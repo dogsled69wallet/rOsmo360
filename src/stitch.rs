@@ -93,7 +93,11 @@ impl Lens {
 
 /// Feathered composite: each lens weighted by its own blend ramp, normalised.
 /// `only` forces a single lens (for checking alignment in the overlap zone).
-pub fn equirect(lenses: &[Lens], frames: &[Frame], out_w: usize, only: Option<usize>) -> Frame {
+///
+/// `views` holds `rig_from_view` at instants spread evenly over the frame's
+/// readout. With more than one, each ray is re-aimed with the rotation at the
+/// sensor row it lands on (rolling-shutter correction, top-down readout).
+pub fn equirect(lenses: &[Lens], frames: &[Frame], out_w: usize, only: Option<usize>, views: &[M3]) -> Frame {
     use std::f64::consts::PI;
     let out_h = out_w / 2;
     let mut rgb = vec![0u8; out_w * out_h * 3];
@@ -102,10 +106,18 @@ pub fn equirect(lenses: &[Lens], frames: &[Frame], out_w: usize, only: Option<us
         for x in 0..out_w {
             let lon = (x as f64 + 0.5) / out_w as f64 * 2.0 * PI - PI;
             let d = [lat.cos() * lon.sin(), -lat.sin(), lat.cos() * lon.cos()];
+            let mid = apply(views[views.len() / 2], d);
             let mut acc = [0f64; 3];
             let mut wsum = 0.0;
             for (i, lens) in lenses.iter().enumerate() {
-                let Some((u, v, theta)) = lens.project(d) else { continue };
+                let Some(mut hit) = lens.project(mid) else { continue };
+                if views.len() > 1 {
+                    let row = (hit.1 / frames[lens.input].height as f64).clamp(0.0, 1.0);
+                    let at = views[(row * (views.len() - 1) as f64).round() as usize];
+                    let Some(h) = lens.project(apply(at, d)) else { continue };
+                    hit = h;
+                }
+                let (u, v, theta) = hit;
                 let w = match only {
                     Some(o) if o == i => 1.0,
                     Some(_) => 0.0,
@@ -191,9 +203,13 @@ fn sample(f: &Frame, u: f64, v: f64) -> [f64; 3] {
     })
 }
 
-type M3 = [[f64; 3]; 3];
+pub type M3 = [[f64; 3]; 3];
 
-fn quat_to_mat(q: Quat) -> M3 {
+pub fn mat_mul(a: M3, b: M3) -> M3 {
+    std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
+}
+
+pub fn quat_to_mat(q: Quat) -> M3 {
     let Quat { w, x, y, z } = q;
     [
         [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
@@ -202,7 +218,7 @@ fn quat_to_mat(q: Quat) -> M3 {
     ]
 }
 
-fn transpose(m: M3) -> M3 {
+pub fn transpose(m: M3) -> M3 {
     std::array::from_fn(|i| std::array::from_fn(|j| m[j][i]))
 }
 
