@@ -22,6 +22,15 @@ pub fn frame_rate(input: &Path) -> Result<f64> {
     Ok(n.parse::<f64>()? / d.parse::<f64>()?)
 }
 
+pub fn duration(input: &Path) -> Result<f64> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+        .arg(input)
+        .output()
+        .context("running ffprobe")?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().parse()?)
+}
+
 fn dimensions(input: &Path, track: u32) -> Result<(usize, usize)> {
     let dims = probe(input, &format!("v:{track}"), "stream=width,height")?;
     let (w, h) = dims.split_once(',').context("ffprobe gave no dimensions")?;

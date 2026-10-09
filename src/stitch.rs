@@ -17,19 +17,19 @@ pub struct Frame {
 pub struct Lens {
     /// Index into the rig's pictures, i.e. which decoded video track.
     pub input: usize,
-    cam_from_rig: [[f64; 3]; 3],
-    k: [f64; 5],
-    p: [f64; 2],
-    focal: [f64; 2],
-    centre: [f64; 2],
-    skew: f64,
-    mirror: bool,
-    calib_to_picture: geometry::Affine2,
-    fov_limit: f64,
-    blend: geometry::Blend,
-    calib_dim: [usize; 2],
+    pub(crate) cam_from_rig: [[f64; 3]; 3],
+    pub(crate) k: [f64; 5],
+    pub(crate) p: [f64; 2],
+    pub(crate) focal: [f64; 2],
+    pub(crate) centre: [f64; 2],
+    pub(crate) skew: f64,
+    pub(crate) mirror: bool,
+    pub(crate) calib_to_picture: geometry::Affine2,
+    pub(crate) fov_limit: f64,
+    pub(crate) blend: geometry::Blend,
+    pub(crate) calib_dim: [usize; 2],
     /// Image validity from the circle and masks, rasterised in calibration pixels.
-    valid: Vec<bool>,
+    pub(crate) valid: Vec<bool>,
 }
 
 impl Lens {

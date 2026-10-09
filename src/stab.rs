@@ -58,6 +58,14 @@ impl Stabilizer {
         Stabilizer { quats, imu_from_rig: axes.imu_from_rig(), world_down, mode, smooth_ms }
     }
 
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+
     pub fn has_data(&self) -> bool {
         !self.quats.is_empty()
     }

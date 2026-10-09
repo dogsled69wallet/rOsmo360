@@ -1,5 +1,6 @@
 mod ffmpeg;
 mod imu;
+mod player;
 mod stab;
 mod stitch;
 
@@ -33,6 +34,23 @@ enum Cmd {
         output: PathBuf,
         #[command(flatten)]
         opts: RenderOpts,
+    },
+    /// Play the clip in a window with free look, stabilisation and rolling-shutter correction.
+    ///
+    /// Drag: look around · right-drag or Q/E: roll · arrows: pitch, seek (shift: yaw) ·
+    /// scroll: zoom · space: play/pause · , .: frame step · S: stabilisation ·
+    /// R: rolling shutter · P: projection · 0: reset view · F: fullscreen
+    Play {
+        input: PathBuf,
+        /// Stream the OSV itself at this size (pixels square) instead of the LRF proxy.
+        #[arg(long)]
+        osv_size: Option<u32>,
+        #[arg(long, value_enum, default_value_t = stab::Mode::Horizon)]
+        stabilize: stab::Mode,
+        #[arg(long, value_enum, default_value_t = stab::ImuAxes::X180)]
+        imu_axes: stab::ImuAxes,
+        #[arg(long)]
+        world_z_down: bool,
     },
     /// Stitch a span of the clip to an equirectangular MP4.
     Render {
@@ -170,6 +188,34 @@ fn main() -> Result<()> {
                     println!("{kind},{t},,{},{},{}", v[0], v[1], v[2]);
                 }
             }
+        }
+        Cmd::Play { input, osv_size, stabilize, imu_axes, world_z_down } => {
+            let opts = RenderOpts {
+                width: 0,
+                variant: None,
+                only: None,
+                stabilize,
+                smooth: 500.0,
+                imu_axes,
+                world_z_down,
+                no_rs: false,
+            };
+            let p = Pipeline::new(&input, &opts)?;
+            let proxy = ["LRF", "lrf"].iter().map(|ext| input.with_extension(ext)).find(|p| p.exists());
+            if proxy.is_none() && osv_size.is_none() {
+                eprintln!("no .LRF proxy next to the clip; streaming the OSV at 1920 px");
+            }
+            player::run(player::Media {
+                duration: ffmpeg::duration(&input)?,
+                input,
+                proxy,
+                osv_size,
+                lenses: p.lenses,
+                tracks: p.tracks,
+                stab: p.stab,
+                readout_ms: p.readout_ms,
+                fps: p.fps,
+            })?;
         }
         Cmd::Stitch { input, time, output, opts } => {
             let p = Pipeline::new(&input, &opts)?;
