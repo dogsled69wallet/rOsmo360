@@ -2,12 +2,35 @@
 //! view-frame ray (x right, y down, z forward) is turned into the rig ray the
 //! stitcher samples.
 //!
-//! The attitude series is world_from_imu with world +z pointing down (NED);
-//! on the sample clip the IMU body frame matches the rig axes up to a possible
-//! 180° turn about vertical, selected by `imu_yaw_180`.
+//! The attitude series is world_from_imu. On the Osmo 360 (telemetry-parser's
+//! series) world +z points up and the IMU sits a half turn about the rig's x
+//! axis — found on handheld footage by world-locking across fast pans until
+//! the sun held still, then checking the horizon levels at 30–50° of tilt.
 
 use crate::stitch::{M3, mat_mul, quat_to_mat, transpose};
 use telemetry_parser::rig::geometry::Quat;
+
+/// How the IMU's axes sit relative to the rig's: identity or a half turn
+/// about one rig axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ImuAxes {
+    Identity,
+    X180,
+    Y180,
+    Z180,
+}
+
+impl ImuAxes {
+    fn imu_from_rig(self) -> M3 {
+        let d = match self {
+            ImuAxes::Identity => [1.0, 1.0, 1.0],
+            ImuAxes::X180 => [1.0, -1.0, -1.0],
+            ImuAxes::Y180 => [-1.0, 1.0, -1.0],
+            ImuAxes::Z180 => [-1.0, -1.0, 1.0],
+        };
+        [[d[0], 0.0, 0.0], [0.0, d[1], 0.0], [0.0, 0.0, d[2]]]
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Mode {
@@ -23,19 +46,16 @@ pub struct Stabilizer {
     /// (ms, world_from_imu)
     quats: Vec<(f64, Quat)>,
     imu_from_rig: M3,
+    /// Sign of world z along gravity: +1 for z down (NED), -1 for z up.
+    world_down: f64,
     mode: Mode,
     smooth_ms: f64,
 }
 
 impl Stabilizer {
-    pub fn new(quats: &[(f64, [f64; 4])], mode: Mode, imu_yaw_180: bool, smooth_ms: f64) -> Self {
+    pub fn new(quats: &[(f64, [f64; 4])], mode: Mode, axes: ImuAxes, world_down: f64, smooth_ms: f64) -> Self {
         let quats = quats.iter().map(|&(t, [w, x, y, z])| (t, Quat { w, x, y, z })).collect();
-        let imu_from_rig = if imu_yaw_180 {
-            [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]]
-        } else {
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-        };
-        Stabilizer { quats, imu_from_rig, mode, smooth_ms }
+        Stabilizer { quats, imu_from_rig: axes.imu_from_rig(), world_down, mode, smooth_ms }
     }
 
     pub fn has_data(&self) -> bool {
@@ -76,7 +96,7 @@ impl Stabilizer {
                         fwd[i] += r[i][2];
                     }
                 }
-                let down = [0.0, 0.0, 1.0];
+                let down = [0.0, 0.0, self.world_down];
                 fwd[2] = 0.0;
                 let fwd = normalise(fwd);
                 let right = cross(down, fwd);

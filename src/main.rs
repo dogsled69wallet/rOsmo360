@@ -67,9 +67,12 @@ struct RenderOpts {
     /// Heading smoothing window for `horizon`, in ms either side.
     #[arg(long, default_value_t = 500.0)]
     smooth: f64,
-    /// Treat the IMU frame as the rig turned 180° about vertical.
+    /// How the IMU's axes sit relative to the rig's.
+    #[arg(long, value_enum, default_value_t = stab::ImuAxes::X180)]
+    imu_axes: stab::ImuAxes,
+    /// Treat the attitude's world z as pointing down rather than up.
     #[arg(long)]
-    imu_yaw_180: bool,
+    world_z_down: bool,
     /// Skip rolling-shutter correction.
     #[arg(long)]
     no_rs: bool,
@@ -108,7 +111,7 @@ impl Pipeline {
                 RigPicture::Sibling { .. } => bail!("multi-file rigs are not supported"),
             })
             .collect::<Result<Vec<_>>>()?;
-        let stab = stab::Stabilizer::new(&imu::read(&parsed).quats, opts.stabilize, opts.imu_yaw_180, opts.smooth);
+        let stab = stab::Stabilizer::new(&imu::read(&parsed).quats, opts.stabilize, opts.imu_axes, if opts.world_z_down { 1.0 } else { -1.0 }, opts.smooth);
         if !stab.has_data() && opts.stabilize != stab::Mode::Off {
             bail!("no attitude data to stabilise with");
         }
