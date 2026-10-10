@@ -27,6 +27,7 @@ Working and verified on real footage:
   - Perspective, little-planet and flat equirect projections.
   - Plays the LRF proxy (or the OSV at 1920 px or full size) and swaps in a full-res frame on pause.
   - Sound through cpal, with a mute icon and volume slider. While sound plays it is the playback clock.
+  - Aspect lock (Free, 16:9, 9:16, 4:3, 1:1, 2:1) letterboxes the view; a saved view takes the same shape.
   - Save the paused frame as PNG: the view as framed (3840 px on the long side) or the whole sphere (7680 × 3840). The CPU stitcher renders it from freshly decoded full-res frames in about 4 s.
 - **Hardware decode on any GPU vendor:** the first of Vulkan Video, VA-API and CUDA that decodes a test frame, else software. `--hwaccel` forces one.
 

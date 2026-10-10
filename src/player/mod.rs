@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
 use iced::mouse;
-use iced::widget::{button, center, column, container, pick_list, row, shader, slider, space, svg, text, toggler, tooltip};
+use iced::widget::{button, center, column, container, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
 use iced::window;
 use iced::{Alignment, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme};
 use playback::Playback;
@@ -149,6 +149,34 @@ enum Saving {
 const SAVE_VIEW_PX: f32 = 3840.0;
 const SAVE_SPHERE_PX: usize = 7680;
 
+/// The shape of the view, and so of a saved view: free fills the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Aspect {
+    Free,
+    Ratio(u16, u16),
+}
+
+impl Aspect {
+    const ALL: [Aspect; 6] = [Aspect::Free, Aspect::Ratio(16, 9), Aspect::Ratio(9, 16), Aspect::Ratio(4, 3), Aspect::Ratio(1, 1), Aspect::Ratio(2, 1)];
+
+    /// Width over height, if locked.
+    fn ratio(self) -> Option<f32> {
+        match self {
+            Aspect::Free => None,
+            Aspect::Ratio(w, h) => Some(w as f32 / h as f32),
+        }
+    }
+}
+
+impl fmt::Display for Aspect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Aspect::Free => f.write_str("Free"),
+            Aspect::Ratio(w, h) => write!(f, "{w}:{h}"),
+        }
+    }
+}
+
 /// What the player streams while playing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Source {
@@ -245,6 +273,7 @@ enum Message {
     RollingShutter(bool),
     Mute,
     Volume(f32),
+    Aspect(Aspect),
     /// The 360 view's size on screen, so a saved view keeps its shape.
     ViewSize(Size),
     Save(Saving),
@@ -265,6 +294,7 @@ struct App {
     volume: f32,
     muted: bool,
     view_size: Size,
+    aspect: Aspect,
     /// What the last save did, or that one is running.
     save_status: Option<String>,
 }
@@ -282,6 +312,7 @@ impl App {
             volume: 1.0,
             muted: false,
             view_size: Size::new(16.0, 9.0),
+            aspect: Aspect::Free,
             save_status: None,
         }
     }
@@ -377,6 +408,7 @@ impl App {
             }
             Message::RollingShutter(on) => self.rolling_shutter = on,
             Message::ViewSize(size) => self.view_size = size,
+            Message::Aspect(a) => self.aspect = a,
             Message::Save(what) => {
                 let Some(c) = &self.clip else { return Task::none() };
                 let media = &c.playback.media;
@@ -536,18 +568,27 @@ impl App {
             .align_y(Alignment::Center);
 
         let view: Element<'_, Message> = match &clip.shown {
-            Some(shown) => shader(Sphere {
-                rig: media.rig.clone(),
-                shown: shown.clone(),
-                user: self.look.matrix(),
-                zoom: self.look.zoom(),
-                projection: self.look.projection as u32,
-                rig_from_view: p.rig_from_view(self.rolling_shutter),
-                fov_deg: self.look.fov_deg,
-            })
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
+            Some(shown) => {
+                let sphere = Sphere {
+                    rig: media.rig.clone(),
+                    shown: shown.clone(),
+                    user: self.look.matrix(),
+                    zoom: self.look.zoom(),
+                    projection: self.look.projection as u32,
+                    rig_from_view: p.rig_from_view(self.rolling_shutter),
+                    fov_deg: self.look.fov_deg,
+                };
+                let aspect = self.aspect;
+                // A locked aspect is the largest box of that shape that fits.
+                responsive(move |room| {
+                    let (w, h) = match aspect.ratio() {
+                        None => (room.width, room.height),
+                        Some(r) => if room.width / room.height > r { (room.height * r, room.height) } else { (room.width, room.width / r) },
+                    };
+                    center(shader(sphere.clone()).width(w).height(h)).into()
+                })
+                .into()
+            }
             None => center(text("Decoding…")).into(),
         };
         let view = container(view).width(Length::Fill).height(Length::Fill).style(|_| container::background(iced::Color::BLACK));
@@ -596,6 +637,7 @@ impl App {
             labelled("Stabilisation", pick_list(&Mode::ALL[..], Some(media.stab.mode()), Message::Stab)),
             labelled("Projection", pick_list(&Projection::ALL[..], Some(self.look.projection), Message::Projection)),
             labelled("Playback source", pick_list(sources, Some(source), Message::Source)),
+            labelled("Aspect", pick_list(&Aspect::ALL[..], Some(self.aspect), Message::Aspect)),
             labelled("FOV", slider(lo..=hi, self.look.fov_deg, Message::Fov).width(120)),
             toggler(self.rolling_shutter).label("Rolling shutter").on_toggle(Message::RollingShutter),
             button("Reset view").on_press(Message::ResetView),
@@ -634,6 +676,7 @@ fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl F
 
 /// The 360 view widget: draws the shader primitive and turns drags and the
 /// scroll wheel into look and zoom messages.
+#[derive(Clone)]
 struct Sphere {
     rig: Arc<Rig>,
     shown: Arc<Shown>,
