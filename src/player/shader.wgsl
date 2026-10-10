@@ -87,6 +87,8 @@ struct Hit {
     uv: vec2f,
     row: f32,
     theta: f32,
+    // How far inside the masks (stitch.rs `edge`), scaling the blend weight.
+    edge: f32,
     ok: bool,
 }
 
@@ -129,7 +131,8 @@ fn project(i: u32, d: vec3f) -> Hit {
     if cu < 0.0 || cv < 0.0 || cu >= l.calib.x || cv >= l.calib.y {
         return h;
     }
-    if mask_at(i, vec2i(i32(cu), i32(cv))) < 0.5 {
+    h.edge = mask_at(i, vec2i(i32(cu), i32(cv)));
+    if h.edge <= 0.0 {
         return h;
     }
     h.uv = vec2f(dot(l.a0.xy, vec2f(cu, cv)) + l.a0.z, dot(l.a1.xy, vec2f(cu, cv)) + l.a1.z);
@@ -266,7 +269,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
             }
         }
         let l = u.lenses[i];
-        let w = clamp((l.lim.y - h.theta) / max(l.lim.z, 1e-6), 0.0, 1.0);
+        let w = clamp((l.lim.y - h.theta) / max(l.lim.z, 1e-6), 0.0, 1.0) * h.edge;
         if w <= 0.0 {
             continue;
         }

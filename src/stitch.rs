@@ -31,9 +31,18 @@ pub struct Lens {
     pub(crate) fov_limit: f64,
     pub(crate) blend: geometry::Blend,
     pub(crate) calib_dim: [usize; 2],
-    /// Image validity from the circle and masks, rasterised in calibration pixels.
-    pub(crate) valid: Vec<bool>,
+    /// How far each calibration pixel lies inside the valid picture (image
+    /// circle and masks): 0 outside, rising to 255 at `FEATHER` in.
+    pub(crate) edge: Vec<u8>,
 }
+
+/// A lens's blend weight fades out over this angle inside its masks. DJI's
+/// masks around the selfie stick cut into the ±6.8° blend band (the overlap
+/// there narrows to ~86-94°), so without it a lens stopped at a mask edge
+/// mid-blend, and where the lenses see the sky differently (sun glare in one)
+/// that step showed as a line: on clip 0043 at 5.9 s, one running up the sky
+/// from the hand on the stick.
+const FEATHER: f64 = 2.0 * std::f64::consts::PI / 180.0;
 
 impl Lens {
     pub fn new(lens: &geometry::Lens) -> Result<Self> {
@@ -54,13 +63,14 @@ impl Lens {
             fov_limit: lens.fov_limit.unwrap_or(std::f64::consts::FRAC_PI_2),
             blend: lens.blend,
             calib_dim,
-            valid: rasterise_validity(lens, calib_dim),
+            edge: feather(&rasterise_validity(lens, calib_dim), calib_dim, lens.intrinsics.focal[0] * FEATHER),
         })
     }
 
     /// Projects a rig-frame direction to picture pixels, plus its angle from
-    /// the optical axis. `None` where the lens has no valid picture.
-    pub(crate) fn project(&self, d: [f64; 3]) -> Option<(f64, f64, f64)> {
+    /// the optical axis and how far inside the masks it is (0..1, for the
+    /// blend weight). `None` where the lens has no valid picture.
+    pub(crate) fn project(&self, d: [f64; 3]) -> Option<(f64, f64, f64, f64)> {
         let c = apply(self.cam_from_rig, d);
         let rho = (c[0] * c[0] + c[1] * c[1]).sqrt();
         let theta = rho.atan2(c[2]);
@@ -84,13 +94,14 @@ impl Lens {
         if iu < 0.0 || iv < 0.0 || iu >= self.calib_dim[0] as f64 || iv >= self.calib_dim[1] as f64 {
             return None;
         }
-        if !self.valid[iv as usize * self.calib_dim[0] + iu as usize] {
+        let edge = self.edge[iv as usize * self.calib_dim[0] + iu as usize];
+        if edge == 0 {
             return None;
         }
         let a = &self.calib_to_picture;
         let pu = a.a[0][0] * u + a.a[0][1] * v + a.t[0];
         let pv = a.a[1][0] * u + a.a[1][1] * v + a.t[1];
-        Some((pu, pv, theta))
+        Some((pu, pv, theta, edge as f64 / 255.0))
     }
 
     /// RGB (0..255) at picture pixel (u, v) of this lens's frame, which may
@@ -179,11 +190,11 @@ pub fn render(
                     let Some(h) = lens.project(warp(apply(at, d))) else { continue };
                     hit = h;
                 }
-                let (u, v, theta) = hit;
+                let (u, v, theta, edge) = hit;
                 let w = match only {
                     Some(o) if o == i => 1.0,
                     Some(_) => 0.0,
-                    None => lens.blend.weight(theta),
+                    None => lens.blend.weight(theta) * edge,
                 };
                 if w <= 0.0 {
                     continue;
@@ -232,6 +243,63 @@ fn rasterise_validity(lens: &geometry::Lens, [w, h]: [usize; 2]) -> Vec<bool> {
         }
     });
     valid
+}
+
+/// The validity map as distances in from its edge: 0 outside, 255 at
+/// `radius` pixels or more, smoothstepped so the weight eases in. An exact
+/// Euclidean distance (Felzenszwalb and Huttenlocher's separable transform),
+/// rows then columns, each in parallel: ~0.05 s for two 3840² lenses, where a
+/// one-thread chamfer pass took 0.6 s of every clip's load.
+fn feather(valid: &[bool], [w, h]: [usize; 2], radius: f64) -> Vec<u8> {
+    const FAR: f32 = 1e12;
+    let mut rows: Vec<f32> = valid.iter().map(|&v| if v { FAR } else { 0.0 }).collect();
+    rows.par_chunks_mut(w).for_each(squared_distance);
+    let mut cols = vec![0f32; w * h];
+    cols.par_chunks_mut(h).enumerate().for_each(|(x, col)| {
+        for (y, c) in col.iter_mut().enumerate() {
+            *c = rows[y * w + x];
+        }
+        squared_distance(col);
+    });
+    let mut edge = vec![0u8; w * h];
+    edge.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for (x, e) in row.iter_mut().enumerate() {
+            let d = cols[x * h + y];
+            *e = if d == 0.0 { 0 } else { (smoothstep(0.0, radius, (d as f64).sqrt()) * 254.0).round() as u8 + 1 };
+        }
+    });
+    edge
+}
+
+/// In place, each sample's squared distance to the nearest one at 0, given
+/// squared distances so far (1-D lower envelope of parabolas).
+fn squared_distance(f: &mut [f32]) {
+    let n = f.len();
+    let src = f.to_vec();
+    let (mut v, mut z) = (vec![0usize; n], vec![0f32; n + 1]);
+    let mut k = 0;
+    z[0] = f32::NEG_INFINITY;
+    z[1] = f32::INFINITY;
+    let cross = |q: usize, p: usize| ((src[q] + (q * q) as f32) - (src[p] + (p * p) as f32)) / (2.0 * (q as f32 - p as f32));
+    for q in 1..n {
+        let mut s = cross(q, v[k]);
+        while s <= z[k] {
+            k -= 1;
+            s = cross(q, v[k]);
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f32::INFINITY;
+    }
+    k = 0;
+    for (q, out) in f.iter_mut().enumerate() {
+        while z[k + 1] < q as f32 {
+            k += 1;
+        }
+        let d = q as f32 - v[k] as f32;
+        *out = d * d + src[v[k]];
+    }
 }
 
 /// Even-odd scanline fill of one polygon on row centre `py`, half-open edges.
@@ -293,4 +361,30 @@ pub fn transpose(m: M3) -> M3 {
 
 pub(crate) fn apply(m: M3, v: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feather_is_the_euclidean_distance_in() {
+        let (w, h) = (37, 23);
+        // A disc with a notch and scattered holes, like a mask cutting in.
+        let valid: Vec<bool> = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as f64, (i / w) as f64);
+                let disc = (x - 18.0).powi(2) + (y - 11.0).powi(2) < 120.0;
+                disc && !(x > 20.0 && (y - 11.0).abs() < 2.0) && (i * 7919) % 53 != 0
+            })
+            .collect();
+        let radius = 4.0;
+        let edge = feather(&valid, [w, h], radius);
+        for (i, &e) in edge.iter().enumerate() {
+            let (x, y) = ((i % w) as f64, (i / w) as f64);
+            let d = (0..w * h).filter(|&j| !valid[j]).map(|j| ((j % w) as f64 - x).hypot((j / w) as f64 - y)).fold(f64::INFINITY, f64::min);
+            let want = if valid[i] { (smoothstep(0.0, radius, d) * 254.0).round() as u8 + 1 } else { 0 };
+            assert_eq!(e, want, "at {x},{y}");
+        }
+    }
 }

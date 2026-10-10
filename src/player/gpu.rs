@@ -338,8 +338,7 @@ impl Pipeline {
             let l = &rig.lenses[i];
             let [w, h] = l.calib_dim;
             let p = plane(device, w as u32, h as u32, wgpu::TextureFormat::R8Unorm);
-            let bytes: Vec<u8> = l.valid.iter().map(|&v| if v { 255 } else { 0 }).collect();
-            write(queue, &p.texture, &bytes, w as u32, h as u32, 1);
+            write(queue, &p.texture, &l.edge, w as u32, h as u32, 1);
             p
         });
         self.lens_u = [0, 1].map(|i| lens_uniform(&rig.lenses[i]));
