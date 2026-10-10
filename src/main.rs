@@ -657,7 +657,7 @@ fn seam_report(input: &Path, start: f64, duration: f64, dump: Option<&Path>) -> 
     // The selfie stick runs down the rig's y axis.
     let stick = aligner.column([0.0, 1.0, 0.0]);
     let mut n = 0;
-    let jitter = |a: &align::Field, b: &align::Field| a.0.iter().zip(&b.0).map(|(x, y)| (x - y).abs() as f64).sum::<f64>() / a.0.len() as f64;
+    let jitter = |a: &align::Field, b: &align::Field| a.shift.iter().zip(&b.shift).map(|(x, y)| (x - y).abs() as f64).sum::<f64>() / a.shift.len() as f64;
     println!("t,mismatch_none,mismatch_raw,mismatch_eased,jitter_raw_deg,jitter_eased_deg,stick_none,stick_eased");
     while n < (duration * p.fps).round() as usize {
         let Some(frames) = stream.next()? else { break };

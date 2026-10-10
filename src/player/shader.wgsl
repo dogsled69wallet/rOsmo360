@@ -43,6 +43,8 @@ struct Uniforms {
     gains: array<vec4f, 64>,
     // Seam alignment shifts (align.rs), radians, four cells per vector.
     field: array<vec4f, 224>,
+    // Disagreement cut strength per azimuth bin (align.rs), four per vector.
+    cut: array<vec4f, 32>,
 }
 
 const BINS: u32 = 32u;
@@ -211,11 +213,24 @@ const CUT_FROM: f32 = 0.06;
 const CUT_FULL: f32 = 0.18;
 const CUT_EDGE: f32 = 0.08;
 
-fn cut_share(share: f32, a: vec3f, b: vec3f) -> f32 {
+fn cut_bin(i: i32) -> f32 {
+    let b = u32((i + i32(CELLS_PHI)) % i32(CELLS_PHI));
+    return u.cut[b / 4u][b % 4u];
+}
+
+// Matches Field::cut_at: how far the cut may act at direction `d`.
+fn cut_strength(d: vec3f) -> f32 {
+    let phi = atan2(dot(d, u.seam[2].xyz), dot(d, u.seam[1].xyz));
+    let x = fract(phi / (2.0 * PI) + 1.0) * f32(CELLS_PHI) - 0.5;
+    let i = floor(x);
+    return mix(cut_bin(i32(i)), cut_bin(i32(i) + 1), x - i);
+}
+
+fn cut_share(share: f32, a: vec3f, b: vec3f, strength: f32) -> f32 {
     let d = abs(a - b);
     let diff = max(d.x, max(d.y, d.z));
     let cut = smoothstep(0.5 - CUT_EDGE, 0.5 + CUT_EDGE, share);
-    return mix(share, cut, smoothstep(CUT_FROM, CUT_FULL, diff));
+    return mix(share, cut, smoothstep(CUT_FROM, CUT_FULL, diff) * strength);
 }
 
 // Matches Seam::gain in exposure.rs.
@@ -264,7 +279,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     }
     var share = wt[0] / wsum;
     if wt[0] > 0.0 && wt[1] > 0.0 {
-        share = cut_share(share, col[0], col[1]);
+        share = cut_share(share, col[0], col[1], cut_strength(mid));
     }
     var rgb = col[0] * share + col[1] * (1.0 - share);
     if u.misc.y > 0.5 {

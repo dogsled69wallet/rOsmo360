@@ -141,11 +141,12 @@ const CUT_FROM: f64 = 0.06;
 const CUT_FULL: f64 = 0.18;
 const CUT_EDGE: f64 = 0.08;
 
-/// Lens 0's share of a two-lens blend once disagreement cuts it.
-pub(crate) fn cut_share(share: f64, a: [f64; 3], b: [f64; 3]) -> f64 {
+/// Lens 0's share of a two-lens blend once disagreement cuts it, `strength`
+/// (0..1) being how far the cut may act there (`Field::cut_at`).
+pub(crate) fn cut_share(share: f64, a: [f64; 3], b: [f64; 3], strength: f64) -> f64 {
     let diff = (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0, f64::max);
     let cut = smoothstep(0.5 - CUT_EDGE, 0.5 + CUT_EDGE, share);
-    share + (cut - share) * smoothstep(CUT_FROM, CUT_FULL, diff)
+    share + (cut - share) * smoothstep(CUT_FROM, CUT_FULL, diff) * strength
 }
 
 fn smoothstep(lo: f64, hi: f64, x: f64) -> f64 {
@@ -191,7 +192,8 @@ pub fn render(
                 hits.push(([0, 1, 2].map(|c| px[c] * gain[c]), w));
             }
             if let ([(a, wa), (b, wb)], true) = (&hits[..], seam.cut) {
-                let s = cut_share(wa / (wa + wb), a.map(|v| v / 255.0), b.map(|v| v / 255.0));
+                let strength = seam.align.map_or(1.0, |(al, f)| f.cut_at(al.ring.coords(mid).0));
+                let s = cut_share(wa / (wa + wb), a.map(|v| v / 255.0), b.map(|v| v / 255.0), strength);
                 hits = vec![(*a, s), (*b, 1.0 - s)];
             }
             let wsum: f64 = hits.iter().map(|h| h.1).sum();

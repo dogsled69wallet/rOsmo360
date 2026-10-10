@@ -41,6 +41,8 @@ struct Uniforms {
     gains: [[f32; 4]; BINS * 2],
     /// Seam alignment shifts, four cells per vector.
     field: [[f32; 4]; CELLS_PHI * CELLS_ALPHA / 4],
+    /// Disagreement cut strength per azimuth bin, four per vector.
+    cut: [[f32; 4]; CELLS_PHI / 4],
 }
 
 /// Numbers rigs and frames so each is uploaded once however often it is drawn.
@@ -302,8 +304,11 @@ impl shader::Primitive for Primitive {
                 u.gains[lens * BINS + b] = [g[0], g[1], g[2], 0.0];
             }
         }
-        for (v, cells) in u.field.iter_mut().zip(self.shown.fix.field.0.chunks_exact(4)) {
+        for (v, cells) in u.field.iter_mut().zip(self.shown.fix.field.shift.chunks_exact(4)) {
             v.copy_from_slice(cells);
+        }
+        for (v, bins) in u.cut.iter_mut().zip(self.shown.fix.field.cut.chunks_exact(4)) {
+            v.copy_from_slice(bins);
         }
         queue.write_buffer(&p.uniforms, 0, bytemuck::bytes_of(&u));
     }

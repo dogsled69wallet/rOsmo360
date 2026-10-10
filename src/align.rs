@@ -59,22 +59,44 @@ const DETAIL_RADIUS: isize = 4;
 /// matching, sky changes fell to 0.5% at 2–3% more mismatch.
 const ZERO_MARGIN: f64 = 0.05;
 
-/// δ in radians per cell: how much further from lens 0's axis lens 1 sees
-/// the content at that output angle.
+/// The disagreement cut only acts where both lenses see detail across the
+/// blend band (the smaller of their mean |detail| per azimuth bin), fading
+/// in between these. Sun glare that one lens catches and the other doesn't
+/// is smooth: on 0037 at 34.6 s its bins scored 0.002–0.006 and the cut drew
+/// a hard edge through the halo. The hand on the stick and rock score
+/// 0.02–0.15, so the cut still takes them.
+const CUT_DETAIL_FROM: f64 = 0.008;
+const CUT_DETAIL_FULL: f64 = 0.02;
+
+/// The seam correction measured on one frame.
 #[derive(Clone, Debug)]
-pub struct Field(pub Vec<f32>);
+pub struct Field {
+    /// δ in radians per cell: how much further from lens 0's axis lens 1
+    /// sees the content at that output angle.
+    pub shift: Vec<f32>,
+    /// 0..1 per azimuth bin: how far the disagreement cut may act there.
+    pub cut: Vec<f32>,
+}
 
 impl Default for Field {
     fn default() -> Self {
-        Field(vec![0.0; CELLS_PHI * CELLS_ALPHA])
+        Field { shift: vec![0.0; CELLS_PHI * CELLS_ALPHA], cut: vec![1.0; CELLS_PHI] }
     }
 }
 
 impl Field {
     pub fn ease(&mut self, to: &Field, k: f32) {
-        for (a, b) in self.0.iter_mut().zip(&to.0) {
+        for (a, b) in self.shift.iter_mut().zip(&to.shift).chain(self.cut.iter_mut().zip(&to.cut)) {
             *a += (b - *a) * k;
         }
+    }
+
+    /// The cut's strength at azimuth `phi`, linear between bins.
+    pub fn cut_at(&self, phi: f64) -> f64 {
+        let x = phi / TAU * CELLS_PHI as f64 - 0.5;
+        let (x0, f) = (x.floor(), x - x.floor());
+        let v = |i: f64| self.cut[(i as isize).rem_euclid(CELLS_PHI as isize) as usize] as f64;
+        v(x0) * (1.0 - f) + v(x0 + 1.0) * f
     }
 
     /// Bilinear in cells, wrapping round the ring and clamped across it.
@@ -85,7 +107,7 @@ impl Field {
         let (fx, fy) = (x - x0, y - y0);
         let col = |i: f64| (i as isize).rem_euclid(CELLS_PHI as isize) as usize;
         let row = |j: f64| (j as usize).min(CELLS_ALPHA - 1);
-        let v = |i: f64, j: f64| self.0[row(j) * CELLS_PHI + col(i)] as f64;
+        let v = |i: f64, j: f64| self.shift[row(j) * CELLS_PHI + col(i)] as f64;
         let top = v(x0, y0) * (1.0 - fx) + v(x0 + 1.0, y0) * fx;
         let bot = v(x0, y0 + 1.0) * (1.0 - fx) + v(x0 + 1.0, y0 + 1.0) * fx;
         top * (1.0 - fy) + bot * fy
@@ -145,10 +167,10 @@ impl Aligner {
     /// frame before, when this one follows on from it.
     pub fn measure(&self, strips: &Strips, prev: Option<&Field>) -> Field {
         let detail = [highpass(&strips.0[0], DETAIL_RADIUS), highpass(&strips.0[1], DETAIL_RADIUS)];
-        let mut cells: Vec<f32> =
-            (0..CELLS_PHI * CELLS_ALPHA).into_par_iter().map(|c| match_cell(&detail, c % CELLS_PHI, c / CELLS_PHI, prev.map(|p| p.0[c]))).collect();
-        fill_and_smooth(&mut cells);
-        Field(cells)
+        let mut shift: Vec<f32> =
+            (0..CELLS_PHI * CELLS_ALPHA).into_par_iter().map(|c| match_cell(&detail, c % CELLS_PHI, c / CELLS_PHI, prev.map(|p| p.shift[c]))).collect();
+        fill_and_smooth(&mut shift);
+        Field { shift, cut: (0..CELLS_PHI).map(|b| cut_strength(&detail, b)).collect() }
     }
 
     /// Writes the frame's strips as images for inspection: each lens, their
@@ -169,7 +191,7 @@ impl Aligner {
         let rgb: Vec<u8> = (0..CELLS_ALPHA * k)
             .flat_map(|y| (0..CELLS_PHI * k).map(move |x| (x / k, y / k)))
             .flat_map(|(cx, cy)| {
-                let d = (field.0[cy * CELLS_PHI + cx] as f64).to_degrees() / 6.0;
+                let d = (field.shift[cy * CELLS_PHI + cx] as f64).to_degrees() / 6.0;
                 let v = (d.abs().min(1.0) * 255.0) as u8;
                 if d > 0.0 { [v, 0, 0] } else { [0, 0, v] }
             })
@@ -302,6 +324,29 @@ fn match_cell(strips: &[Vec<f32>; 2], cx: usize, cy: usize, prev: Option<f32>) -
 
 /// The strip minus its local mean over a (2r+1)² box of valid pixels, so
 /// only edges and texture are left to match.
+/// How far the cut may act in azimuth bin `b`, from the detail both lenses
+/// see across the blend band. Bins with no overlap keep the full cut.
+fn cut_strength(detail: &[Vec<f32>; 2], b: usize) -> f32 {
+    let rows = ((TAPER_LO - STRIP_ALPHA_LO) / STRIP_STEP) as usize..((TAPER_HI - STRIP_ALPHA_LO) / STRIP_STEP) as usize;
+    let cols = b * STRIP_W / CELLS_PHI..(b + 1) * STRIP_W / CELLS_PHI;
+    let (mut sum, mut n) = ([0.0f64; 2], 0.0);
+    for y in rows {
+        for x in cols.clone() {
+            let (a, c) = (detail[0][y * STRIP_W + x], detail[1][y * STRIP_W + x]);
+            if !a.is_nan() && !c.is_nan() {
+                sum[0] += a.abs() as f64;
+                sum[1] += c.abs() as f64;
+                n += 1.0;
+            }
+        }
+    }
+    if n == 0.0 {
+        return 1.0;
+    }
+    let t = ((sum[0].min(sum[1]) / n - CUT_DETAIL_FROM) / (CUT_DETAIL_FULL - CUT_DETAIL_FROM)).clamp(0.0, 1.0);
+    (t * t * (3.0 - 2.0 * t)) as f32
+}
+
 fn highpass(s: &[f32], r: isize) -> Vec<f32> {
     (0..STRIP_W * STRIP_H)
         .into_par_iter()
