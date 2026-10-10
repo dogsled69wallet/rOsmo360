@@ -53,6 +53,8 @@ Not done yet, roughly in priority order:
    - Crossfades between cuts (picture and sound), in the player and the export.
    - Music: a track under the edit, with its level.
    - Each cut's volume, and mute.
+   - Export the timeline as separate clips, one per cut, named `<project> - 001.mp4` and so on (the first clip's name without a project), for external editors. Optional handles (e.g. 1 s either side where the footage has it) and possibly an EDL/FCPXML so the editor rebuilds the cut order.
+   - A "DaVinci Resolve (Linux)" export checkbox (and CLI option), for the full export and the separate clips: Resolve free on Linux decodes neither H.264/H.265 nor AAC, so DNxHR HQ (or ProRes 422 HQ) in `.mov` with PCM audio (48 kHz). Large files (~20 MB/s at 1080p30); say so in the UI.
 7. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
    - Needs a D-Log M sample clip first: all 35 Kyrkja clips are normal colour, tagged BT.709 10-bit, as DJI may also tag D-Log.
    - DJI records the profile in `StreamMeta.color_mode` (`ColorModeType`: D_LOG = 2, HLG = 9, …). telemetry-parser's Metadata tag only serialises the clip meta, so reading it means decoding StreamMeta ourselves.

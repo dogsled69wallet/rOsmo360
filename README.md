@@ -169,7 +169,7 @@ rosmo360 scan clip.OSV > scan.csv           # per second: heading, tilt, turning
 
 ## Roadmap
 
-- Version 0.3: crossfades between cuts, and sound controls: a music track and each cut's volume.
+- Version 0.3: crossfades between cuts; sound controls (a music track and each cut's volume); exporting the timeline as separate clips for other editors; and a DaVinci Resolve-friendly export (DNxHR or ProRes with PCM audio, which Resolve's free Linux version can read).
 - 360° metadata on equirectangular exports, so YouTube and VR players show them as 360° video.
 - Smooth full-resolution playback on modest hardware (zero-copy decoding).
 - Windows and macOS builds.
