@@ -688,7 +688,7 @@ const LOGO: &[u8] = include_bytes!("../../vibewithravelund-lowres-corrected.jpg"
 /// Who made it, and how: credit to the author and to the AI-assisted way it
 /// was built.
 fn credit<'a>() -> Element<'a, Message> {
-    container(text("Made by Vibing with Ravelund · 2026").size(12).style(text::secondary)).width(Length::Fill).align_x(Alignment::Center).padding([2, 10]).into()
+    container(text(concat!("rOsmo360 ", env!("CARGO_PKG_VERSION"), " · Made by Vibing with Ravelund · 2026")).size(12).style(text::secondary)).width(Length::Fill).align_x(Alignment::Center).padding([2, 10]).into()
 }
 
 /// Speaker icons for the mute button, drawn in the button's text colour.
