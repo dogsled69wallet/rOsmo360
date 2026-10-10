@@ -54,7 +54,8 @@ enum Cmd {
     /// scroll: zoom · space: play/pause · , .: frame step · S: stabilisation ·
     /// R: rolling shutter · P: projection · M: mute · 0: reset view · F: fullscreen · Ctrl+O: open ·
     /// K: keyframe the view here · [ ]: previous/next keyframe · Del: delete keyframe · J: its ease ·
-    /// C: split the cut · Shift+Del: delete the selected cut · Ctrl+Z / Ctrl+Shift+Z: undo / redo
+    /// C: split the cut · Shift+Del: delete the selected cut · Ctrl+Z / Ctrl+Shift+Z: undo / redo ·
+    /// Ctrl+= / Ctrl+− / Ctrl+0: zoom the timeline in / out / to the whole edit (or scroll on it)
     Play {
         /// Clips to open at start, one cut each in this order, or a saved
         /// project (.json); otherwise use the Open buttons.

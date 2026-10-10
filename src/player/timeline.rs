@@ -1,8 +1,12 @@
 //! The timeline under the view. The top row holds the edit's cuts as
-//! blocks showing thumbnails of their footage: click one to select it, drag it to move it, drag its edges to
-//! trim it. The bottom row is the seek bar with each cut's keyframes as
-//! diamonds (shaped by their ease): click the bar to seek, click a diamond to jump to it, drag one
-//! to retime it.
+//! blocks showing thumbnails of their footage: click one to select it, drag
+//! it to move it, drag its edges to trim it. Below is the seek bar with each
+//! cut's keyframes as diamonds (shaped by their ease): click the bar to seek,
+//! click a diamond to jump to it, drag one to retime it.
+//!
+//! It shows a window of the edit: the wheel zooms around the pointer, Shift
+//! or a sideways wheel pans, and when zoomed in a scrollbar at the bottom
+//! shows and moves the window.
 
 use super::{Message, thumbs};
 use crate::view::Ease;
@@ -21,7 +25,10 @@ const BAR: f32 = 8.0;
 /// The cut row's height, and the gap between cut blocks.
 const CUTS: f32 = 40.0;
 const GAP: f32 = 2.0;
-pub const HEIGHT: f32 = 68.0;
+/// The scrollbar's row at the bottom, and the bar's thickness.
+const SCROLL: f32 = 8.0;
+const SCROLL_BAR: f32 = 5.0;
+pub const HEIGHT: f32 = 76.0;
 /// A press on a cut that moves less than this is a click, not a drag.
 const DRAG_FROM: f32 = 4.0;
 
@@ -55,6 +62,9 @@ impl Block {
 pub struct Timeline {
     pub blocks: Vec<Block>,
     pub duration: f64,
+    /// The stretch of edit time shown: from `start`, `span` seconds.
+    pub start: f64,
+    pub span: f64,
     /// Playhead, in edit time.
     pub position: f64,
     pub selected: Option<usize>,
@@ -73,6 +83,15 @@ pub enum Drag {
     Trim { cut: usize, start: bool, x0: f32, from: f64, per_px: f64 },
     /// Moving a cut; `to` is where it would go.
     Move { cut: usize, x0: f32, moved: bool, to: usize },
+    /// Dragging the scrollbar, which was at `start` when pressed at `x0`.
+    Scroll { x0: f32, start: f64 },
+}
+
+#[derive(Default)]
+pub struct State {
+    drag: Drag,
+    /// Shift held: the wheel pans instead of zooming.
+    shift: bool,
 }
 
 impl Timeline {
@@ -81,12 +100,23 @@ impl Timeline {
     }
 
     /// Edit time to x, with room either side for diamonds at the ends.
+    /// Times outside the window land outside the widget.
     fn x(&self, t: f64, b: Rectangle) -> f32 {
-        PICK + (t / self.duration.max(1e-9)).clamp(0.0, 1.0) as f32 * Self::width(b)
+        PICK + ((t - self.start) / self.span.max(1e-9)) as f32 * Self::width(b)
     }
 
     fn t(&self, x: f32, b: Rectangle) -> f64 {
-        (((x - PICK) / Self::width(b)).clamp(0.0, 1.0) as f64) * self.duration
+        (self.start + ((x - PICK) / Self::width(b)) as f64 * self.span).clamp(0.0, self.duration)
+    }
+
+    fn zoomed(&self) -> bool {
+        self.span < self.duration - 1e-6
+    }
+
+    /// The scrollbar's thumb, left and right x.
+    fn scroll_thumb(&self, b: Rectangle) -> (f32, f32) {
+        let w = Self::width(b) as f64 / self.duration.max(1e-9);
+        (PICK + (self.start * w) as f32, PICK + ((self.start + self.span) * w) as f32)
     }
 
     fn block_at(&self, x: f32, b: Rectangle) -> Option<usize> {
@@ -138,11 +168,13 @@ impl Timeline {
     pub fn view<'a>(self) -> iced::Element<'a, Message> {
         let t = Arc::new(self);
         use iced::widget::canvas;
-        iced::widget::stack![
+        let layers = iced::widget::stack![
             canvas(Pictures(t.clone())).width(iced::Length::Fill).height(HEIGHT),
             canvas(Marks(t)).width(iced::Length::Fill).height(HEIGHT),
-        ]
-        .into()
+        ];
+        // Zoomed in, what is outside the window is drawn outside the widget;
+        // canvases don't clip, so the container does.
+        iced::widget::container(layers).clip(true).into()
     }
 
     /// A cut block's left and right edges.
@@ -172,8 +204,10 @@ impl canvas::Program<Message> for Pictures {
             let clip = Rectangle::new(Point::new(l + inset, inset), Size::new(r - l - 2.0 * inset, th));
             let per_px = c.len / (r - l) as f64;
             frame.with_clip(clip, |f| {
-                let mut x = clip.x;
-                while x < clip.x + clip.width {
+                // From the first tile in sight: zoomed in, a block can be
+                // far wider than the widget.
+                let mut x = clip.x + ((-clip.x) / tw).floor().max(0.0) * tw;
+                while x < (clip.x + clip.width).min(bounds.width) {
                     let t = c.start + (x + tw / 2.0 - l) as f64 * per_px;
                     if let Some(h) = c.thumb_at(t) {
                         f.draw_image(Rectangle::new(Point::new(x, inset), Size::new(tw, th)), canvas::Image::new(h.clone()));
@@ -197,19 +231,50 @@ impl std::ops::Deref for Marks {
 }
 
 impl canvas::Program<Message> for Marks {
-    type State = Drag;
+    type State = State;
 
-    fn update(&self, drag: &mut Drag, event: &iced::Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<canvas::Action<Message>> {
-        use iced::Event::Mouse;
+    fn update(&self, state: &mut State, event: &iced::Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<canvas::Action<Message>> {
+        use iced::Event::{Keyboard, Mouse};
+        let drag = &mut state.drag;
         match event {
+            Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
+                state.shift = m.shift();
+                None
+            }
+            Mouse(mouse::Event::WheelScrolled { delta }) => {
+                let p = cursor.position_in(bounds)?;
+                let (dx, dy) = match *delta {
+                    mouse::ScrollDelta::Lines { x, y } => (x, y),
+                    mouse::ScrollDelta::Pixels { x, y } => (x / 40.0, y / 40.0),
+                };
+                let (pan, zoom) = if state.shift { (dx + dy, 0.0) } else { (dx, dy) };
+                let message = if zoom != 0.0 {
+                    Message::TimelineZoom(1.25f64.powf(zoom as f64), Some(self.t(p.x, bounds)))
+                } else if pan != 0.0 {
+                    Message::TimelinePan(self.start - pan as f64 * self.span * 0.1)
+                } else {
+                    return None;
+                };
+                Some(canvas::Action::publish(message).and_capture())
+            }
             Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let p = cursor.position_in(bounds)?;
-                let message = if p.y < CUTS {
+                let message = if p.y >= HEIGHT - SCROLL {
+                    if !self.zoomed() {
+                        return None;
+                    }
+                    // On the thumb, drag it; elsewhere on the bar, centre it there first.
+                    let (l, r) = self.scroll_thumb(bounds);
+                    let per_px = self.duration / Timeline::width(bounds) as f64;
+                    let start = if p.x >= l && p.x <= r { self.start } else { self.start + (p.x - (l + r) / 2.0) as f64 * per_px };
+                    *drag = Drag::Scroll { x0: p.x, start };
+                    Message::TimelinePan(start)
+                } else if p.y < CUTS {
                     let cut = self.block_at(p.x, bounds)?;
                     let c = &self.blocks[cut];
                     match self.edge_at(cut, p.x, bounds) {
                         Some(start) => {
-                            let per_px = self.duration / Timeline::width(bounds) as f64;
+                            let per_px = self.span / Timeline::width(bounds) as f64;
                             *drag = Drag::Trim { cut, start, x0: p.x, from: if start { c.start } else { c.start + c.len }, per_px };
                         }
                         None => *drag = Drag::Move { cut, x0: p.x, moved: false, to: cut },
@@ -240,20 +305,22 @@ impl canvas::Program<Message> for Marks {
                         *to = self.drop_at(x, bounds);
                         return Some(canvas::Action::request_redraw().and_capture());
                     }
+                    Drag::Scroll { x0, start } => Message::TimelinePan(*start + (x - *x0) as f64 * self.duration / Timeline::width(bounds) as f64),
                 };
                 Some(canvas::Action::publish(message).and_capture())
             }
             Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => match std::mem::take(drag) {
                 Drag::None => None,
                 Drag::Move { cut, moved: true, to, .. } => Some(canvas::Action::publish(Message::MoveCut(cut, to)).and_capture()),
-                Drag::Move { .. } => Some(canvas::Action::request_redraw().and_capture()),
+                Drag::Move { .. } | Drag::Scroll { .. } => Some(canvas::Action::request_redraw().and_capture()),
                 Drag::Playhead | Drag::Key { .. } | Drag::Trim { .. } => Some(canvas::Action::publish(Message::ScrubDone).and_capture()),
             },
             _ => None,
         }
     }
 
-    fn draw(&self, drag: &Drag, renderer: &Renderer, theme: &Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+    fn draw(&self, state: &State, renderer: &Renderer, theme: &Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let drag = &state.drag;
         let palette = theme.extended_palette();
         let mut frame = Frame::new(renderer, bounds.size());
         for (i, c) in self.blocks.iter().enumerate() {
@@ -289,7 +356,7 @@ impl canvas::Program<Message> for Marks {
             frame.fill(&Path::rectangle(Point::new(x - 1.5, 0.0), Size::new(3.0, CUTS)), palette.primary.strong.color);
         }
 
-        let mid = CUTS + (bounds.height - CUTS) / 2.0;
+        let mid = CUTS + (bounds.height - CUTS - SCROLL) / 2.0;
         let (x0, x1) = (self.x(0.0, bounds), self.x(self.duration, bounds));
         let bar = |from: f32, to: f32| Path::rounded_rectangle(Point::new(from, mid - BAR / 2.0), Size::new((to - from).max(0.0), BAR), (BAR / 2.0).into());
         frame.fill(&bar(x0, x1), palette.background.strong.color);
@@ -322,14 +389,25 @@ impl canvas::Program<Message> for Marks {
         }
         frame.fill(&Path::rectangle(Point::new(at - 1.0, 0.0), Size::new(2.0, CUTS)), palette.primary.strong.color);
         frame.fill(&Path::circle(Point::new(at, mid), BAR), palette.primary.strong.color);
+        if self.zoomed() {
+            let y = HEIGHT - SCROLL / 2.0 - SCROLL_BAR / 2.0;
+            let pill = |l: f32, r: f32| Path::rounded_rectangle(Point::new(l, y), Size::new((r - l).max(SCROLL_BAR), SCROLL_BAR), (SCROLL_BAR / 2.0).into());
+            frame.fill(&pill(PICK, PICK + Timeline::width(bounds)), palette.background.strong.color);
+            let (l, r) = self.scroll_thumb(bounds);
+            let active = matches!(drag, Drag::Scroll { .. });
+            frame.fill(&pill(l, r), if active { palette.primary.strong.color } else { palette.background.base.text.scale_alpha(0.5) });
+        }
         vec![frame.into_geometry()]
     }
 
-    fn mouse_interaction(&self, drag: &Drag, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
-        match drag {
+    fn mouse_interaction(&self, state: &State, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
+        match state.drag {
             Drag::Trim { .. } => mouse::Interaction::ResizingHorizontally,
             Drag::None => {
                 let Some(p) = cursor.position_in(bounds) else { return mouse::Interaction::default() };
+                if p.y >= HEIGHT - SCROLL {
+                    return if self.zoomed() { mouse::Interaction::Grab } else { mouse::Interaction::default() };
+                }
                 if p.y >= CUTS {
                     return if self.key_at(p.x, bounds).is_some() { mouse::Interaction::Grab } else { mouse::Interaction::Pointer };
                 }

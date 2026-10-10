@@ -252,6 +252,13 @@ enum Message {
     KeyAdd,
     /// Delete the keyframe at the playhead.
     KeyDelete,
+    /// Zoom the timeline by a factor, keeping edit time `.1` (the playhead
+    /// if `None`) where it is on screen.
+    TimelineZoom(f64, Option<f64>),
+    /// Zoom the timeline to slider position `.0` (0 whole edit, 1 closest).
+    TimelineZoomTo(f64),
+    /// Scroll the timeline so it starts at edit time `.0`.
+    TimelinePan(f64),
     /// A thumbnail of clip `.0` at clip time `.1`.
     Thumb(PathBuf, f64, image::Handle),
     /// How the keyframe at the playhead moves on to the next.
@@ -322,6 +329,10 @@ struct App {
     exporting: Option<(Arc<std::sync::atomic::AtomicBool>, f32)>,
     /// A trim or keyframe drag has saved the edit for undo already.
     dragging: bool,
+    /// Timeline zoom (1 shows the whole edit) and the edit time at its left
+    /// edge; `timeline_window` keeps them in range.
+    timeline_zoom: f64,
+    timeline_start: f64,
     clip: Option<Clip>,
     /// The picture as it was drawn when the playhead crossed into another
     /// cut, kept until that cut's first frame arrives. Drawing the old frame
@@ -361,6 +372,8 @@ impl App {
             current: 0,
             selected: None,
             dragging: false,
+            timeline_zoom: 1.0,
+            timeline_start: 0.0,
             queue: Default::default(),
             loading_adds: true,
             project: None,
@@ -765,8 +778,21 @@ impl App {
                     self.error = Some(format!("Saving the project failed: {e:#}"));
                 }
             },
-            Message::Tick => self.tick(),
-            Message::Key(key, mods) => return self.key(key, mods),
+            Message::Tick => {
+                self.tick();
+                if self.clip.as_ref().is_some_and(|c| c.playback.playing) {
+                    self.reveal_playhead();
+                }
+            }
+            Message::Key(key, mods) => {
+                let task = self.key(key, mods);
+                // Keys can seek out of sight (arrows, [ ]): follow.
+                self.reveal_playhead();
+                return task;
+            }
+            Message::TimelineZoom(factor, anchor) => self.zoom_timeline(self.timeline_zoom * factor, anchor),
+            Message::TimelineZoomTo(v) => self.zoom_timeline(self.timeline_most_zoom().powf(v), None),
+            Message::TimelinePan(start) => self.timeline_start = start,
             Message::Toggle => {
                 self.follow = true;
                 let playing = self.clip.as_ref().is_some_and(|c| c.playback.playing);
@@ -1193,6 +1219,40 @@ impl App {
         }
     }
 
+    /// The stretch of edit time the timeline shows: (start, span).
+    fn timeline_window(&self) -> (f64, f64) {
+        let d = self.edit.duration();
+        let span = (d / self.timeline_zoom).max(TIMELINE_SPAN.min(d));
+        (self.timeline_start.clamp(0.0, (d - span).max(0.0)), span)
+    }
+
+    /// The closest zoom: `TIMELINE_SPAN` seconds across.
+    fn timeline_most_zoom(&self) -> f64 {
+        (self.edit.duration() / TIMELINE_SPAN).max(1.0)
+    }
+
+    /// Zooms the timeline keeping `anchor` in place: by default the playhead
+    /// if it is in sight, else the middle.
+    fn zoom_timeline(&mut self, zoom: f64, anchor: Option<f64>) {
+        let (start, span) = self.timeline_window();
+        let position = self.position();
+        let anchor = anchor.unwrap_or(if position >= start && position <= start + span { position } else { start + span / 2.0 });
+        self.timeline_zoom = zoom.clamp(1.0, self.timeline_most_zoom());
+        let (_, new_span) = self.timeline_window();
+        self.timeline_start = anchor - (anchor - start) / span.max(1e-9) * new_span;
+        self.timeline_start = self.timeline_window().0;
+    }
+
+    /// Scrolls the timeline to keep the playhead in sight, a page at a time.
+    fn reveal_playhead(&mut self) {
+        let (start, span) = self.timeline_window();
+        let position = self.position();
+        if position < start || position > start + span {
+            self.timeline_start = (position - span * 0.05).max(0.0);
+        }
+        self.timeline_start = self.timeline_window().0;
+    }
+
     fn key(&mut self, key: Key, mods: keyboard::Modifiers) -> Task<Message> {
         let step = 5.0;
         match key.as_ref() {
@@ -1223,6 +1283,9 @@ impl App {
                 "c" | "C" => return self.update(Message::Split),
                 "q" | "Q" => self.free_look().roll -= step,
                 "e" | "E" => self.free_look().roll += step,
+                "=" | "+" if mods.command() => return self.update(Message::TimelineZoom(1.5, None)),
+                "-" if mods.command() => return self.update(Message::TimelineZoom(1.0 / 1.5, None)),
+                "0" if mods.command() => return self.update(Message::TimelineZoomTo(0.0)),
                 "0" => self.free_look().reset(),
                 "k" | "K" => return self.update(Message::KeyAdd),
                 "j" | "J" => {
@@ -1353,9 +1416,12 @@ impl App {
                 block
             })
             .collect();
+        let (timeline_start, timeline_span) = self.timeline_window();
         let timeline = timeline::Timeline {
             blocks,
             duration: self.edit.duration(),
+            start: timeline_start,
+            span: timeline_span,
             position: self.position(),
             selected: self.selected,
             current: current.map(|k| (self.current, k)),
@@ -1394,6 +1460,14 @@ impl App {
             ),
             tooltip(icon_button(UNDO, Some(Message::Undo)), text("Undo (Ctrl+Z)"), tooltip::Position::Top),
             tooltip(icon_button(REDO, Some(Message::Redo)), text("Redo (Ctrl+Shift+Z)"), tooltip::Position::Top),
+            tooltip(icon_button(ZOOM_OUT, Some(Message::TimelineZoom(1.0 / 1.5, None))), text("Zoom the timeline out (Ctrl+−, or scroll on it)"), tooltip::Position::Top),
+            tooltip(
+                slider(0.0..=1.0, self.timeline_zoom.ln() / self.timeline_most_zoom().ln().max(1e-9), Message::TimelineZoomTo).step(0.001).width(90),
+                text("Timeline zoom"),
+                tooltip::Position::Top,
+            ),
+            tooltip(icon_button(ZOOM_IN, Some(Message::TimelineZoom(1.5, None))), text("Zoom the timeline in (Ctrl+=, or scroll on it)"), tooltip::Position::Top),
+            tooltip(icon_button(ZOOM_FIT, Some(Message::TimelineZoomTo(0.0))), text("Show the whole edit (Ctrl+0)"), tooltip::Position::Top),
             space().width(Length::Fill),
             tooltip(
                 button(svg(svg::Handle::from_memory(if self.muted { SPEAKER_MUTED } else { SPEAKER })).width(20).height(20))
@@ -1459,6 +1533,14 @@ fn credit<'a>() -> Element<'a, Message> {
 const SPLIT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.1 15.9M14.5 14.5 20 20M8.1 8.1 12 12"/></svg>"#;
 const DELETE_CUT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/></svg>"#;
 const UNDO: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>"#;
+/// The timeline zooms in until this many seconds fill it.
+const TIMELINE_SPAN: f64 = 2.0;
+
+/// Timeline zoom icons: a magnifier with a minus or plus, and arrows out to
+/// both ends (fit).
+const ZOOM_OUT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round"><circle cx="10" cy="10" r="7"/><path d="m21 21-6-6M7 10h6"/></svg>"#;
+const ZOOM_IN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round"><circle cx="10" cy="10" r="7"/><path d="m21 21-6-6M7 10h6M10 7v6"/></svg>"#;
+const ZOOM_FIT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5v14M21 5v14M7 12h10M10 9l-3 3 3 3M14 9l3 3-3 3"/></svg>"#;
 const REDO: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg>"#;
 
 /// A short name for a clip on the timeline: DJI's clip number (the digits
