@@ -48,6 +48,16 @@ const DISTANCE_PRIOR: f64 = 0.06;
 /// frame-to-frame wobble of the shift ~4× (`rosmo360 seam` on 0037, 0026,
 /// 0043) without leaving more ghosting.
 const TEMPORAL: f64 = 0.1;
+/// Matching runs on detail only: each strip minus its local mean over this
+/// radius. On raw brightness, smooth sky gradients (sun haze, the lenses'
+/// leftover exposure difference) "matched" at large shifts, warping the sky
+/// along the seam into faint streaks. With detail only, the sky warped
+/// 5× less (4.3% → 0.8% of it changed on 0043 at 8.81 s) and eased jitter
+/// fell up to 5× (0037: 0.076° → 0.014°), for ~1% more mismatch.
+const DETAIL_RADIUS: isize = 4;
+/// How much a shift's cost must beat no shift by: with the detail-only
+/// matching, sky changes fell to 0.5% at 2–3% more mismatch.
+const ZERO_MARGIN: f64 = 0.05;
 
 /// δ in radians per cell: how much further from lens 0's axis lens 1 sees
 /// the content at that output angle.
@@ -134,8 +144,9 @@ impl Aligner {
     /// The disparity field of one frame; `prev` is the field shown on the
     /// frame before, when this one follows on from it.
     pub fn measure(&self, strips: &Strips, prev: Option<&Field>) -> Field {
+        let detail = [highpass(&strips.0[0], DETAIL_RADIUS), highpass(&strips.0[1], DETAIL_RADIUS)];
         let mut cells: Vec<f32> =
-            (0..CELLS_PHI * CELLS_ALPHA).into_par_iter().map(|c| match_cell(&strips.0, c % CELLS_PHI, c / CELLS_PHI, prev.map(|p| p.0[c]))).collect();
+            (0..CELLS_PHI * CELLS_ALPHA).into_par_iter().map(|c| match_cell(&detail, c % CELLS_PHI, c / CELLS_PHI, prev.map(|p| p.0[c]))).collect();
         fill_and_smooth(&mut cells);
         Field(cells)
     }
@@ -270,6 +281,13 @@ fn match_cell(strips: &[Vec<f32>; 2], cx: usize, cy: usize, prev: Option<f32>) -
     if c > 0.5 {
         return f32::NAN;
     }
+    // A shift has to beat no shift clearly, or smooth sky drifts.
+    if let Some(&c0) = costs.get(MAX_HALF as usize)
+        && !c0.is_nan()
+        && c0 - c < ZERO_MARGIN
+    {
+        return 0.0;
+    }
     // Sub-row refinement from the neighbouring costs.
     let mut k = best as f64 - MAX_HALF as f64;
     if best > 0 && best + 1 < costs.len() && !costs[best - 1].is_nan() && !costs[best + 1].is_nan() {
@@ -280,6 +298,36 @@ fn match_cell(strips: &[Vec<f32>; 2], cx: usize, cy: usize, prev: Option<f32>) -
         }
     }
     (2.0 * k * STRIP_STEP).to_radians() as f32
+}
+
+/// The strip minus its local mean over a (2r+1)² box of valid pixels, so
+/// only edges and texture are left to match.
+fn highpass(s: &[f32], r: isize) -> Vec<f32> {
+    (0..STRIP_W * STRIP_H)
+        .into_par_iter()
+        .map(|i| {
+            let v = s[i];
+            if v.is_nan() {
+                return f32::NAN;
+            }
+            let (x, y) = ((i % STRIP_W) as isize, (i / STRIP_W) as isize);
+            let (mut sum, mut n) = (0.0f32, 0.0f32);
+            for dy in -r..=r {
+                let yy = y + dy;
+                if yy < 0 || yy >= STRIP_H as isize {
+                    continue;
+                }
+                for dx in -r..=r {
+                    let w = s[yy as usize * STRIP_W + (x + dx).rem_euclid(STRIP_W as isize) as usize];
+                    if !w.is_nan() {
+                        sum += w;
+                        n += 1.0;
+                    }
+                }
+            }
+            v - sum / n
+        })
+        .collect()
 }
 
 /// Fills unmeasured cells from their neighbours (or zero, the calibration's
