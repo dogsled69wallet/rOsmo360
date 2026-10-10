@@ -7,6 +7,7 @@
 //! each keyframe on the same moment of footage. Keyframes outside the cut's
 //! in and out points are kept, so extending the cut again brings them back.
 
+use crate::stab::Mode;
 use crate::view::{Aspect, Camera, Keyframes, Projection, View};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,10 @@ pub struct Cut {
     pub end: f64,
     #[serde(default)]
     pub keyframes: Keyframes,
+    /// Its stabilisation, or the export's `--stabilize` (horizon by
+    /// default) if it doesn't set one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stabilize: Option<Mode>,
 }
 
 impl Project {
@@ -91,7 +96,7 @@ mod tests {
             &path,
             r#"{"aspect": "9:16", "cuts": [
                 {"input": "a.OSV", "in": 28, "out": 37, "keyframes": [{"t": 28, "yaw": -20}, {"t": 37, "projection": "little-planet"}]},
-                {"input": "/clips/b.OSV", "in": 5, "out": 12}
+                {"input": "/clips/b.OSV", "in": 5, "out": 12, "stabilize": "lock"}
             ]}"#,
         )
         .unwrap();
@@ -100,6 +105,7 @@ mod tests {
         assert_eq!(p.cuts[1].input, PathBuf::from("/clips/b.OSV"));
         assert_eq!(p.duration(), 16.0);
         assert_eq!(p.cuts[1].keyframes.len(), 0);
+        assert_eq!((p.cuts[0].stabilize, p.cuts[1].stabilize), (None, Some(Mode::Lock)));
         assert_eq!(p.cuts[0].keyframes[1].view.projection, Projection::LittlePlanet);
         let saved = dir.join("again.json");
         p.save(&saved).unwrap();

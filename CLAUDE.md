@@ -46,10 +46,9 @@ Not done yet, roughly in priority order:
 2. **Native widget shapes.** native-theme-iced's per-widget styles (radii, padding, pressed and focus states); only the colours follow the OS today.
 3. **Windows and macOS groundwork.** Add `d3d11va` and `videotoolbox` to `Hwaccel::pick`, and `cargo check` for both targets. Then hide the console window on Windows (the CLI commands still need one), and bundle ffmpeg or document installing it (mind its GPL builds). A macOS `.app` would need signing and notarisation.
 4. **Seam, what's left.** Patch matching is tuned out, the stick is handled by the cut, and the sky by detail-only matching (see Seam below). Further gains need per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
-5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
+5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), stabilisation per cut, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
    - Thumbnails on the cut blocks.
    - Crossfades between cuts.
-   - Stabilisation mode per cut.
    - `preview` reading projects.
    - GPU export: the CPU export runs ~5 fps at 1080p.
    - Spherical metadata on equirect export.
@@ -106,7 +105,7 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
   - Rolling-shutter re-aim.
 - `src/stab.rs`: `Stabilizer::rig_from_view(t_ms, readout_ms, steps)`, and `pose` (heading, tilt) for `scan`. Defines the `Mode` and `ImuAxes` enums.
 - `src/view.rs`: `View` (yaw/pitch/roll/fov in degrees, projection), `Reframe` (keyframes, JSON with carry-over of missing fields) and `Camera` (what gets drawn). Shared by the player and `export`/`preview`. `Camera::ray` mirrors the shader's `screen_ray`; change them together.
-- `src/project.rs`: `Project` (aspect, cuts) and `Cut` (input, in, out, its own `Keyframes` in clip time). Keyframes stay pinned to the footage, so moving or trimming a cut keeps its camera moves; those outside in/out are kept for when it is extended again.
+- `src/project.rs`: `Project` (aspect, cuts) and `Cut` (input, in, out, its own `Keyframes` in clip time, and an optional `stabilize` that wins over `--stabilize`; the player sets it on every cut, from the picker or S while that cut plays). Keyframes stay pinned to the footage, so moving or trimming a cut keeps its camera moves; those outside in/out are kept for when it is extended again.
 - `src/sheet.rs`: contact sheets for `preview`, with a tiny built-in bitmap font for the time labels.
 - `src/ring.rs`: the seam ring: azimuth φ around lens 0's axis and angle α from it.
 - `src/exposure.rs`: per-frame exposure matching (`Seam::measure`, `Seam::gain`).

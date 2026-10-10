@@ -115,7 +115,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn cut(name: &str, start: f64, end: f64) -> Cut {
-        Cut { input: PathBuf::from(name), start, end, keyframes: Default::default() }
+        Cut { input: PathBuf::from(name), start, end, keyframes: Default::default(), stabilize: None }
     }
 
     fn edit() -> Edit {

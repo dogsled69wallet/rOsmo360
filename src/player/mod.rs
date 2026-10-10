@@ -658,7 +658,11 @@ impl App {
                     }
                 };
                 // Cuts of clips that are gone can't play; say so and leave them out.
-                let (cuts, missing): (Vec<_>, Vec<_>) = project.cuts.into_iter().partition(|c| c.input.exists());
+                let (mut cuts, missing): (Vec<_>, Vec<_>) = project.cuts.into_iter().partition(|c| c.input.exists());
+                // Each cut gets a mode of its own, so changing one leaves the rest.
+                for c in &mut cuts {
+                    c.stabilize.get_or_insert(self.opts.stabilize);
+                }
                 self.error = (!missing.is_empty()).then(|| {
                     let names: Vec<_> = missing.iter().map(|c| c.input.display().to_string()).collect();
                     format!("Left out cuts of missing clips: {}", names.join(", "))
@@ -881,7 +885,12 @@ impl App {
             Message::Zoom(deg) => self.free_look().zoom_by(deg),
             Message::Fov(deg) => self.free_look().fov = deg,
             Message::Stab(mode) => {
+                // The playing cut's, and the one new cuts get.
                 self.opts.stabilize = mode;
+                if self.edit.cuts.get(self.current).is_some_and(|c| c.stabilize != Some(mode)) {
+                    self.edit.checkpoint();
+                    self.edit.cuts[self.current].stabilize = Some(mode);
+                }
                 self.with_playback(|p| p.media.stab.set_mode(mode));
             }
             Message::Projection(p) => {
@@ -1050,7 +1059,7 @@ impl App {
     /// ones leave playback where it is.
     fn add_cut(&mut self, input: PathBuf, duration: f64) {
         self.edit.checkpoint();
-        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default() });
+        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default(), stabilize: Some(self.opts.stabilize) });
         let i = self.edit.cuts.len() - 1;
         self.selected = Some(i);
         if self.clip.is_none() {
@@ -1075,16 +1084,14 @@ impl App {
                 let Some(media) = self.library.iter().find(|m| m.input == cut.input) else { return };
                 let mut media = media.clone();
                 media.osv_size = self.opts.osv_size;
-                media.stab.set_mode(self.opts.stabilize);
                 let mut playback = Playback::new(media, self.volume(), self.full_on_pause);
                 playback.jump(t, play);
                 self.clip = Some(Clip { playback, shown: None });
             }
         }
         self.current = i;
-        if let Some(c) = &self.clip {
-            self.error = c.playback.error.clone();
-        }
+        let mode = self.edit.cuts[i].stabilize.unwrap_or(self.opts.stabilize);
+        self.with_playback(|p| p.media.stab.set_mode(mode));
     }
 
     /// Follows a drag (the playhead, a trim, a keyframe) to clip time `t`
@@ -1321,7 +1328,7 @@ impl App {
             .iter()
             .map(|c| {
                 let keys = c.keyframes.iter().enumerate().filter(|(_, k)| k.t >= c.start - tolerance && k.t <= c.end + tolerance).map(|(i, k)| (i, k.t, k.ease)).collect();
-                let block = timeline::Block { label: format!("{} · {:.1} s", clip_name(&c.input), c.end - c.start), from, len: c.end - c.start, start: c.start, keys };
+                let block = timeline::Block { label: cut_label(c, self.opts.stabilize), from, len: c.end - c.start, start: c.start, keys };
                 from += c.end - c.start;
                 block
             })
@@ -1489,6 +1496,17 @@ fn theme_changes() -> impl iced::futures::Stream<Item = Message> {
 
 fn labelled<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     row![text(label), widget.into()].spacing(6).align_y(Alignment::Center).into()
+}
+
+/// A cut's name on the timeline: its clip, length, and stabilisation when
+/// that isn't horizon (the usual).
+fn cut_label(c: &Cut, default: Mode) -> String {
+    let label = format!("{} · {:.1} s", clip_name(&c.input), c.end - c.start);
+    match c.stabilize.unwrap_or(default) {
+        Mode::Horizon => label,
+        Mode::Off => format!("{label} · unstabilised"),
+        Mode::Lock => format!("{label} · world lock"),
+    }
 }
 
 fn clock(t: f64) -> String {

@@ -273,7 +273,7 @@ fn parse_size(s: &str) -> Result<[u32; 2], String> {
     Ok([w, h])
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct StitchOpts {
     /// Use this alternative calibration (see `rig`'s `variants`) instead of the default.
     #[arg(long)]
@@ -493,10 +493,12 @@ fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), d
     // Per cut: its clip's pipeline, start (on a frame) and frame count.
     let mut plan = Vec::with_capacity(project.cuts.len());
     for cut in &project.cuts {
-        let i = match pipelines.iter().position(|p| p.input == cut.input) {
+        // The cut's own stabilisation wins over the command's.
+        let mode = cut.stabilize.or(opts.stabilize).unwrap_or(stab::Mode::Horizon);
+        let i = match pipelines.iter().position(|p| p.input == cut.input && p.stab.mode() == mode) {
             Some(i) => i,
             None => {
-                let mut p = Pipeline::new(&cut.input, opts, stab::Mode::Horizon)?;
+                let mut p = Pipeline::new(&cut.input, &StitchOpts { stabilize: Some(mode), ..opts.clone() }, mode)?;
                 if draft {
                     p.use_proxy();
                 }
@@ -619,7 +621,7 @@ fn main() -> Result<()> {
                 // One clip is a project of one cut.
                 let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
                 let (start, end) = span(&input, start, duration, Some(&reframe))?;
-                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes }] }
+                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None }] }
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
