@@ -63,6 +63,8 @@ The program is `target/release/rosmo360`.
 
 ## Usage
 
+The **[user guide](docs/user-guide.md)** walks through the whole app with screenshots: watching, projections, stabilisation, the timeline, keyframes, projects and exporting.
+
 ```sh
 rosmo360 play                 # opens the player; use Open… or Ctrl+O
 rosmo360 play clip.OSV        # opens a clip straight away
@@ -180,7 +182,7 @@ rOsmo360 is licensed under either of
 
 at your option. Unless you state otherwise, any contribution you submit for inclusion in rOsmo360 is dual-licensed as above, without any additional terms or conditions.
 
-The Vibing with Ravelund logo ([`vibewithravelund-lowres-corrected.jpg`](vibewithravelund-lowres-corrected.jpg)) and the screenshot ([`docs/screenshot.png`](docs/screenshot.png)) are not covered by these licences; all rights reserved.
+The Vibing with Ravelund logo ([`vibewithravelund-lowres-corrected.jpg`](vibewithravelund-lowres-corrected.jpg)) and the screenshots ([`docs/screenshot.png`](docs/screenshot.png) and those in [`docs/guide/`](docs/guide/)) are not covered by these licences; all rights reserved.
 
 ## Support
 
