@@ -110,7 +110,7 @@ pub fn run(input: Option<PathBuf>, opts: Options) -> Result<()> {
     )
     .title(App::title)
     .subscription(App::subscription)
-    .theme(|_: &App| Theme::Dark)
+    .theme(|app: &App| app.theme.clone())
     .window_size((1280.0, 820.0))
     .run()
     .context("running the player window")
@@ -274,6 +274,8 @@ enum Message {
     Mute,
     Volume(f32),
     Aspect(Aspect),
+    /// The OS theme changed; read it again.
+    ThemeChanged,
     /// The 360 view's size on screen, so a saved view keeps its shape.
     ViewSize(Size),
     Save(Saving),
@@ -285,6 +287,7 @@ enum Message {
 
 struct App {
     opts: Options,
+    theme: Theme,
     clip: Option<Clip>,
     loading: Option<PathBuf>,
     error: Option<String>,
@@ -303,6 +306,7 @@ impl App {
     fn new(opts: Options) -> Self {
         App {
             opts,
+            theme: system_theme(),
             clip: None,
             loading: None,
             error: None,
@@ -345,8 +349,9 @@ impl App {
             keyboard::Event::KeyPressed { key, modifiers, .. } => Some(Message::Key(key, modifiers)),
             _ => None,
         });
+        let theme = Subscription::run(theme_changes);
         let busy = self.clip.as_ref().is_some_and(|c| c.playback.busy());
-        if busy { Subscription::batch([keys, window::frames().map(|_| Message::Tick)]) } else { keys }
+        if busy { Subscription::batch([keys, theme, window::frames().map(|_| Message::Tick)]) } else { Subscription::batch([keys, theme]) }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -409,6 +414,7 @@ impl App {
             Message::RollingShutter(on) => self.rolling_shutter = on,
             Message::ViewSize(size) => self.view_size = size,
             Message::Aspect(a) => self.aspect = a,
+            Message::ThemeChanged => self.theme = system_theme(),
             Message::Save(what) => {
                 let Some(c) = &self.clip else { return Task::none() };
                 let media = &c.playback.media;
@@ -655,6 +661,39 @@ impl App {
 /// Speaker icons for the mute button, drawn in the button's text colour.
 const SPEAKER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z" fill="white"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/></svg>"#;
 const SPEAKER_MUTED: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z" fill="white"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></svg>"#;
+
+/// The OS's own colours (KDE colour scheme, GTK/portal, Windows, macOS), so
+/// the player looks like the rest of the desktop; iced's dark theme where
+/// they can't be read.
+fn system_theme() -> Theme {
+    match native_theme_iced::from_system() {
+        Ok((theme, ..)) => theme,
+        Err(e) => {
+            eprintln!("using the default theme: {e}");
+            Theme::Dark
+        }
+    }
+}
+
+/// A message whenever the OS theme changes. The watcher calls back on its
+/// own thread; a channel hands that to iced.
+fn theme_changes() -> impl iced::futures::Stream<Item = Message> {
+    use iced::futures::{SinkExt, StreamExt};
+    iced::stream::channel(1, async |mut output: iced::futures::channel::mpsc::Sender<Message>| {
+        let (tx, mut rx) = iced::futures::channel::mpsc::unbounded();
+        let _watch = match native_theme::watch::on_theme_change(move |_| {
+            let _ = tx.unbounded_send(());
+        }) {
+            Ok(w) => w,
+            Err(e) => return eprintln!("not following theme changes: {e}"),
+        };
+        while rx.next().await.is_some() {
+            if output.send(Message::ThemeChanged).await.is_err() {
+                break;
+            }
+        }
+    })
+}
 
 fn labelled<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     row![text(label), widget.into()].spacing(6).align_y(Alignment::Center).into()

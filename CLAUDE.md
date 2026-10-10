@@ -28,6 +28,7 @@ Working and verified on real footage:
   - Plays the LRF proxy (or the OSV at 1920 px or full size) and swaps in a full-res frame on pause.
   - Sound through cpal, with a mute icon and volume slider. While sound plays it is the playback clock.
   - Aspect lock (Free, 16:9, 9:16, 4:3, 1:1, 2:1) letterboxes the view; a saved view takes the same shape.
+  - Follows the OS theme and accent through native-theme (KDE colour scheme, GTK/portal, Windows, macOS), live when it changes. iced's dark theme is the fallback.
   - Save the paused frame as PNG: the view as framed (3840 px on the long side) or the whole sphere (7680 × 3840). The CPU stitcher renders it from freshly decoded full-res frames in about 4 s.
 - **Hardware decode on any GPU vendor:** the first of Vulkan Video, VA-API and CUDA that decodes a test frame, else software. `--hwaccel` forces one.
 
@@ -36,7 +37,9 @@ Not done yet, roughly in priority order:
 1. **Zero-copy decode.** Hand Vulkan Video frames to wgpu without the CPU round trip. This would allow full-res playback on the dev laptop.
 2. **Seam ghosting, next step.** Patch matching is tuned out (see Seam below); what ghosting is left needs per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
 3. **Export from the player** with the current view or keyframed reframing to a flat MP4. Also write spherical metadata on equirect export.
-4. **Colour.** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
+4. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
+   - Needs a D-Log M sample clip first: all 35 Kyrkja clips are normal colour, tagged BT.709 10-bit, as DJI may also tag D-Log.
+   - DJI records the profile in `StreamMeta.color_mode` (`ColorModeType`: D_LOG = 2, HLG = 9, …). telemetry-parser's Metadata tag only serialises the clip meta, so reading it means decoding StreamMeta ourselves.
 
 ## Commands
 
