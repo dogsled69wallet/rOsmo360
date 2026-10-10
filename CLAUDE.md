@@ -47,6 +47,7 @@ $B play [clip.OSV]                                    # player (see `$B play --h
 $B stitch clip.OSV -t 10 -w 2048 --stabilize horizon -o f.png
 $B render clip.OSV -s 48 -d 12 -w 1280 --stabilize horizon -o out.mp4
 $B rig clip.OSV > rig.json;  $B imu clip.OSV > imu.csv
+$B seam clip.OSV -s 10 -d 3 > seam.csv                 # seam alignment quality (summary on stderr)
 ```
 
 Debug flags on `stitch`/`render`:
@@ -147,6 +148,10 @@ How it was found:
 - Ghosting from close subjects is parallax across the seam (along α). The convergence variants don't fix it: no single distance suits both a hand at 0.5 m and mountains. A hard cut where the lenses disagree drew lines in the sky (before exposure matching) and was dropped.
 - Alignment matches zero-mean NCC patches symmetrically about the output angle (lens 0 at α − δ/2, lens 1 at α + δ/2), so the field needs no inversion. Featureless patches fall back to δ = 0, the calibration's own alignment.
 - telemetry-parser's `DjiMaskProfile` covers the housing and lens guards, not the stick or hands.
+- Tuning with `osmo360 seam` (mismatch = mean lens disagreement across the blend band; jitter = mean per-frame change of the shift):
+  - A temporal term (cost per degree from last frame's shift, 0.1) plus a stronger distance prior (0.06) cut eased jitter ~4× (0037: 0.224° → 0.054°/frame) with equal or lower mismatch.
+  - Bigger patches lower mismatch slightly but double jitter. Finer cells (256 × 13) change mismatch < 0.5%.
+  - A constant shift along the seam (φ) only makes mismatch worse, so the calibration lines up along the seam; the search stays 1-D.
 
 ### Hardware decode through the ffmpeg CLI
 
@@ -170,6 +175,7 @@ How it was found:
 ## How to verify changes
 
 - **Stitch geometry:** run `stitch --only 0` and `--only 1`, then crop around longitude ±90°. Content must match across the overlap. Black areas are DJI's validity masks.
+- **Seam alignment:** `seam` on 0043, 0037 and 0026; compare mismatch (raw/eased vs none) and eased jitter before and after.
 - **Stabilisation axes and sync:** run `--stabilize lock` across a fast pan and track a distant object or the sun; it must stay fixed. Horizon mode must keep the far horizon on latitude 0 at large tilts.
 - **Player:** launch, then screenshot the active window. On KDE use `spectacle -b -n -a -o out.png`. On Hyprland use `hyprctl clients -j` for geometry, `grim -g` to screenshot and `wtype` to send keys; don't separate multiple keys with spaces, because space toggles play. Compare the seek-bar time across two screenshots to check real-time playback.
 

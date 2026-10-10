@@ -273,7 +273,7 @@ impl Playback {
             }
         }
         if let Some(aligner) = &rig.aligner {
-            let now = aligner.measure(|i, u, v| rgb(i, u, v).map(|c| c.iter().sum::<f64>() / 3.0));
+            let now = aligner.measure(&aligner.strips(|i, u, v| rgb(i, u, v).map(|c| c.iter().sum::<f64>() / 3.0)), continuous.then_some(&self.fix.field));
             if continuous {
                 self.fix.field.ease(&now, align::EASE);
             } else {

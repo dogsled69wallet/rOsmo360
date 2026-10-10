@@ -41,7 +41,12 @@ const PATCH_W: isize = 8;
 const PATCH_H: isize = 6;
 /// Cost added per degree of shift, so featureless patches settle on the
 /// calibration's own (distant) alignment.
-const DISTANCE_PRIOR: f64 = 0.02;
+const DISTANCE_PRIOR: f64 = 0.06;
+/// Cost added per degree away from the previous frame's shift: a cell only
+/// moves when the picture clearly says so. With the prior above this cut
+/// frame-to-frame wobble of the shift ~4× (`osmo360 seam` on 0037, 0026,
+/// 0043) without leaving more ghosting.
+const TEMPORAL: f64 = 0.1;
 
 /// δ in radians per cell: how much further from lens 0's axis lens 1 sees
 /// the content at that output angle.
@@ -76,6 +81,22 @@ impl Field {
     }
 }
 
+/// Both lenses' luma on the strip, NaN where a lens has no picture.
+pub struct Strips([Vec<f32>; 2]);
+
+impl Strips {
+    /// Linear in α between strip rows.
+    fn at(&self, lens: usize, x: usize, y: f64) -> f64 {
+        let y0 = y.floor();
+        if y0 < 0.0 || y0 + 1.0 >= STRIP_H as f64 {
+            return f64::NAN;
+        }
+        let s = &self.0[lens];
+        let (a, b) = (s[y0 as usize * STRIP_W + x] as f64, s[(y0 as usize + 1) * STRIP_W + x] as f64);
+        a + (b - a) * (y - y0)
+    }
+}
+
 pub struct Aligner {
     pub ring: Ring,
     /// Per strip pixel, picture pixels in lens 0 and lens 1.
@@ -96,15 +117,41 @@ impl Aligner {
         Some(Aligner { ring, strip })
     }
 
-    /// The disparity field of one frame. `luma(lens, u, v)` returns 0..1 at
-    /// that lens's picture pixel.
-    pub fn measure(&self, luma: impl Fn(usize, f64, f64) -> Option<f64> + Sync) -> Field {
-        let strips: [Vec<f32>; 2] = [0, 1].map(|l| {
-            self.strip.par_iter().map(|at| at[l].and_then(|(u, v)| luma(l, u, v)).map_or(f32::NAN, |v| v as f32)).collect()
-        });
-        let mut cells: Vec<f32> = (0..CELLS_PHI * CELLS_ALPHA).into_par_iter().map(|c| match_cell(&strips, c % CELLS_PHI, c / CELLS_PHI)).collect();
+    /// Both lenses unrolled onto the strip. `luma(lens, u, v)` returns 0..1
+    /// at that lens's picture pixel.
+    pub fn strips(&self, luma: impl Fn(usize, f64, f64) -> Option<f64> + Sync) -> Strips {
+        Strips([0, 1].map(|l| self.strip.par_iter().map(|at| at[l].and_then(|(u, v)| luma(l, u, v)).map_or(f32::NAN, |v| v as f32)).collect()))
+    }
+
+    /// The disparity field of one frame; `prev` is the field shown on the
+    /// frame before, when this one follows on from it.
+    pub fn measure(&self, strips: &Strips, prev: Option<&Field>) -> Field {
+        let mut cells: Vec<f32> =
+            (0..CELLS_PHI * CELLS_ALPHA).into_par_iter().map(|c| match_cell(&strips.0, c % CELLS_PHI, c / CELLS_PHI, prev.map(|p| p.0[c]))).collect();
         fill_and_smooth(&mut cells);
         Field(cells)
+    }
+
+    /// Mean absolute luma difference between the lenses across the blend
+    /// band once `field` is applied: what ghosting is left.
+    pub fn mismatch(&self, strips: &Strips, field: &Field) -> f64 {
+        let (mut sum, mut n) = (0.0, 0usize);
+        for y in 0..STRIP_H {
+            let a = STRIP_ALPHA_LO + y as f64 * STRIP_STEP;
+            if !(TAPER_LO..=TAPER_HI).contains(&a) {
+                continue;
+            }
+            for x in 0..STRIP_W {
+                let phi = (x as f64 + 0.5) / STRIP_W as f64 * TAU;
+                let half = 0.5 * field.at(phi, a).to_degrees() / STRIP_STEP;
+                let (va, vb) = (strips.at(0, x, y as f64 - half), strips.at(1, x, y as f64 + half));
+                if !va.is_nan() && !vb.is_nan() {
+                    sum += (va - vb).abs();
+                    n += 1;
+                }
+            }
+        }
+        sum / n.max(1) as f64
     }
 
     /// The direction lens `lens` should sample for output direction `d`.
@@ -124,7 +171,7 @@ impl Aligner {
 /// Best shift for one cell by zero-mean normalised cross-correlation, which
 /// ignores any brightness difference left between the lenses. NaN where the
 /// patch has too little texture or overlap to say.
-fn match_cell(strips: &[Vec<f32>; 2], cx: usize, cy: usize) -> f32 {
+fn match_cell(strips: &[Vec<f32>; 2], cx: usize, cy: usize, prev: Option<f32>) -> f32 {
     let x0 = ((cx as f64 + 0.5) * (STRIP_W / CELLS_PHI) as f64) as isize;
     let alpha = CELL_ALPHA_LO + cy as f64 * (CELL_ALPHA_HI - CELL_ALPHA_LO) / (CELLS_ALPHA - 1) as f64;
     let y0 = ((alpha - STRIP_ALPHA_LO) / STRIP_STEP).round() as isize;
@@ -166,7 +213,8 @@ fn match_cell(strips: &[Vec<f32>; 2], cx: usize, cy: usize) -> f32 {
         }
         let ncc = (sab / n - sa / n * sb / n) / (va * vb).sqrt();
         let shift_deg = 2.0 * k as f64 * STRIP_STEP;
-        costs.push(1.0 - ncc + DISTANCE_PRIOR * shift_deg.abs());
+        let temporal = prev.map_or(0.0, |p| TEMPORAL * (shift_deg - (p as f64).to_degrees()).abs());
+        costs.push(1.0 - ncc + DISTANCE_PRIOR * shift_deg.abs() + temporal);
     }
     let Some((best, &c)) = costs.iter().enumerate().filter(|(_, c)| !c.is_nan()).min_by(|a, b| a.1.total_cmp(b.1)) else {
         return f32::NAN;

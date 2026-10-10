@@ -59,6 +59,18 @@ enum Cmd {
         #[arg(long)]
         world_z_down: bool,
     },
+    /// Report how well the seam alignment works over a span: what ghosting
+    /// is left (lens disagreement across the blend band) and how much the
+    /// shift wobbles from frame to frame.
+    Seam {
+        input: PathBuf,
+        /// Start time in seconds.
+        #[arg(short, long, default_value_t = 0.0)]
+        start: f64,
+        /// Duration in seconds.
+        #[arg(short, long, default_value_t = 5.0)]
+        duration: f64,
+    },
     /// Stitch a span of the clip to an equirectangular MP4.
     Render {
         input: PathBuf,
@@ -193,7 +205,7 @@ impl Pipeline {
             (seam, *g)
         });
         let align = self.aligner.as_ref().map(|aligner| {
-            let now = aligner.measure(|i, u, v| Some(rgb(i, u, v).iter().sum::<f64>() / 3.0));
+            let now = aligner.measure(&aligner.strips(|i, u, v| Some(rgb(i, u, v).iter().sum::<f64>() / 3.0)), carry.field.as_ref());
             let f = carry.field.get_or_insert_with(|| now.clone());
             f.ease(&now, align::EASE);
             (aligner, f.clone())
@@ -233,6 +245,7 @@ fn main() -> Result<()> {
         Cmd::Play { input, osv_size, hwaccel, stabilize, imu_axes, world_z_down } => {
             player::run(input, player::Options { osv_size, hw: hwaccel, stabilize, imu_axes, world_z_down })?;
         }
+        Cmd::Seam { input, start, duration } => seam_report(&input, start, duration)?,
         Cmd::Stitch { input, time, output, opts } => {
             let p = Pipeline::new(&input, &opts)?;
             let time = p.snap(time);
@@ -262,6 +275,54 @@ fn main() -> Result<()> {
             eprintln!("\nwrote {} ({n} frames)", output.display());
         }
     }
+    Ok(())
+}
+
+fn seam_report(input: &Path, start: f64, duration: f64) -> Result<()> {
+    let opts = RenderOpts {
+        width: 0,
+        variant: None,
+        only: None,
+        stabilize: stab::Mode::Off,
+        smooth: 500.0,
+        imu_axes: stab::ImuAxes::X180,
+        world_z_down: false,
+        no_rs: true,
+        no_exposure: true,
+        no_align: false,
+    };
+    let p = Pipeline::new(input, &opts)?;
+    let aligner = p.aligner.as_ref().context("not a two-lens rig")?;
+    let start = p.snap(start);
+    let mut decoders = p.decoders(input, start)?;
+    let (mut eased, mut prev_raw): (Option<align::Field>, Option<align::Field>) = (None, None);
+    let mut sums = [0.0; 5];
+    let mut n = 0;
+    let jitter = |a: &align::Field, b: &align::Field| a.0.iter().zip(&b.0).map(|(x, y)| (x - y).abs() as f64).sum::<f64>() / a.0.len() as f64;
+    println!("t,mismatch_none,mismatch_raw,mismatch_eased,jitter_raw_deg,jitter_eased_deg");
+    while n < (duration * p.fps).round() as usize {
+        let Some(frames) = next_frames(&mut decoders)? else { break };
+        let strips = aligner.strips(|i, u, v| Some(stitch::sample(&frames[p.lenses[i].input], u, v).iter().sum::<f64>() / (3.0 * 255.0)));
+        let raw = aligner.measure(&strips, eased.as_ref());
+        let before = eased.clone();
+        let e = eased.get_or_insert_with(|| raw.clone());
+        e.ease(&raw, align::EASE);
+        let row = [
+            aligner.mismatch(&strips, &align::Field::default()),
+            aligner.mismatch(&strips, &raw),
+            aligner.mismatch(&strips, e),
+            prev_raw.as_ref().map_or(0.0, |r| jitter(r, &raw).to_degrees()),
+            before.as_ref().map_or(0.0, |b| jitter(b, e).to_degrees()),
+        ];
+        println!("{:.3},{:.5},{:.5},{:.5},{:.4},{:.4}", start + n as f64 / p.fps, row[0], row[1], row[2], row[3], row[4]);
+        for (s, v) in sums.iter_mut().zip(row) {
+            *s += v;
+        }
+        prev_raw = Some(raw);
+        n += 1;
+    }
+    let m = sums.map(|s| s / n.max(1) as f64);
+    eprintln!("{n} frames: mismatch none {:.5} raw {:.5} eased {:.5}; jitter raw {:.4}° eased {:.4}°", m[0], m[1], m[2], m[3], m[4]);
     Ok(())
 }
 
