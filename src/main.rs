@@ -141,6 +141,10 @@ enum Cmd {
         /// Stitch from the low-resolution proxy (LRF): a quick, soft draft.
         #[arg(long)]
         draft: bool,
+        /// Stitch on the CPU, the reference the GPU shader must match.
+        /// Without a usable GPU this happens anyway.
+        #[arg(long)]
+        cpu: bool,
         #[command(flatten)]
         opts: StitchOpts,
     },
@@ -516,8 +520,25 @@ fn cut_pipelines(project: &project::Project, opts: &StitchOpts, proxy: bool) -> 
     Ok((pipelines, of_cut))
 }
 
-fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), draft: bool, output: &Path, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), draft: bool, cpu: bool, output: &Path, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<()> {
     let (pipelines, of_cut) = cut_pipelines(project, opts, draft)?;
+    // The shader always draws both lenses, so `--only` needs the CPU.
+    let mut gpu = if cpu || opts.only.is_some() {
+        None
+    } else {
+        match player::render::Gpu::new() {
+            Ok(gpu) => {
+                eprintln!("stitching on {}", gpu.name);
+                Some(gpu)
+            }
+            Err(e) => {
+                eprintln!("stitching on the CPU: {e:#}");
+                None
+            }
+        }
+    };
+    let clips: Vec<_> = if gpu.is_some() { pipelines.iter().map(player::render::Clip::new).collect::<Result<_>>()? } else { Vec::new() };
     // Per cut: its clip's pipeline, start (on a frame) and frame count.
     let mut plan = Vec::with_capacity(project.cuts.len());
     for (cut, &i) in project.cuts.iter().zip(&of_cut) {
@@ -539,7 +560,11 @@ fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), d
     let mut done = 0;
     for (cut, &(i, start, frames)) in project.cuts.iter().zip(&plan) {
         let mut tick = |n: usize| progress(done + n, total);
-        if let Err(e) = encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: cut.camera_at(t), size }, &mut tick) {
+        let result = match &mut gpu {
+            Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut encoder, |t| cut.camera_at(t), size, &mut tick),
+            None => encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: cut.camera_at(t), size }, &mut tick),
+        };
+        if let Err(e) = result {
             encoder.abort();
             let _ = std::fs::remove_file(output);
             return Err(e);
@@ -626,7 +651,7 @@ fn main() -> Result<()> {
             encoder.finish()?;
             eprintln!("wrote {}", output.display());
         }
-        Cmd::Export { input, framing, start, duration, resolution, aspect, size, output, draft, opts } => {
+        Cmd::Export { input, framing, start, duration, resolution, aspect, size, output, draft, cpu, opts } => {
             let project = if is_project(&input) {
                 if framing.reframe.is_some() || framing.view.is_some() || start.is_some() || duration.is_some() {
                     bail!("a project sets its own cuts and views; leave out --reframe, --view, -s and -d");
@@ -640,7 +665,7 @@ fn main() -> Result<()> {
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
-            export(&project, &opts, (w, h), draft, &output, &mut print_progress())?;
+            export(&project, &opts, (w, h), draft, cpu, &output, &mut print_progress())?;
             eprintln!("wrote {} ({w}×{h}, {:.2} s)", output.display(), project.duration());
         }
         Cmd::Preview { input, framing, start, duration, every, tile, columns, output, full, opts } if is_project(&input) => {

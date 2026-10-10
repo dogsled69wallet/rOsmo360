@@ -16,6 +16,7 @@ pub struct Frame {
     pub rgb: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct Lens {
     /// Index into the rig's pictures, i.e. which decoded video track.
     pub input: usize,

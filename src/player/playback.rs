@@ -6,7 +6,6 @@ use super::source::{self, Frame, Kind, Stream};
 use super::Media;
 use super::audio::Audio;
 use super::gpu::SeamFix;
-use crate::{align, exposure};
 use crate::stitch::M3;
 use anyhow::Result;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -79,7 +78,7 @@ impl Playback {
     fn kind(&self) -> Kind {
         match (&self.media.proxy, self.media.osv_size) {
             (Some(p), None) => Kind::Lrf(p.clone()),
-            (_, size) => Kind::Osv { path: self.media.input.clone(), tracks: self.media.rig.tracks.clone(), size: size.unwrap_or(1920) },
+            (_, size) => Kind::Osv { path: self.media.input.clone(), tracks: self.media.rig.tracks.clone(), size: Some(size.unwrap_or(1920)) },
         }
     }
 
@@ -388,24 +387,7 @@ impl Playback {
         let continuous = self.playing && still.is_none() && (frame.pts - self.shown_pts).abs() < 2.0 / self.media.fps;
         self.shown_pts = frame.pts;
         self.showing_still = still;
-        let rig = &self.media.rig;
-        let rgb = |i: usize, u: f64, v: f64| frame.rgb_at(&rig.lenses[i], rig.tracks[rig.lenses[i].input], u, v);
-        if let Some(seam) = &rig.seam {
-            let now = seam.measure(rgb);
-            if continuous {
-                self.fix.gains.ease(&now, exposure::EASE);
-            } else {
-                self.fix.gains = now;
-            }
-        }
-        if let Some(aligner) = &rig.aligner {
-            let now = aligner.measure(&aligner.strips(|i, u, v| rgb(i, u, v).map(|c| c.iter().sum::<f64>() / 3.0)), continuous.then_some(&self.fix.field));
-            if continuous {
-                self.fix.field.ease(&now, align::EASE);
-            } else {
-                self.fix.field = now;
-            }
-        }
+        self.fix.follow(&self.media.rig, &frame, continuous);
         Some((frame, self.fix.clone()))
     }
 
@@ -427,7 +409,7 @@ impl Playback {
             (None, None) if !self.playing && self.media.proxy.is_some() => "proxy".to_owned(),
             (None, None) => match self.kind() {
                 Kind::Lrf(_) => "proxy".to_owned(),
-                Kind::Osv { size, .. } => osv(Some(size)),
+                Kind::Osv { size, .. } => osv(size),
             },
         }
     }

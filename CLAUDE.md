@@ -46,9 +46,8 @@ Not done yet, roughly in priority order:
 2. **Native widget shapes.** native-theme-iced's per-widget styles (radii, padding, pressed and focus states); only the colours follow the OS today.
 3. **Windows and macOS groundwork.** Add `d3d11va` and `videotoolbox` to `Hwaccel::pick`, and `cargo check` for both targets. Then hide the console window on Windows (the CLI commands still need one), and bundle ffmpeg or document installing it (mind its GPL builds). A macOS `.app` would need signing and notarisation.
 4. **Seam, what's left.** Patch matching is tuned out, the stick is handled by the cut, and the sky by detail-only matching (see Seam below). Further gains need per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
-5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), stabilisation per cut, thumbnails on the cut blocks, timeline zoom, `preview` of projects, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
+5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), stabilisation per cut, thumbnails on the cut blocks, timeline zoom, `preview` of projects, GPU export, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
    - Crossfades between cuts.
-   - GPU export: the CPU export runs ~5 fps at 1080p.
    - Spherical metadata on equirect export.
    - Merging `timeline` into master and releasing (0.2.0?) when the user says so.
 6. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
@@ -118,7 +117,8 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
   - `thumbs.rs`: timeline thumbnails, the view straight ahead (horizon, 100° FOV) stitched on the CPU without seam corrections from the proxy's keyframes only (`ffmpeg::key_frames`, `-skip_frame nokey`; times from `showinfo`). A thread per clip when it loads, sent one at a time through a `Task::run` stream; none without a proxy. 0037 takes ~1 s, 0036 (13.5 min, 890 MB proxy) ~16 s, mostly reading the file.
   - `edit.rs`: the edit (cuts in order) with undo/redo snapshots, split/trim/move, and edit-time ↔ (cut, clip time). The app keeps a library of loaded `Media` and makes a fresh `Playback` when the playhead crosses into another clip's cut; `tick` plays on into the next cut at an out point.
   - `playback.rs`: playback clock, streams and full-res stills.
-  - `gpu.rs`: iced shader `Primitive`/`Pipeline`: uniforms and NV12 textures, uploaded once per frame id.
+  - `gpu.rs`: iced shader `Primitive`/`Pipeline`: uniforms and NV12 textures, uploaded once per frame id. `Pipeline::create`/`prepare_frame`/`draw` don't need iced; `SeamFix::follow` (= `SeamSample::new` + `apply`) is the per-frame seam measure shared by playback and export.
+  - `render.rs`: GPU export. `Gpu` is a wgpu device of its own rendering into an off-screen RGBA texture, two frames in flight (one renders while the other is read back); `encode` mirrors `crate::encode` (same frame times, attitude, rolling-shutter steps, last-frame padding). `crate::export` uses it unless `--cpu`, `--only` or no GPU (a software rasteriser doesn't count).
   - `shader.wgsl`: GPU port of `stitch.rs`.
   - `source.rs`: NV12 decode threads (LRF proxy / OSV) and full-res stills.
   - `audio.rs`: ffmpeg → f32 PCM → cpal output; frames played minus device latency give the clock.
@@ -213,7 +213,11 @@ How it was found:
 - In horizon mode, equirect longitude/latitude = view yaw/pitch, which is why preview tiles map directly to `--view` angles. Lock mode holds the clip's first orientation including its tilt (0037 starts tilted ~49°), so it is level only if the clip started level.
 - The Osmo 360 records only the fused attitude (no raw gyro or accelerometer tags), so `scan` derives turning and shake from attitude differences every 20 ms. On 0037 it shows the known 87° pan at 15–18 s.
 - The stitcher reads the LRF proxy by splitting it into per-lens 1024² frames; `Lens::sample` scales picture coordinates to whatever frame size it gets.
-- Speed on the RTX 3090 desktop: full-quality export ~5 fps at 1080×1920, `--draft` ~8 fps (CPU-bound stitch and seam measure); a 24-tile preview from the proxy ~15 s.
+- Speed on the RTX 3090 desktop (i7-10700K): CPU export ~5 fps at 1080×1920, `--draft` ~8 fps; a 24-tile preview from the proxy ~15 s.
+- GPU export (`render.rs`) runs ~21 fps at 1080p full quality, and matches the CPU at 40-41 dB PSNR (the difference is the 8-bit NV12 decode against ffmpeg's RGB, and x264). A 6 s, 3-cut project: 12 s against 40 s (each cut restarts a decoder, ~1 s). How it got there, on 0037:
+  - Done in turn, a frame took 22 ms of seam measure (strips 14, matching 17 under load), 14 ms texture upload (two 3840² NV12), 10 ms GPU and 6 ms RGBA→RGB: 11 fps. Overlapping them on threads (decode → seam sample → seam match + attitude → render, with two readback buffers) gave 16 fps.
+  - Then the decode limited it: Vulkan decodes both 3840² lenses at only ~1× real time, because the cost is downloading 10-bit P010. CUDA with `scale_cuda=format=nv12` converts on the GPU and downloads half the bytes: 1.9× real time alone, and the export went to 21 fps. `Hwaccel::works` probes CUDA once a run; export uses it for the full-res OSV when it works (`ffmpeg::nv12`).
+  - Now the whole CPU is busy (16 threads). The x264 preset barely matters (veryfast 22 fps), nor does NVENC (24 fps): x264 only takes cycles nothing else wants. CachyOS also nices ffmpeg below us. Next gains would be buffer reuse in the decode pump (allocation and page faults: ~1 s of system time per second) or the seam measure on the GPU.
 
 ### iced and wgpu
 

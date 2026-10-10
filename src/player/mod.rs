@@ -7,6 +7,7 @@ mod edit;
 mod export;
 mod gpu;
 mod playback;
+pub mod render;
 mod settings;
 mod source;
 mod thumbs;
@@ -493,7 +494,7 @@ impl App {
                     }
                     Ok(())
                 };
-                let result = crate::export(&project, &opts, (w as usize, h as usize), false, &path, &mut progress);
+                let result = crate::export(&project, &opts, (w as usize, h as usize), false, false, &path, &mut progress);
                 let _ = tx.unbounded_send(Message::ExportDone(result.map(|()| path).map_err(|e| format!("{e:#}"))));
             });
             while let Some(m) = rx.next().await {

@@ -162,22 +162,36 @@ impl Hwaccel {
     }
 
     /// The first decoder that gets a frame of `track` out of `input`.
-    /// `hwdownload` rejects software frames, so a probe only succeeds if the
-    /// GPU really decoded; ffmpeg's own fallback would hide a failure.
     pub fn pick(input: &Path, track: u32) -> Result<Hwaccel> {
         for hw in [Hwaccel::Vulkan, Hwaccel::Vaapi, Hwaccel::Cuda] {
-            let ok = nv12(input, track, 0.0, None, hw)?
-                .args(["-frames:v", "1", "-f", "null", "-"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .context("running ffmpeg")?
-                .success();
-            if ok {
+            if hw.works(input, track)? {
                 return Ok(hw);
             }
         }
         Ok(Hwaccel::Software)
+    }
+
+    /// Whether this decoder gets a full-size frame of `track` out of `input`.
+    /// `hwdownload` rejects software frames, so a probe only succeeds if the
+    /// GPU really decoded; ffmpeg's own fallback would hide a failure.
+    ///
+    /// Each probe takes 0.5-1 s, and every Osmo 360 clip's tracks are the
+    /// same (HEVC Main10, 3840²), so each decoder is probed once a run: an
+    /// export of several clips otherwise spent seconds probing.
+    pub fn works(self, input: &Path, track: u32) -> Result<bool> {
+        static PROBED: std::sync::Mutex<Vec<(Hwaccel, bool)>> = std::sync::Mutex::new(Vec::new());
+        if let Some(&(_, ok)) = PROBED.lock().unwrap().iter().find(|(hw, _)| *hw == self) {
+            return Ok(ok);
+        }
+        let ok = nv12(input, track, 0.0, None, self)?
+            .args(["-frames:v", "1", "-f", "null", "-"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("running ffmpeg")?
+            .success();
+        PROBED.lock().unwrap().push((self, ok));
+        Ok(ok)
     }
 }
 
@@ -185,6 +199,10 @@ impl Hwaccel {
 /// `start` to NV12, scaled to `size` pixels square if given. Scaling and
 /// conversion run on the CPU: the GPU filters differ per backend, and timing
 /// showed the download, not the conversion, is the cost.
+///
+/// Except on CUDA at full size: `scale_cuda` converts the 10-bit frames to
+/// NV12 before the download, which halves the bytes. Both 3840² lenses of
+/// 0037 then decode at 1.9× real time instead of 0.9× on Vulkan.
 pub fn nv12(input: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel) -> Result<Command> {
     let mut filters = Vec::new();
     let mut cmd = Command::new("ffmpeg");
@@ -192,7 +210,11 @@ pub fn nv12(input: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel
     if let Some(name) = hw.name() {
         let ten_bit = probe(input, &format!("v:{track}"), "stream=pix_fmt")?.contains("10");
         cmd.args(["-hwaccel", name, "-hwaccel_output_format", name]);
-        filters.push(format!("hwdownload,format={}", if ten_bit { "p010le" } else { "nv12" }));
+        if hw == Hwaccel::Cuda && size.is_none() {
+            filters.push("scale_cuda=format=nv12,hwdownload".to_owned());
+        } else {
+            filters.push(format!("hwdownload,format={}", if ten_bit { "p010le" } else { "nv12" }));
+        }
     }
     if let Some(s) = size {
         filters.push(format!("scale={s}:{s}:flags=bilinear"));

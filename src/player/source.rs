@@ -70,8 +70,8 @@ impl Frame {
 #[derive(Clone)]
 pub enum Kind {
     Lrf(PathBuf),
-    /// OSV tracks scaled to this many pixels square.
-    Osv { path: PathBuf, tracks: Vec<u32>, size: u32 },
+    /// OSV tracks scaled to this many pixels square, or at their own size.
+    Osv { path: PathBuf, tracks: Vec<u32>, size: Option<u32> },
 }
 
 /// A running decode from `start`, delivering frames in order.
@@ -90,7 +90,13 @@ pub fn spawn(kind: Kind, hw: Hwaccel, start: f64, fps: f64) -> Result<Stream> {
             vec![(decode(path, 0, start, None, Hwaccel::Software)?, w, h)]
         }
         Kind::Osv { path, tracks, size } => {
-            tracks.iter().map(|&t| Ok((decode(path, t, start, Some(*size), hw)?, *size, *size))).collect::<Result<_>>()?
+            tracks
+                .iter()
+                .map(|&t| {
+                    let (w, h) = size.map_or_else(|| dims(path, t), |s| Ok((s, s)))?;
+                    Ok((decode(path, t, start, *size, hw)?, w, h))
+                })
+                .collect::<Result<_>>()?
         }
     };
     let layout = match &kind {

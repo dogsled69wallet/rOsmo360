@@ -1,9 +1,10 @@
 //! The 360 view as an iced shader primitive: one pass of `shader.wgsl` over
-//! the widget's rectangle, sharing iced's wgpu device.
+//! the widget's rectangle, sharing iced's wgpu device. `Pipeline` doesn't
+//! need iced: `render.rs` drives it on a device of its own for export.
 
 use super::source::{Frame, Layout};
-use crate::align::{Aligner, CELLS_ALPHA, CELLS_PHI, Field};
-use crate::exposure::{BINS, FADE_FROM, FADE_TO, Gains, Seam};
+use crate::align::{Aligner, CELLS_ALPHA, CELLS_PHI, Field, Strips};
+use crate::exposure::{self, BINS, FADE_FROM, FADE_TO, Gains, Seam};
 use crate::stitch::{Lens, M3};
 use crate::view::Camera;
 use bytemuck::{Pod, Zeroable};
@@ -72,6 +73,50 @@ pub struct SeamFix {
     pub field: Field,
 }
 
+/// What `SeamFix::follow` reads off a frame before matching it against the
+/// last: split out so export can sample one frame while matching the one
+/// before (14 and 17 ms a frame at 3840²).
+pub struct SeamSample {
+    gains: Option<Gains>,
+    strips: Option<Strips>,
+}
+
+impl SeamSample {
+    pub fn new(rig: &Rig, frame: &Frame) -> Self {
+        let rgb = |i: usize, u: f64, v: f64| frame.rgb_at(&rig.lenses[i], rig.tracks[rig.lenses[i].input], u, v);
+        SeamSample {
+            gains: rig.seam.as_ref().map(|seam| seam.measure(rgb)),
+            strips: rig.aligner.as_ref().map(|aligner| aligner.strips(|i, u, v| rgb(i, u, v).map(|c| c.iter().sum::<f64>() / 3.0))),
+        }
+    }
+}
+
+impl SeamFix {
+    /// Measures `frame`'s seam. When it follows on from the last frame
+    /// (`continuous`) the corrections ease towards it, else they jump.
+    pub fn follow(&mut self, rig: &Rig, frame: &Frame, continuous: bool) {
+        self.apply(rig, SeamSample::new(rig, frame), continuous);
+    }
+
+    pub fn apply(&mut self, rig: &Rig, sample: SeamSample, continuous: bool) {
+        if let Some(now) = sample.gains {
+            if continuous {
+                self.gains.ease(&now, exposure::EASE);
+            } else {
+                self.gains = now;
+            }
+        }
+        if let (Some(aligner), Some(strips)) = (&rig.aligner, sample.strips) {
+            let now = aligner.measure(&strips, continuous.then_some(&self.field));
+            if continuous {
+                self.field.ease(&now, crate::align::EASE);
+            } else {
+                self.field = now;
+            }
+        }
+    }
+}
+
 /// A decoded frame as handed to the view, with its seam corrections.
 pub struct Shown {
     id: u64,
@@ -123,6 +168,12 @@ pub struct Pipeline {
 
 impl shader::Pipeline for Pipeline {
     fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+        Pipeline::create(device, format)
+    }
+}
+
+impl Pipeline {
+    pub fn create(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("stitch"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -220,9 +271,68 @@ impl shader::Pipeline for Pipeline {
             shown_id: 0,
         }
     }
-}
 
-impl Pipeline {
+    /// Gets ready to draw `shown` through `camera` into a `size` pixel
+    /// rectangle at `origin` in its target. The rig and pictures are
+    /// uploaded only when they change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rig: &Rig, shown: &Shown, camera: &Camera, rig_from_view: &[M3], size: [f32; 2], origin: [f32; 2]) {
+        if self.rig_id != rig.id {
+            self.set_rig(device, queue, rig);
+        }
+        if self.shown_id != shown.id {
+            self.upload(device, queue, &shown.frame, rig);
+            self.shown_id = shown.id;
+        }
+        let mut u = Uniforms::zeroed();
+        u.user = rows(camera.user);
+        // A negative mapping means equirect; see the shader's `screen_ray`.
+        u.screen = [size[0], size[1], camera.zoom as f32, camera.planet.map_or(-1.0, |d| d as f32)];
+        let steps = rig_from_view.len().min(RS_STEPS_MAX);
+        u.misc = [steps as f32, self.srgb as u8 as f32, origin[0], origin[1]];
+        u.lenses = self.lens_u;
+        for (k, m) in rig_from_view.iter().take(steps).enumerate() {
+            u.views[k * 3..k * 3 + 3].copy_from_slice(&rows(*m));
+        }
+        if let Some(seam) = &rig.seam {
+            u.seam = rows(seam.ring.basis);
+            u.seam[0][3] = FADE_FROM as f32;
+            u.seam[1][3] = FADE_TO as f32;
+        }
+        for (lens, bins) in shown.fix.gains.0.iter().enumerate() {
+            for (b, g) in bins.iter().enumerate() {
+                u.gains[lens * BINS + b] = [g[0], g[1], g[2], 0.0];
+            }
+        }
+        for (v, cells) in u.field.iter_mut().zip(shown.fix.field.shift.chunks_exact(4)) {
+            v.copy_from_slice(cells);
+        }
+        for (v, bins) in u.cut.iter_mut().zip(shown.fix.field.cut.chunks_exact(4)) {
+            v.copy_from_slice(bins);
+        }
+        queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+    }
+
+    /// Draws the prepared frame into `target`, within `clip`.
+    pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, clip: &Rectangle<u32>) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("stitch"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     fn set_rig(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rig: &Rig) {
         self.masks = [0, 1].map(|i| {
             let l = &rig.lenses[i];
@@ -276,60 +386,12 @@ impl shader::Primitive for Primitive {
     type Pipeline = Pipeline;
 
     fn prepare(&self, p: &mut Pipeline, device: &wgpu::Device, queue: &wgpu::Queue, bounds: &Rectangle, viewport: &Viewport) {
-        if p.rig_id != self.rig.id {
-            p.set_rig(device, queue, &self.rig);
-        }
-        if p.shown_id != self.shown.id {
-            p.upload(device, queue, &self.shown.frame, &self.rig);
-            p.shown_id = self.shown.id;
-        }
         let px = *bounds * viewport.scale_factor();
-        let mut u = Uniforms::zeroed();
-        u.user = rows(self.camera.user);
-        // A negative mapping means equirect; see the shader's `screen_ray`.
-        u.screen = [px.width, px.height, self.camera.zoom as f32, self.camera.planet.map_or(-1.0, |d| d as f32)];
-        let steps = self.rig_from_view.len().min(RS_STEPS_MAX);
-        u.misc = [steps as f32, p.srgb as u8 as f32, px.x, px.y];
-        u.lenses = p.lens_u;
-        for (k, m) in self.rig_from_view.iter().take(steps).enumerate() {
-            u.views[k * 3..k * 3 + 3].copy_from_slice(&rows(*m));
-        }
-        if let Some(seam) = &self.rig.seam {
-            u.seam = rows(seam.ring.basis);
-            u.seam[0][3] = FADE_FROM as f32;
-            u.seam[1][3] = FADE_TO as f32;
-        }
-        for (lens, bins) in self.shown.fix.gains.0.iter().enumerate() {
-            for (b, g) in bins.iter().enumerate() {
-                u.gains[lens * BINS + b] = [g[0], g[1], g[2], 0.0];
-            }
-        }
-        for (v, cells) in u.field.iter_mut().zip(self.shown.fix.field.shift.chunks_exact(4)) {
-            v.copy_from_slice(cells);
-        }
-        for (v, bins) in u.cut.iter_mut().zip(self.shown.fix.field.cut.chunks_exact(4)) {
-            v.copy_from_slice(bins);
-        }
-        queue.write_buffer(&p.uniforms, 0, bytemuck::bytes_of(&u));
+        p.prepare_frame(device, queue, &self.rig, &self.shown, &self.camera, &self.rig_from_view, [px.width, px.height], [px.x, px.y]);
     }
 
     fn render(&self, p: &Pipeline, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, clip: &Rectangle<u32>) {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("stitch"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
-        pass.set_pipeline(&p.pipeline);
-        pass.set_bind_group(0, &p.bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        p.draw(encoder, target, clip);
     }
 }
 
