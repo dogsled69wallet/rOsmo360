@@ -4,6 +4,8 @@ A 360° video player and editor for **DJI Osmo 360** footage, written in Rust. I
 
 ![rOsmo360 editing a mountain hike: the view over a lake and glaciers, with cuts from three clips on the timeline below, their thumbnails and keyframes](docs/screenshot.png)
 
+**New here? Read the [user guide](docs/user-guide.md)**: the whole app, step by step, with screenshots.
+
 Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 
 ## Why
