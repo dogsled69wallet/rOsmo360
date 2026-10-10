@@ -22,7 +22,7 @@ Working and verified on real footage:
   - `stitch`: one frame to an equirect PNG.
   - `render`: span to an equirect MP4 with audio.
   - `seam`: seam alignment quality over a span (ghosting left, frame-to-frame wobble).
-  - `export`: a framed MP4 with sound, from a fixed `--view` or a keyframed `--reframe` JSON (`view::Reframe`). 1080p by default (`-r` 720p–2160p is the short side; `-a` aspect, or the reframe's `"aspect"`). `--draft` stitches from the LRF proxy.
+  - `export`: a framed MP4 with sound, from a fixed `--view` or a keyframed `--reframe` JSON (`view::Reframe`), or a project JSON of cuts from several clips (`project::Project`), joined with their sound. A single clip is exported as a one-cut project. 1080p by default (`-r` 720p–2160p is the short side; `-a` aspect, or the reframe's `"aspect"`). `--draft` stitches from the LRF proxy.
   - `preview`: a contact sheet of stitched moments labelled with time; equirect tiles marked at yaw −90/0/90° and the horizon, or the reframe's framing.
   - `scan`: CSV per second of heading, tilt, turning, shake, loudness and peak.
   - `info`: duration, fps, recording time and contents as JSON.
@@ -95,6 +95,7 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
   - Rolling-shutter re-aim.
 - `src/stab.rs`: `Stabilizer::rig_from_view(t_ms, readout_ms, steps)`, and `pose` (heading, tilt) for `scan`. Defines the `Mode` and `ImuAxes` enums.
 - `src/view.rs`: `View` (yaw/pitch/roll/fov in degrees, projection), `Reframe` (keyframes, JSON with carry-over of missing fields) and `Camera` (what gets drawn). Shared by the player and `export`/`preview`. `Camera::ray` mirrors the shader's `screen_ray`; change them together.
+- `src/project.rs`: `Project` (aspect, cuts) and `Cut` (input, in, out, its own `Keyframes` in clip time). Keyframes stay pinned to the footage, so moving or trimming a cut keeps its camera moves; those outside in/out are kept for when it is extended again.
 - `src/sheet.rs`: contact sheets for `preview`, with a tiny built-in bitmap font for the time labels.
 - `src/ring.rs`: the seam ring: azimuth φ around lens 0's axis and angle α from it.
 - `src/exposure.rs`: per-frame exposure matching (`Seam::measure`, `Seam::gain`).

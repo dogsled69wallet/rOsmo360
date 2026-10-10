@@ -103,6 +103,23 @@ Angles are in degrees: yaw turns right, pitch looks up. With stabilisation on (h
 
 Exports are 1080p by default (1920 × 1080, or 1080 × 1920 for 9:16), a good quality for sharing online. `-r` picks `720p`, `1080p`, `1440p` or `2160p` (`4k`), meaning the short side in pixels. `-a` sets the shape (`16:9`, `9:16`, `1:1`, `4:5`, …) when the reframe file doesn't, and `--size 1234x567` gives an exact size.
 
+To join cuts from one or more clips, write a project file and export it. Each cut has its own keyframes, in clip time; relative paths are relative to the project file:
+
+```json
+{
+  "aspect": "9:16",
+  "cuts": [
+    {"input": "CAM_0037.OSV", "in": 28, "out": 32, "keyframes": [{"t": 28, "yaw": -20}, {"t": 32, "yaw": 60}]},
+    {"input": "CAM_0043.OSV", "in": 5, "out": 8},
+    {"input": "CAM_0037.OSV", "in": 34, "out": 37, "keyframes": [{"t": 37, "projection": "little-planet", "pitch": -90}]}
+  ]
+}
+```
+
+```sh
+rosmo360 export edit.json -o edit.mp4
+```
+
 `t` is the clip time in seconds; `projection` is `perspective`, `little-planet` or `equirect`; `ease` (how a keyframe moves on to the next) is `smooth` (the default), `linear` or `hold`. Perspective and little planet morph smoothly into each other.
 
 Skimming a clip:

@@ -3,6 +3,7 @@ mod exposure;
 mod ffmpeg;
 mod imu;
 mod player;
+mod project;
 mod ring;
 mod sheet;
 mod stab;
@@ -101,12 +102,15 @@ enum Cmd {
         #[command(flatten)]
         opts: StitchOpts,
     },
-    /// Render a framed (reframed) video: a fixed view or keyframed views
-    /// from a JSON file, with the clip's sound.
+    /// Render a framed (reframed) video with sound: a clip with a fixed view
+    /// or keyframed views from a JSON file, or a project (.json) of cuts from
+    /// several clips, each with its own keyframes.
     ///
-    /// Without -s/-d the keyframes' span is rendered. Stabilisation defaults
-    /// to horizon.
+    /// For a clip without -s/-d, the keyframes' span is rendered.
+    /// Stabilisation defaults to horizon.
     Export {
+        /// A clip (.OSV), or a project (.json): {"aspect": "9:16", "cuts":
+        /// [{"input": "a.OSV", "in": 28, "out": 37, "keyframes": [...]}, ...]}.
         input: PathBuf,
         #[command(flatten)]
         framing: Framing,
@@ -442,18 +446,66 @@ impl Pipeline {
     /// The span to render: `start`/`duration` if given, else the keyframes'
     /// span, else from `start` to the end of the clip.
     fn span(&self, start: Option<f64>, duration: Option<f64>, reframe: Option<&Reframe>) -> Result<(f64, f64)> {
-        let keyed = reframe.and_then(Reframe::span);
-        let start = start.or(keyed.map(|k| k.0)).unwrap_or(0.0);
-        let end = match (duration, keyed) {
-            (Some(d), _) => start + d,
-            (None, Some((_, end))) if end > start => end,
-            _ => ffmpeg::duration(&self.input)?,
-        };
-        if end <= start {
-            bail!("nothing to render between {start} and {end} s");
-        }
+        let (start, end) = span(&self.input, start, duration, reframe)?;
         Ok((self.snap(start), end))
     }
+}
+
+/// The span of `input` to render: `start`/`duration` if given, else the
+/// keyframes' span, else from `start` to the end of the clip.
+fn span(input: &Path, start: Option<f64>, duration: Option<f64>, reframe: Option<&Reframe>) -> Result<(f64, f64)> {
+    let keyed = reframe.and_then(Reframe::span);
+    let start = start.or(keyed.map(|k| k.0)).unwrap_or(0.0);
+    let end = match (duration, keyed) {
+        (Some(d), _) => start + d,
+        (None, Some((_, end))) if end > start => end,
+        _ => ffmpeg::duration(input)?,
+    };
+    if end <= start {
+        bail!("nothing to render between {start} and {end} s");
+    }
+    Ok((start, end))
+}
+
+/// Renders every cut of `project` back to back into one MP4 at `size`,
+/// with their sound. Each clip is set up once however many cuts use it.
+fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), draft: bool, output: &Path) -> Result<()> {
+    let mut pipelines: Vec<Pipeline> = Vec::new();
+    // Per cut: its clip's pipeline, start (on a frame) and frame count.
+    let mut plan = Vec::with_capacity(project.cuts.len());
+    for cut in &project.cuts {
+        let i = match pipelines.iter().position(|p| p.input == cut.input) {
+            Some(i) => i,
+            None => {
+                let mut p = Pipeline::new(&cut.input, opts, stab::Mode::Horizon)?;
+                if draft {
+                    p.use_proxy();
+                }
+                pipelines.push(p);
+                pipelines.len() - 1
+            }
+        };
+        let p = &pipelines[i];
+        let start = p.snap(cut.start);
+        let end = cut.end.min(ffmpeg::duration(&cut.input)?);
+        if end <= start {
+            bail!("the cut from {} s starts after {} ends", cut.start, cut.input.display());
+        }
+        plan.push((i, start, ((end - start) * p.fps).round().max(1.0) as usize));
+    }
+    let fps = pipelines[0].fps;
+    if pipelines.iter().any(|p| (p.fps - fps).abs() > 0.01) {
+        eprintln!("the clips' frame rates differ; exporting at {fps:.3} fps");
+    }
+    let sound: Vec<_> = plan.iter().map(|&(i, start, frames)| ffmpeg::Sound { input: &pipelines[i].input, start, duration: Some(frames as f64 / fps) }).collect();
+    let mut encoder = ffmpeg::Encoder::new(output, size, fps, &sound)?;
+    for (n, (cut, &(i, start, frames))) in project.cuts.iter().zip(&plan).enumerate() {
+        if project.cuts.len() > 1 {
+            eprintln!("cut {}/{}: {} from {start:.2} s", n + 1, project.cuts.len(), cut.input.display());
+        }
+        encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: cut.camera_at(t), size })?;
+    }
+    encoder.finish()
 }
 
 /// Decoded lens frames in order, from the lens tracks or the proxy.
@@ -506,23 +558,27 @@ fn main() -> Result<()> {
             let p = Pipeline::new(&input, &opts, stab::Mode::Off)?;
             let start = p.snap(start);
             let total = duration.map(|d| (d * p.fps).round() as usize);
-            let encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &input, start, duration)?;
-            encode(&p, start, total, encoder, |_| Shot::Equirect(width))?;
+            let mut encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &[ffmpeg::Sound { input: &input, start, duration }])?;
+            encode(&p, start, total, &mut encoder, |_| Shot::Equirect(width))?;
+            encoder.finish()?;
             eprintln!("wrote {}", output.display());
         }
         Cmd::Export { input, framing, start, duration, resolution, aspect, size, output, draft, opts } => {
-            let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
-            let aspect = aspect.or(reframe.aspect).unwrap_or(view::Aspect(16, 9));
+            let project = if input.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) {
+                if framing.reframe.is_some() || framing.view.is_some() || start.is_some() || duration.is_some() {
+                    bail!("a project sets its own cuts and views; leave out --reframe, --view, -s and -d");
+                }
+                project::Project::load(&input)?
+            } else {
+                // One clip is a project of one cut.
+                let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
+                let (start, end) = span(&input, start, duration, Some(&reframe))?;
+                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes }] }
+            };
+            let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
-            let mut p = Pipeline::new(&input, &opts, stab::Mode::Horizon)?;
-            if draft {
-                p.use_proxy();
-            }
-            let (start, end) = p.span(start, duration, Some(&reframe))?;
-            let total = ((end - start) * p.fps).round().max(1.0) as usize;
-            let encoder = ffmpeg::Encoder::new(&output, (w, h), p.fps, &input, start, Some(end - start))?;
-            encode(&p, start, Some(total), encoder, |t| Shot::View { camera: reframe.camera_at(t), size: (w, h) })?;
-            eprintln!("wrote {} ({w}×{h}, {:.2}–{:.2} s)", output.display(), start, end);
+            export(&project, &opts, (w, h), draft, &output)?;
+            eprintln!("wrote {} ({w}×{h}, {:.2} s)", output.display(), project.duration());
         }
         Cmd::Preview { input, framing, start, duration, every, tile, columns, output, full, opts } => {
             let reframe = framing.reframe()?;
@@ -569,22 +625,30 @@ fn main() -> Result<()> {
 }
 
 /// Stitches `total` frames (or to the end) from `start` into `encoder`,
-/// framing each as `shot` says for its time.
-fn encode(p: &Pipeline, start: f64, total: Option<usize>, mut encoder: ffmpeg::Encoder, shot: impl Fn(f64) -> Shot) -> Result<()> {
+/// framing each as `shot` says for its time. If the clip ends early, the
+/// last frame is repeated up to `total`, so the sound stays in step.
+fn encode(p: &Pipeline, start: f64, total: Option<usize>, encoder: &mut ffmpeg::Encoder, shot: impl Fn(f64) -> Shot) -> Result<()> {
     let mut stream = p.stream(start)?;
     let began = Instant::now();
     let mut carry = Carry::default();
+    let mut last = None;
     let mut n = 0;
     while total.is_none_or(|total| n < total) {
         let Some(frames) = stream.next()? else { break };
         let t = start + n as f64 / p.fps;
-        encoder.write(&p.render(&frames, t, &mut carry, &shot(t)))?;
+        let frame = p.render(&frames, t, &mut carry, &shot(t));
+        encoder.write(&frame)?;
+        last = Some(frame);
         n += 1;
         if n % 10 == 0 {
             eprint!("\rframe {n}{}  {:.2} fps", total.map_or(String::new(), |t| format!("/{t}")), n as f64 / began.elapsed().as_secs_f64());
         }
     }
-    encoder.finish()?;
+    if let (Some(total), Some(last)) = (total, &last) {
+        for _ in n..total {
+            encoder.write(last)?;
+        }
+    }
     eprintln!("\r{n} frames in {:.0} s", began.elapsed().as_secs_f64());
     Ok(())
 }

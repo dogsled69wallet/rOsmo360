@@ -199,50 +199,52 @@ pub struct Keyframe {
     pub ease: Ease,
 }
 
-/// Keyframed views over a stretch of one clip. Between keyframes yaw, pitch
-/// and roll move evenly, the zoom changes at an even rate (in tan of half the
-/// FOV), and perspective and little planet morph into each other. Yaw isn't
-/// wrapped: 0 → 360 is a full turn.
+/// Keyframed views in clip time. Between keyframes yaw, pitch and roll move
+/// evenly, the zoom changes at an even rate (in tan of half the FOV), and
+/// perspective and little planet morph into each other. Yaw isn't wrapped:
+/// 0 → 360 is a full turn.
 ///
 /// The JSON form lets a keyframe leave out anything that stays the same:
 /// missing fields carry over from the keyframe before, and the first
 /// keyframe's from its projection's home view.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "RawReframe")]
-pub struct Reframe {
-    pub keyframes: Vec<Keyframe>,
-    /// The picture's shape, width:height, if the reframe was made for one
-    /// (a 9:16 framing stays 9:16 whatever the resolution).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aspect: Option<Aspect>,
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<RawKeyframe>", into = "Vec<Keyframe>")]
+pub struct Keyframes(Vec<Keyframe>);
+
+impl std::ops::Deref for Keyframes {
+    type Target = [Keyframe];
+
+    fn deref(&self) -> &[Keyframe] {
+        &self.0
+    }
 }
 
-impl Reframe {
-    pub fn fixed(view: View) -> Reframe {
-        Reframe { keyframes: vec![Keyframe { t: 0.0, view, ease: Ease::Hold }], aspect: None }
+impl From<Keyframes> for Vec<Keyframe> {
+    fn from(k: Keyframes) -> Self {
+        k.0
     }
+}
 
+impl Keyframes {
     /// The span the keyframes cover, if more than one instant.
     pub fn span(&self) -> Option<(f64, f64)> {
-        let (a, b) = (self.keyframes.first()?.t, self.keyframes.last()?.t);
+        let (a, b) = (self.first()?.t, self.last()?.t);
         (b > a).then_some((a, b))
     }
 
-    pub fn camera_at(&self, t: f64) -> Camera {
-        let k = &self.keyframes;
+    /// The view at clip time `t`; `None` without keyframes.
+    pub fn camera_at(&self, t: f64) -> Option<Camera> {
+        let k = &self.0;
         let i = k.partition_point(|f| f.t <= t);
-        if i == 0 {
-            return k[0].view.camera();
-        }
-        if i == k.len() {
-            return k[i - 1].view.camera();
+        if i == 0 || i == k.len() {
+            return k.get(i.saturating_sub(1)).map(|f| f.view.camera());
         }
         let (a, b) = (&k[i - 1], &k[i]);
         let x = ((t - a.t) / (b.t - a.t)).clamp(0.0, 1.0);
         let u = match a.ease {
             Ease::Smooth => x * x * (3.0 - 2.0 * x),
             Ease::Linear => x,
-            Ease::Hold => return a.view.camera(),
+            Ease::Hold => return Some(a.view.camera()),
         };
         let lerp = |p: f64, q: f64| p + (q - p) * u;
         let (va, vb) = (a.view, b.view);
@@ -253,16 +255,52 @@ impl Reframe {
             // Equirect has no in-between: cut half way.
             _ => if u < 0.5 { va } else { vb }.projection.planet(),
         };
-        Camera { user: view.matrix(), zoom: lerp(zoom(va), zoom(vb)).exp(), planet }
+        Some(Camera { user: view.matrix(), zoom: lerp(zoom(va), zoom(vb)).exp(), planet })
+    }
+}
+
+/// Keyframed views over a stretch of one clip, as `export --reframe` reads.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawReframe")]
+pub struct Reframe {
+    pub keyframes: Keyframes,
+    /// The picture's shape, width:height, if the reframe was made for one
+    /// (a 9:16 framing stays 9:16 whatever the resolution).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect: Option<Aspect>,
+}
+
+impl Reframe {
+    pub fn fixed(view: View) -> Reframe {
+        Reframe { keyframes: Keyframes(vec![Keyframe { t: 0.0, view, ease: Ease::Hold }]), aspect: None }
+    }
+
+    pub fn span(&self) -> Option<(f64, f64)> {
+        self.keyframes.span()
+    }
+
+    pub fn camera_at(&self, t: f64) -> Camera {
+        self.keyframes.camera_at(t).expect("a reframe has keyframes")
     }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawReframe {
-    keyframes: Vec<RawKeyframe>,
+    keyframes: Keyframes,
     #[serde(default)]
     aspect: Option<Aspect>,
+}
+
+impl TryFrom<RawReframe> for Reframe {
+    type Error = anyhow::Error;
+
+    fn try_from(raw: RawReframe) -> Result<Self> {
+        if raw.keyframes.is_empty() {
+            bail!("a reframe needs at least one keyframe");
+        }
+        Ok(Reframe { keyframes: raw.keyframes, aspect: raw.aspect })
+    }
 }
 
 #[derive(Deserialize)]
@@ -277,15 +315,12 @@ struct RawKeyframe {
     ease: Option<Ease>,
 }
 
-impl TryFrom<RawReframe> for Reframe {
+impl TryFrom<Vec<RawKeyframe>> for Keyframes {
     type Error = anyhow::Error;
 
-    fn try_from(raw: RawReframe) -> Result<Self> {
-        if raw.keyframes.is_empty() {
-            bail!("a reframe needs at least one keyframe");
-        }
-        let mut keyframes: Vec<Keyframe> = Vec::with_capacity(raw.keyframes.len());
-        for r in raw.keyframes {
+    fn try_from(raw: Vec<RawKeyframe>) -> Result<Self> {
+        let mut keyframes: Vec<Keyframe> = Vec::with_capacity(raw.len());
+        for r in raw {
             let prev = keyframes.last();
             if prev.is_some_and(|p| r.t < p.t) {
                 bail!("keyframe at {} s comes after one at {} s; keep them in time order", r.t, prev.unwrap().t);
@@ -306,7 +341,7 @@ impl TryFrom<RawReframe> for Reframe {
             }
             keyframes.push(Keyframe { t: r.t, view, ease: r.ease.or(prev.map(|p| p.ease)).unwrap_or_default() });
         }
-        Ok(Reframe { keyframes, aspect: raw.aspect })
+        Ok(Keyframes(keyframes))
     }
 }
 

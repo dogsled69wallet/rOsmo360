@@ -231,21 +231,41 @@ pub struct Encoder {
     stdin: Option<ChildStdin>,
 }
 
+/// A stretch of a clip's sound: from `start` seconds, for `duration` (to
+/// the end if `None`).
+pub struct Sound<'a> {
+    pub input: &'a Path,
+    pub start: f64,
+    pub duration: Option<f64>,
+}
+
 impl Encoder {
-    /// `duration` bounds the audio, so it ends with the picture even when
-    /// the encoder is fed fewer frames than the source has.
-    pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio_from: &Path, start: f64, duration: Option<f64>) -> Result<Self> {
+    /// The sound is `audio`'s stretches back to back. Each stretch should
+    /// last exactly as long as the frames written for it, so later cuts stay
+    /// in sync. Several stretches are joined only if every clip has sound.
+    pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio: &[Sound<'_>]) -> Result<Self> {
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24"])
-            .args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"])
-            .args(["-ss", &start.to_string()]);
-        if let Some(d) = duration {
-            cmd.args(["-t", &d.to_string()]);
+        cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24"]).args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"]);
+        for s in audio {
+            cmd.args(["-ss", &s.start.to_string()]);
+            if let Some(d) = s.duration {
+                cmd.args(["-t", &d.to_string()]);
+            }
+            cmd.arg("-i").arg(s.input);
+        }
+        cmd.args(["-map", "0:v"]);
+        if let [_] = audio {
+            cmd.args(["-map", "1:a:0?"]);
+        } else if audio.iter().all(|s| has_audio(s.input).unwrap_or(false)) {
+            // Same camera, but resample anyway: concat needs matching formats.
+            let parts: String = (1..=audio.len()).map(|i| format!("[{i}:a:0]aresample=48000,aformat=channel_layouts=stereo[a{i}];")).collect();
+            let inputs: String = (1..=audio.len()).map(|i| format!("[a{i}]")).collect();
+            cmd.args(["-filter_complex", &format!("{parts}{inputs}concat=n={}:v=0:a=1[a]", audio.len()), "-map", "[a]"]);
+        } else if !audio.is_empty() {
+            eprintln!("not every clip has sound; exporting without");
         }
         let mut child = cmd
-            .arg("-i")
-            .arg(audio_from)
-            .args(["-map", "0:v", "-map", "1:a:0?", "-shortest"])
+            .args(["-shortest"])
             .args(["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac"])
             .arg(output)
             .stdin(Stdio::piped())
