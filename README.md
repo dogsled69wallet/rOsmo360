@@ -82,6 +82,7 @@ In the player:
 | Delete the selected cut | Shift+Delete, or 🗑 |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
 | Save / open a project | Ctrl+S (Ctrl+Shift+S: save as) / Ctrl+Shift+O |
+| Export the edit to MP4 | Export… (pick 720p–2160p next to it); the aspect lock sets the shape, 16:9 when free |
 
 A project saves the cuts, their keyframes and the aspect lock, in the same file `rosmo360 export` renders (see below). Clips in the project's folder are stored by relative path, so the folder can be moved as a whole.
 

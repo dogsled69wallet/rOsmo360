@@ -280,6 +280,13 @@ impl Encoder {
         Ok(())
     }
 
+    /// Stops encoding, leaving whatever was written.
+    pub fn abort(mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     pub fn finish(mut self) -> Result<()> {
         drop(self.stdin.take());
         if !self.child.wait()?.success() {

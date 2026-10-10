@@ -183,7 +183,7 @@ enum Cmd {
     },
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 enum Resolution {
     #[value(name = "720p")]
     P720,
@@ -196,6 +196,8 @@ enum Resolution {
 }
 
 impl Resolution {
+    const ALL: [Resolution; 4] = [Resolution::P720, Resolution::P1080, Resolution::P1440, Resolution::P2160];
+
     /// Pixels on the picture's short side.
     fn short_side(self) -> u32 {
         match self {
@@ -204,6 +206,12 @@ impl Resolution {
             Resolution::P1440 => 1440,
             Resolution::P2160 => 2160,
         }
+    }
+}
+
+impl std::fmt::Display for Resolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}p", self.short_side())
     }
 }
 
@@ -472,7 +480,9 @@ fn span(input: &Path, start: Option<f64>, duration: Option<f64>, reframe: Option
 
 /// Renders every cut of `project` back to back into one MP4 at `size`,
 /// with their sound. Each clip is set up once however many cuts use it.
-fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), draft: bool, output: &Path) -> Result<()> {
+/// `progress(done, total)` hears of every frame; an error from it (a
+/// cancel) stops the export and removes the unfinished file.
+fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), draft: bool, output: &Path, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<()> {
     let mut pipelines: Vec<Pipeline> = Vec::new();
     // Per cut: its clip's pipeline, start (on a frame) and frame count.
     let mut plan = Vec::with_capacity(project.cuts.len());
@@ -502,13 +512,32 @@ fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), d
     }
     let sound: Vec<_> = plan.iter().map(|&(i, start, frames)| ffmpeg::Sound { input: &pipelines[i].input, start, duration: Some(frames as f64 / fps) }).collect();
     let mut encoder = ffmpeg::Encoder::new(output, size, fps, &sound)?;
-    for (n, (cut, &(i, start, frames))) in project.cuts.iter().zip(&plan).enumerate() {
-        if project.cuts.len() > 1 {
-            eprintln!("cut {}/{}: {} from {start:.2} s", n + 1, project.cuts.len(), cut.input.display());
+    let total = plan.iter().map(|p| p.2).sum();
+    let mut done = 0;
+    for (cut, &(i, start, frames)) in project.cuts.iter().zip(&plan) {
+        let mut tick = |n: usize| progress(done + n, total);
+        if let Err(e) = encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: cut.camera_at(t), size }, &mut tick) {
+            encoder.abort();
+            let _ = std::fs::remove_file(output);
+            return Err(e);
         }
-        encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: cut.camera_at(t), size })?;
+        done += frames;
     }
     encoder.finish()
+}
+
+/// Progress on the terminal: frames done, out of how many, and the rate.
+fn print_progress() -> impl FnMut(usize, usize) -> Result<()> {
+    let began = Instant::now();
+    move |done, total| {
+        if done.is_multiple_of(10) || done == total {
+            eprint!("\rframe {done}/{total}  {:.2} fps", done as f64 / began.elapsed().as_secs_f64().max(1e-3));
+        }
+        if done == total {
+            eprintln!();
+        }
+        Ok(())
+    }
 }
 
 /// Decoded lens frames in order, from the lens tracks or the proxy.
@@ -562,7 +591,15 @@ fn main() -> Result<()> {
             let start = p.snap(start);
             let total = duration.map(|d| (d * p.fps).round() as usize);
             let mut encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &[ffmpeg::Sound { input: &input, start, duration }])?;
-            encode(&p, start, total, &mut encoder, |_| Shot::Equirect(width))?;
+            let began = Instant::now();
+            let mut tick = |n: usize| {
+                if n.is_multiple_of(10) {
+                    eprint!("\rframe {n}{}  {:.2} fps", total.map_or(String::new(), |t| format!("/{t}")), n as f64 / began.elapsed().as_secs_f64());
+                }
+                Ok(())
+            };
+            encode(&p, start, total, &mut encoder, |_| Shot::Equirect(width), &mut tick)?;
+            eprintln!();
             encoder.finish()?;
             eprintln!("wrote {}", output.display());
         }
@@ -580,7 +617,7 @@ fn main() -> Result<()> {
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
-            export(&project, &opts, (w, h), draft, &output)?;
+            export(&project, &opts, (w, h), draft, &output, &mut print_progress())?;
             eprintln!("wrote {} ({w}×{h}, {:.2} s)", output.display(), project.duration());
         }
         Cmd::Preview { input, framing, start, duration, every, tile, columns, output, full, opts } => {
@@ -630,9 +667,8 @@ fn main() -> Result<()> {
 /// Stitches `total` frames (or to the end) from `start` into `encoder`,
 /// framing each as `shot` says for its time. If the clip ends early, the
 /// last frame is repeated up to `total`, so the sound stays in step.
-fn encode(p: &Pipeline, start: f64, total: Option<usize>, encoder: &mut ffmpeg::Encoder, shot: impl Fn(f64) -> Shot) -> Result<()> {
+fn encode(p: &Pipeline, start: f64, total: Option<usize>, encoder: &mut ffmpeg::Encoder, shot: impl Fn(f64) -> Shot, tick: &mut dyn FnMut(usize) -> Result<()>) -> Result<()> {
     let mut stream = p.stream(start)?;
-    let began = Instant::now();
     let mut carry = Carry::default();
     let mut last = None;
     let mut n = 0;
@@ -643,16 +679,14 @@ fn encode(p: &Pipeline, start: f64, total: Option<usize>, encoder: &mut ffmpeg::
         encoder.write(&frame)?;
         last = Some(frame);
         n += 1;
-        if n % 10 == 0 {
-            eprint!("\rframe {n}{}  {:.2} fps", total.map_or(String::new(), |t| format!("/{t}")), n as f64 / began.elapsed().as_secs_f64());
-        }
+        tick(n)?;
     }
     if let (Some(total), Some(last)) = (total, &last) {
-        for _ in n..total {
+        for k in n..total {
             encoder.write(last)?;
+            tick(k + 1)?;
         }
     }
-    eprintln!("\r{n} frames in {:.0} s", began.elapsed().as_secs_f64());
     Ok(())
 }
 

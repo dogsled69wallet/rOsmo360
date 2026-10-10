@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
 use iced::mouse;
-use iced::widget::{button, canvas, center, column, container, image, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
+use iced::widget::{button, canvas, center, column, progress_bar, container, image, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
 use iced::window;
 use iced::{Alignment, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme};
 use playback::Playback;
@@ -191,6 +191,14 @@ enum Message {
     /// Save the project; to a new file if true or never saved.
     SaveProject(bool),
     SaveProjectTo(Option<PathBuf>),
+    Resolution(crate::Resolution),
+    /// Export the edit: ask where, then render in the background.
+    Export,
+    ExportTo(Option<PathBuf>),
+    /// Fraction of the export done.
+    ExportProgress(f32),
+    ExportDone(Result<PathBuf, String>),
+    ExportCancel,
     /// Never cloned in flight, so the clip can be taken back out of the `Arc`.
     Loaded(Arc<Result<Media, String>>),
     Tick,
@@ -259,6 +267,10 @@ struct App {
     /// The project file, once opened or saved, and the edit version saved.
     project: Option<PathBuf>,
     saved_version: u64,
+    /// Exports are this many pixels on the short side.
+    resolution: crate::Resolution,
+    /// A running export: its cancel flag and how far it has got.
+    exporting: Option<(Arc<std::sync::atomic::AtomicBool>, f32)>,
     /// A trim or keyframe drag has saved the edit for undo already.
     dragging: bool,
     clip: Option<Clip>,
@@ -296,6 +308,8 @@ impl App {
             loading_adds: true,
             project: None,
             saved_version: 0,
+            resolution: crate::Resolution::P1080,
+            exporting: None,
             clip: None,
             loading: None,
             error: None,
@@ -347,6 +361,72 @@ impl App {
             Aspect::Ratio(w, h) => Some(crate::view::Aspect(w.into(), h.into())),
         };
         Project { aspect, cuts: self.edit.cuts.clone() }
+    }
+
+    /// Renders the edit to `path` on its own thread with the export the
+    /// command line uses, at the chosen resolution, in the aspect lock's
+    /// shape (16:9 when free), stabilised as the player is.
+    fn start_export(&mut self, path: PathBuf) -> Task<Message> {
+        use iced::futures::{SinkExt, StreamExt};
+        let project = self.to_project();
+        let [w, h] = project.aspect.unwrap_or(crate::view::Aspect(16, 9)).size(self.resolution.short_side());
+        let opts = crate::StitchOpts {
+            stabilize: Some(self.opts.stabilize),
+            imu_axes: self.opts.imu_axes,
+            world_z_down: self.opts.world_z_down,
+            no_rs: !self.rolling_shutter,
+            ..Default::default()
+        };
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.exporting = Some((cancel.clone(), 0.0));
+        self.save_status = None;
+        let work = iced::stream::channel(8, async move |mut output: iced::futures::channel::mpsc::Sender<Message>| {
+            let (tx, mut rx) = iced::futures::channel::mpsc::unbounded();
+            std::thread::spawn(move || {
+                let mut progress = |done: usize, total: usize| {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        anyhow::bail!("cancelled");
+                    }
+                    if done.is_multiple_of(5) || done == total {
+                        let _ = tx.unbounded_send(Message::ExportProgress(done as f32 / total.max(1) as f32));
+                    }
+                    Ok(())
+                };
+                let result = crate::export(&project, &opts, (w as usize, h as usize), false, &path, &mut progress);
+                let _ = tx.unbounded_send(Message::ExportDone(result.map(|()| path).map_err(|e| format!("{e:#}"))));
+            });
+            while let Some(m) = rx.next().await {
+                if output.send(m).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Task::run(work, |m| m)
+    }
+
+    /// Export button and resolution, or a running export's progress.
+    fn export_controls(&self) -> Element<'_, Message> {
+        match &self.exporting {
+            Some((_, done)) => row![
+                text(format!("Exporting {:.0}%", done * 100.0)),
+                progress_bar(0.0..=1.0, *done).length(140).girth(8),
+                button("Cancel").on_press(Message::ExportCancel),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into(),
+            None => row![
+                tooltip(
+                    button("Export…").on_press_maybe((!self.edit.cuts.is_empty()).then_some(Message::Export)),
+                    text("Render the edit to MP4 with sound, in the aspect lock's shape (16:9 when free)"),
+                    tooltip::Position::Bottom,
+                ),
+                pick_list(&crate::Resolution::ALL[..], Some(self.resolution), Message::Resolution),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into(),
+        }
     }
 
     fn unsaved(&self) -> bool {
@@ -485,6 +565,45 @@ impl App {
                     },
                     Message::SaveProjectTo,
                 );
+            }
+            Message::Resolution(r) => self.resolution = r,
+            Message::Export => {
+                if self.edit.cuts.is_empty() || self.exporting.is_some() {
+                    return Task::none();
+                }
+                let base = self.project.as_ref().unwrap_or(&self.edit.cuts[0].input);
+                let dir = base.parent().map(Path::to_owned);
+                let name = format!("{}_{}.mp4", base.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), self.resolution);
+                return Task::perform(
+                    async move {
+                        let mut dialog = rfd::AsyncFileDialog::new().set_title("Export video").add_filter("MP4 video", &["mp4"]).set_file_name(name);
+                        if let Some(dir) = dir {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog.save_file().await.map(|f| f.path().to_owned())
+                    },
+                    Message::ExportTo,
+                );
+            }
+            Message::ExportTo(None) => {}
+            Message::ExportTo(Some(path)) => return self.start_export(path),
+            Message::ExportProgress(f) => {
+                if let Some((_, done)) = &mut self.exporting {
+                    *done = f;
+                }
+            }
+            Message::ExportCancel => {
+                if let Some((cancel, _)) = &self.exporting {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Message::ExportDone(result) => {
+                let cancelled = self.exporting.take().is_some_and(|(c, _)| c.load(std::sync::atomic::Ordering::Relaxed));
+                match result {
+                    Ok(path) => self.save_status = Some(format!("Exported {}", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()))),
+                    Err(_) if cancelled => self.save_status = Some("Export cancelled".to_owned()),
+                    Err(e) => self.error = Some(format!("Export failed: {e}")),
+                }
             }
             Message::SaveProjectTo(Some(path)) => match self.to_project().save(&path) {
                 Ok(()) => {
@@ -986,7 +1105,13 @@ impl App {
                 text("Save the edit: cuts, keyframes and shape (Ctrl+S; Ctrl+Shift+S saves as)"),
                 tooltip::Position::Bottom,
             ),
-            text(media.input.display().to_string()),
+            self.export_controls(),
+            // The file name: the full path is in the tooltip.
+            tooltip(
+                text(media.input.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())),
+                text(media.input.display().to_string()),
+                tooltip::Position::Bottom,
+            ),
             space().width(Length::Fill),
             text(status)
         ]
