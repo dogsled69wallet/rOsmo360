@@ -99,7 +99,7 @@ In the player:
 | Delete the selected cut | Shift+Delete, or 🗑 |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
 | Save / open a project | Ctrl+S (Ctrl+Shift+S: save as) / Ctrl+Shift+O |
-| Export the edit to MP4 | Export… (pick 720p–2160p next to it); the aspect lock sets the shape, 16:9 when free |
+| Export the edit | Export… (pick 720p–2160p next to it); the aspect lock sets the shape, 16:9 when free. **Clips** writes each cut to its own file ("project - 001" and on) for another editor; **Resolve** writes DNxHR and PCM in `.mov`, which DaVinci Resolve's free Linux version can read |
 
 A project saves the cuts, their keyframes and the aspect lock, in the same file `rosmo360 export` renders (see below). Clips in the project's folder are stored by relative path, so the folder can be moved as a whole.
 
@@ -151,7 +151,11 @@ To join cuts from one or more clips, write a project file and export it. Each cu
 
 ```sh
 rosmo360 export edit.json -o edit.mp4
+rosmo360 export edit.json --clips --handles 1 -o clips/      # a file per cut: "edit - 001.mp4", … with 1 s extra either side
+rosmo360 export edit.json --format resolve -o edit.mov       # DNxHR HQ + PCM, for DaVinci Resolve on Linux
 ```
+
+`--format resolve` exists because DaVinci Resolve's free version on Linux reads neither H.264/H.265 nor AAC. DNxHR is an editing format, so the files are large: about 27 MB a second at 1080p.
 
 `t` is the clip time in seconds; `projection` is `perspective`, `little-planet` or `equirect`; `ease` (how a keyframe moves on to the next) is `smooth` (the default), `linear` or `hold`. Perspective and little planet morph smoothly into each other.
 
@@ -169,7 +173,7 @@ rosmo360 scan clip.OSV > scan.csv           # per second: heading, tilt, turning
 
 ## Roadmap
 
-- Version 0.3: crossfades between cuts; sound controls (a music track and each cut's volume); exporting the timeline as separate clips for other editors; and a DaVinci Resolve-friendly export (DNxHR or ProRes with PCM audio, which Resolve's free Linux version can read).
+- Version 0.3: crossfades between cuts, and sound controls (a music track and each cut's volume).
 - 360° metadata on equirectangular exports, so YouTube and VR players show them as 360° video.
 - Smooth full-resolution playback on modest hardware (zero-copy decoding).
 - Windows and macOS builds.

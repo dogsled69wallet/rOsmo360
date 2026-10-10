@@ -295,7 +295,36 @@ impl Drop for Decoder {
     }
 }
 
-/// Encodes RGB24 frames to H.264, muxing the source's audio over the same span.
+/// What `Encoder` writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    /// H.264 and AAC in MP4: plays anywhere, small.
+    #[default]
+    Mp4,
+    /// DNxHR HQ and 16-bit PCM in MOV, for DaVinci Resolve: its free Linux
+    /// version decodes neither H.264/H.265 nor AAC. About 27 MB a second
+    /// at 1080p (110 at 2160p), an editing intermediate.
+    Resolve,
+}
+
+impl Format {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Mp4 => "mp4",
+            Format::Resolve => "mov",
+        }
+    }
+
+    fn codecs(self) -> &'static [&'static str] {
+        match self {
+            Format::Mp4 => &["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+            Format::Resolve => &["-c:v", "dnxhd", "-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p", "-c:a", "pcm_s16le", "-ar", "48000"],
+        }
+    }
+}
+
+/// Encodes RGB24 frames, muxing the source's audio over the same span.
 pub struct Encoder {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -313,7 +342,7 @@ impl Encoder {
     /// The sound is `audio`'s stretches back to back. Each stretch should
     /// last exactly as long as the frames written for it, so later cuts stay
     /// in sync. Several stretches are joined only if every clip has sound.
-    pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio: &[Sound<'_>]) -> Result<Self> {
+    pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio: &[Sound<'_>], format: Format) -> Result<Self> {
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24"]).args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"]);
         for s in audio {
@@ -336,7 +365,7 @@ impl Encoder {
         }
         let mut child = cmd
             .args(["-shortest"])
-            .args(["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+            .args(format.codecs())
             .arg(output)
             .stdin(Stdio::piped())
             .spawn()

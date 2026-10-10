@@ -2,6 +2,7 @@
 //! changes, in the OS's usual place for configuration.
 
 use crate::Resolution;
+use crate::ffmpeg::Format;
 use crate::stab::Mode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -19,6 +20,9 @@ pub struct Settings {
     pub resolution: Resolution,
     /// The aspect lock, width and height; free if `None`.
     pub aspect: Option<[u16; 2]>,
+    /// Export each cut to its own file.
+    pub export_clips: bool,
+    pub export_format: Format,
 }
 
 impl Default for Settings {
@@ -32,6 +36,8 @@ impl Default for Settings {
             muted: false,
             resolution: Resolution::P1080,
             aspect: None,
+            export_clips: false,
+            export_format: Format::Mp4,
         }
     }
 }

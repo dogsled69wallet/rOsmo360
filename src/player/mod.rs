@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
 use iced::mouse;
-use iced::widget::{button, center, column, progress_bar, container, image, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
+use iced::widget::{button, center, checkbox, column, progress_bar, container, image, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
 use iced::window;
 use iced::{Alignment, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme};
 use playback::Playback;
@@ -234,12 +234,18 @@ enum Message {
     SaveProject(bool),
     SaveProjectTo(Option<PathBuf>),
     Resolution(crate::Resolution),
-    /// Export the edit: ask where, then render in the background.
+    /// Export each cut to its own file.
+    ExportClips(bool),
+    /// Export for DaVinci Resolve (true) or as MP4.
+    ExportResolve(bool),
+    /// Export the edit: ask where (a file, or a folder for the clips), then
+    /// render in the background.
     Export,
     ExportTo(Option<PathBuf>),
     /// Fraction of the export done.
     ExportProgress(f32),
-    ExportDone(Result<PathBuf, String>),
+    /// The files written.
+    ExportDone(Result<Vec<PathBuf>, String>),
     ExportCancel,
     /// Never cloned in flight, so the clip can be taken back out of the `Arc`.
     Loaded(Arc<Result<Media, String>>),
@@ -326,6 +332,9 @@ struct App {
     after_save: Option<Then>,
     /// Exports are this many pixels on the short side.
     resolution: crate::Resolution,
+    /// Export each cut to its own file, and in which format.
+    export_clips: bool,
+    export_format: ffmpeg::Format,
     /// A running export: its cancel flag and how far it has got.
     exporting: Option<(Arc<std::sync::atomic::AtomicBool>, f32)>,
     /// A trim or keyframe drag has saved the edit for undo already.
@@ -381,6 +390,8 @@ impl App {
             saved_version: 0,
             after_save: None,
             resolution: saved.resolution,
+            export_clips: saved.export_clips,
+            export_format: saved.export_format,
             exporting: None,
             clip: None,
             held: None,
@@ -414,6 +425,8 @@ impl App {
                 Aspect::Free => None,
                 Aspect::Ratio(w, h) => Some([w, h]),
             },
+            export_clips: self.export_clips,
+            export_format: self.export_format,
         }
     }
 
@@ -472,6 +485,12 @@ impl App {
         use iced::futures::{SinkExt, StreamExt};
         let project = self.to_project();
         let [w, h] = project.aspect.unwrap_or(crate::view::Aspect(16, 9)).size(self.resolution.short_side());
+        let target = if self.export_clips {
+            crate::Target::Clips { dir: path, name: self.export_name(), handles: 0.0 }
+        } else {
+            crate::Target::One(path.with_extension(self.export_format.extension()))
+        };
+        let out = crate::ExportOpts { size: (w as usize, h as usize), draft: false, cpu: false, format: self.export_format, target };
         let opts = crate::StitchOpts {
             stabilize: Some(self.opts.stabilize),
             imu_axes: self.opts.imu_axes,
@@ -494,8 +513,8 @@ impl App {
                     }
                     Ok(())
                 };
-                let result = crate::export(&project, &opts, (w as usize, h as usize), false, false, &path, &mut progress);
-                let _ = tx.unbounded_send(Message::ExportDone(result.map(|()| path).map_err(|e| format!("{e:#}"))));
+                let result = crate::export(&project, &opts, &out, &mut progress);
+                let _ = tx.unbounded_send(Message::ExportDone(result.map_err(|e| format!("{e:#}"))));
             });
             while let Some(m) = rx.next().await {
                 if output.send(m).await.is_err() {
@@ -506,7 +525,16 @@ impl App {
         Task::run(work, |m| m)
     }
 
-    /// Export button and resolution, or a running export's progress.
+    /// What exports are named after: the project, else the first clip.
+    fn export_base(&self) -> &Path {
+        self.project.as_deref().unwrap_or(&self.edit.cuts[0].input)
+    }
+
+    fn export_name(&self) -> String {
+        self.export_base().file_stem().map_or_else(|| "export".to_owned(), |s| s.to_string_lossy().into_owned())
+    }
+
+    /// Export button, resolution and options, or a running export's progress.
     fn export_controls(&self) -> Element<'_, Message> {
         match &self.exporting {
             Some((_, done)) => row![
@@ -525,10 +553,20 @@ impl App {
                 ),
                 tooltip(
                     button("Export…").on_press_maybe((!self.edit.cuts.is_empty()).then_some(Message::Export)),
-                    text("Render the edit to MP4 with sound, at this resolution, in the aspect's shape"),
+                    text("Render the edit with sound, at this resolution, in the aspect's shape"),
                     tooltip::Position::Bottom,
                 ),
                 pick_list(&crate::Resolution::ALL[..], Some(self.resolution), Message::Resolution),
+                tooltip(
+                    checkbox(self.export_clips).label("Clips").on_toggle(Message::ExportClips),
+                    text("Export each cut to its own file, for another editor: \"<project> - 001\" and on, into a folder you pick"),
+                    tooltip::Position::Bottom,
+                ),
+                tooltip(
+                    checkbox(self.export_format == ffmpeg::Format::Resolve).label("Resolve").on_toggle(Message::ExportResolve),
+                    text("For DaVinci Resolve, whose free Linux version can't read MP4's H.264 and AAC: DNxHR HQ with PCM sound in .mov. Large: about 27 MB a second at 1080p"),
+                    tooltip::Position::Bottom,
+                ),
             ]
             .spacing(6)
             .align_y(Alignment::Center)
@@ -727,20 +765,27 @@ impl App {
                 );
             }
             Message::Resolution(r) => self.resolution = r,
+            Message::ExportClips(on) => self.export_clips = on,
+            Message::ExportResolve(on) => self.export_format = if on { ffmpeg::Format::Resolve } else { ffmpeg::Format::Mp4 },
             Message::Export => {
                 if self.edit.cuts.is_empty() || self.exporting.is_some() {
                     return Task::none();
                 }
-                let base = self.project.as_ref().unwrap_or(&self.edit.cuts[0].input);
-                let dir = base.parent().map(Path::to_owned);
-                let name = format!("{}_{}.mp4", base.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), self.resolution);
+                let dir = self.export_base().parent().map(Path::to_owned);
+                let (clips, ext) = (self.export_clips, self.export_format.extension());
+                let name = format!("{}_{}.{ext}", self.export_name(), self.resolution);
                 return Task::perform(
                     async move {
-                        let mut dialog = rfd::AsyncFileDialog::new().set_title("Export video").add_filter("MP4 video", &["mp4"]).set_file_name(name);
+                        let mut dialog = rfd::AsyncFileDialog::new();
                         if let Some(dir) = dir {
                             dialog = dialog.set_directory(dir);
                         }
-                        dialog.save_file().await.map(|f| f.path().to_owned())
+                        if clips {
+                            dialog.set_title("Export the cuts as clips, into the folder").pick_folder().await.map(|f| f.path().to_owned())
+                        } else {
+                            let kind = if ext == "mov" { "QuickTime video" } else { "MP4 video" };
+                            dialog.set_title("Export video").add_filter(kind, &[ext]).set_file_name(name).save_file().await.map(|f| f.path().to_owned())
+                        }
                     },
                     Message::ExportTo,
                 );
@@ -760,7 +805,14 @@ impl App {
             Message::ExportDone(result) => {
                 let cancelled = self.exporting.take().is_some_and(|(c, _)| c.load(std::sync::atomic::Ordering::Relaxed));
                 match result {
-                    Ok(path) => self.save_status = Some(format!("Exported {}", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()))),
+                    Ok(paths) => {
+                        let name = |p: &PathBuf| p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                        self.save_status = Some(match paths.as_slice() {
+                            [one] => format!("Exported {}", name(one)),
+                            [first, ..] => format!("Exported {} clips to {}", paths.len(), first.parent().map_or_else(String::new, |d| d.display().to_string())),
+                            [] => "Exported nothing".to_owned(),
+                        });
+                    }
                     Err(_) if cancelled => self.save_status = Some("Export cancelled".to_owned()),
                     Err(e) => self.error = Some(format!("Export failed: {e}")),
                 }

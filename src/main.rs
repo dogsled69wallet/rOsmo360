@@ -136,8 +136,24 @@ enum Cmd {
         /// Exact size, WIDTHxHEIGHT, instead of a resolution and aspect.
         #[arg(long, value_parser = parse_size, conflicts_with_all = ["resolution", "aspect"])]
         size: Option<[u32; 2]>,
-        #[arg(short, long, default_value = "clip.mp4")]
-        output: PathBuf,
+        /// The file to write; with --clips, the folder for the clips.
+        /// [default: clip.mp4, clip.mov for --format resolve, or the
+        /// project's or clip's name for --clips]
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// mp4: H.264 and AAC, plays anywhere. resolve: DNxHR HQ and PCM
+        /// in MOV, which DaVinci Resolve's free Linux version can read
+        /// (about 27 MB a second at 1080p).
+        #[arg(long, value_enum, default_value_t = ffmpeg::Format::Mp4)]
+        format: ffmpeg::Format,
+        /// Write each cut to its own file for another editor, named after
+        /// the project: "<name> - 001.mp4" and on, in the folder -o.
+        #[arg(long)]
+        clips: bool,
+        /// With --clips, seconds of extra footage either side of each cut,
+        /// where the clip has it, for the other editor's transitions.
+        #[arg(long, default_value_t = 0.0, requires = "clips")]
+        handles: f64,
         /// Stitch from the low-resolution proxy (LRF): a quick, soft draft.
         #[arg(long)]
         draft: bool,
@@ -520,11 +536,34 @@ fn cut_pipelines(project: &project::Project, opts: &StitchOpts, proxy: bool) -> 
     Ok((pipelines, of_cut))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), draft: bool, cpu: bool, output: &Path, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<()> {
-    let (pipelines, of_cut) = cut_pipelines(project, opts, draft)?;
+/// How and where `export` writes.
+pub struct ExportOpts {
+    pub size: (usize, usize),
+    /// Stitch from the proxies: quick and soft.
+    pub draft: bool,
+    /// Stitch on the CPU, not the GPU.
+    pub cpu: bool,
+    pub format: ffmpeg::Format,
+    pub target: Target,
+}
+
+pub enum Target {
+    /// The whole edit in one file.
+    One(PathBuf),
+    /// A file per cut in `dir`, named `<name> - 001.<ext>` and on, for an
+    /// external editor. Each runs `handles` seconds longer either side where
+    /// its clip has the footage, for that editor's own transitions.
+    Clips { dir: PathBuf, name: String, handles: f64 },
+}
+
+/// Renders `project` as `out` says, with sound, and returns the files
+/// written. Each clip is set up once however many cuts use it.
+/// `progress(done, total)` hears of every frame; an error from it (a
+/// cancel) stops the export and removes the unfinished file.
+fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<Vec<PathBuf>> {
+    let (pipelines, of_cut) = cut_pipelines(project, opts, out.draft)?;
     // The shader always draws both lenses, so `--only` needs the CPU.
-    let mut gpu = if cpu || opts.only.is_some() {
+    let mut gpu = if out.cpu || opts.only.is_some() {
         None
     } else {
         match player::render::Gpu::new() {
@@ -539,12 +578,16 @@ fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), d
         }
     };
     let clips: Vec<_> = if gpu.is_some() { pipelines.iter().map(player::render::Clip::new).collect::<Result<_>>()? } else { Vec::new() };
+    let handles = match out.target {
+        Target::One(_) => 0.0,
+        Target::Clips { handles, .. } => handles.max(0.0),
+    };
     // Per cut: its clip's pipeline, start (on a frame) and frame count.
     let mut plan = Vec::with_capacity(project.cuts.len());
     for (cut, &i) in project.cuts.iter().zip(&of_cut) {
         let p = &pipelines[i];
-        let start = p.snap(cut.start);
-        let end = cut.end.min(ffmpeg::duration(&cut.input)?);
+        let start = p.snap((cut.start - handles).max(0.0));
+        let end = (cut.end + handles).min(ffmpeg::duration(&cut.input)?);
         if end <= start {
             bail!("the cut from {} s starts after {} ends", cut.start, cut.input.display());
         }
@@ -554,24 +597,38 @@ fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), d
     if pipelines.iter().any(|p| (p.fps - fps).abs() > 0.01) {
         eprintln!("the clips' frame rates differ; exporting at {fps:.3} fps");
     }
-    let sound: Vec<_> = plan.iter().map(|&(i, start, frames)| ffmpeg::Sound { input: &pipelines[i].input, start, duration: Some(frames as f64 / fps) }).collect();
-    let mut encoder = ffmpeg::Encoder::new(output, size, fps, &sound)?;
+    // Each file and the cuts it holds.
+    let files: Vec<(PathBuf, std::ops::Range<usize>)> = match &out.target {
+        Target::One(path) => vec![(path.clone(), 0..plan.len())],
+        Target::Clips { dir, name, .. } => {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            (0..plan.len()).map(|k| (dir.join(format!("{name} - {:03}.{}", k + 1, out.format.extension())), k..k + 1)).collect()
+        }
+    };
     let total = plan.iter().map(|p| p.2).sum();
     let mut done = 0;
-    for (cut, &(i, start, frames)) in project.cuts.iter().zip(&plan) {
-        let mut tick = |n: usize| progress(done + n, total);
-        let result = match &mut gpu {
-            Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut encoder, |t| cut.camera_at(t), size, &mut tick),
-            None => encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: cut.camera_at(t), size }, &mut tick),
-        };
-        if let Err(e) = result {
-            encoder.abort();
-            let _ = std::fs::remove_file(output);
-            return Err(e);
+    let mut written = Vec::with_capacity(files.len());
+    for (path, cuts) in files {
+        let sound: Vec<_> = plan[cuts.clone()].iter().map(|&(i, start, frames)| ffmpeg::Sound { input: &pipelines[i].input, start, duration: Some(frames as f64 / fps) }).collect();
+        let mut encoder = ffmpeg::Encoder::new(&path, out.size, fps, &sound, out.format)?;
+        for (cut, &(i, start, frames)) in project.cuts[cuts.clone()].iter().zip(&plan[cuts]) {
+            let size = out.size;
+            let mut tick = |n: usize| progress(done + n, total);
+            let result = match &mut gpu {
+                Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut encoder, |t| cut.camera_at(t), size, &mut tick),
+                None => encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: cut.camera_at(t), size }, &mut tick),
+            };
+            if let Err(e) = result {
+                encoder.abort();
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+            done += frames;
         }
-        done += frames;
+        encoder.finish()?;
+        written.push(path);
     }
-    encoder.finish()
+    Ok(written)
 }
 
 /// Progress on the terminal: frames done, out of how many, and the rate.
@@ -638,7 +695,7 @@ fn main() -> Result<()> {
             let p = Pipeline::new(&input, &opts, stab::Mode::Off)?;
             let start = p.snap(start);
             let total = duration.map(|d| (d * p.fps).round() as usize);
-            let mut encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &[ffmpeg::Sound { input: &input, start, duration }])?;
+            let mut encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &[ffmpeg::Sound { input: &input, start, duration }], ffmpeg::Format::Mp4)?;
             let began = Instant::now();
             let mut tick = |n: usize| {
                 if n.is_multiple_of(10) {
@@ -651,7 +708,8 @@ fn main() -> Result<()> {
             encoder.finish()?;
             eprintln!("wrote {}", output.display());
         }
-        Cmd::Export { input, framing, start, duration, resolution, aspect, size, output, draft, cpu, opts } => {
+        Cmd::Export { input, framing, start, duration, resolution, aspect, size, output, format, clips, handles, draft, cpu, opts } => {
+            let name = input.file_stem().map_or_else(|| "export".to_owned(), |s| s.to_string_lossy().into_owned());
             let project = if is_project(&input) {
                 if framing.reframe.is_some() || framing.view.is_some() || start.is_some() || duration.is_some() {
                     bail!("a project sets its own cuts and views; leave out --reframe, --view, -s and -d");
@@ -665,8 +723,16 @@ fn main() -> Result<()> {
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
-            export(&project, &opts, (w, h), draft, cpu, &output, &mut print_progress())?;
-            eprintln!("wrote {} ({w}×{h}, {:.2} s)", output.display(), project.duration());
+            let target = if clips {
+                Target::Clips { dir: output.unwrap_or_else(|| PathBuf::from(&name)), name, handles }
+            } else {
+                Target::One(output.unwrap_or_else(|| PathBuf::from(format!("clip.{}", format.extension()))))
+            };
+            let written = export(&project, &opts, &ExportOpts { size: (w, h), draft, cpu, format, target }, &mut print_progress())?;
+            for path in &written {
+                eprintln!("wrote {} ({w}×{h})", path.display());
+            }
+            eprintln!("{} file(s), {:.2} s of edit", written.len(), project.duration());
         }
         Cmd::Preview { input, framing, start, duration, every, tile, columns, output, full, opts } if is_project(&input) => {
             if framing.reframe.is_some() || framing.view.is_some() || start.is_some() || duration.is_some() {

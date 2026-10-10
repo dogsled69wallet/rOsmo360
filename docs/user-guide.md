@@ -212,6 +212,13 @@ The export renders the whole edit at full resolution, with the sound joined acro
 
 Exports render on the GPU. On an RTX 3090 that's about 21 frames a second at 1080p, so a one-minute edit takes about a minute and a half. You can keep using the player while it runs.
 
+Two checkboxes next to the resolution change what gets written:
+
+- **Clips** writes each cut to its own file instead of one video, for finishing in another editor. Export… then asks for a folder, and the files are named after the project: `My hike - 001.mp4`, `My hike - 002.mp4` and so on, in timeline order.
+- **Resolve** writes DNxHR HQ video with uncompressed PCM sound in a `.mov`, instead of H.264 and AAC in an MP4. Use it for DaVinci Resolve: its free version on Linux can't read H.264, H.265 or AAC. The files are large, about 27 MB a second at 1080p (110 at 4K), as editing formats are.
+
+Both are remembered, and they combine: Clips and Resolve together give one `.mov` per cut, ready to drop into Resolve.
+
 ## 11. Saving photos
 
 Pause, then:
@@ -232,7 +239,11 @@ rosmo360 export edit.json -o edit.mp4                         # a project saved 
 rosmo360 export clip.OSV -s 30 -d 8 --view 40,-10 -a 9:16 -o reel.mp4
 rosmo360 export clip.OSV --reframe moves.json -r 2160p -o reel.mp4
 rosmo360 export edit.json --draft -o draft.mp4                # quick and soft, from the proxies
+rosmo360 export edit.json --clips --handles 1 -o clips/        # a file per cut, with 1 s extra either side
+rosmo360 export edit.json --format resolve -o edit.mov         # for DaVinci Resolve on Linux
 ```
+
+`--handles` adds footage before and after each clip, where the camera recorded it, so another editor has room for its own transitions.
 
 **Preview** an edit or a clip as one image. For a project you get a row per cut, each tile framed as the export will frame it:
 

@@ -22,7 +22,7 @@ Working and verified on real footage:
   - `stitch`: one frame to an equirect PNG.
   - `render`: span to an equirect MP4 with audio.
   - `seam`: seam alignment quality over a span (ghosting left, frame-to-frame wobble).
-  - `export`: a framed MP4 with sound, from a fixed `--view` or a keyframed `--reframe` JSON (`view::Reframe`), or a project JSON of cuts from several clips (`project::Project`), joined with their sound. A single clip is exported as a one-cut project. 1080p by default (`-r` 720p–2160p is the short side; `-a` aspect, or the reframe's `"aspect"`). `--draft` stitches from the LRF proxy.
+  - `export`: a framed video with sound (MP4, or `--format resolve`: DNxHR HQ + PCM in MOV, since Resolve free on Linux reads no H.264/H.265/AAC; DNxHR encodes any size, ~27 MB/s at 1080p), from a fixed `--view` or a keyframed `--reframe` JSON (`view::Reframe`), or a project JSON of cuts from several clips (`project::Project`), joined with their sound. A single clip is exported as a one-cut project. `--clips` writes a file per cut into the folder `-o`, named `<project or clip> - 001.<ext>`, with `--handles` seconds of extra footage either side where the clip has it (`main::Target::Clips`). 1080p by default (`-r` 720p–2160p is the short side; `-a` aspect, or the reframe's `"aspect"`). `--draft` stitches from the LRF proxy.
   - `preview`: a contact sheet of stitched moments labelled with time; equirect tiles marked at yaw −90/0/90° and the horizon, or the reframe's framing. Given a project, a row per cut (`--columns` tiles spread across it, or `--every N` wrapping rows) framed as the export frames it, labelled `#cut time`; `cut_pipelines` is shared with `export`.
   - `scan`: CSV per second of heading, tilt, turning, shake, loudness and peak.
   - `info`: duration, fps, recording time and contents as JSON.
@@ -53,8 +53,7 @@ Not done yet, roughly in priority order:
    - Crossfades between cuts (picture and sound), in the player and the export.
    - Music: a track under the edit, with its level.
    - Each cut's volume, and mute.
-   - Export the timeline as separate clips, one per cut, named `<project> - 001.mp4` and so on (the first clip's name without a project), for external editors. Optional handles (e.g. 1 s either side where the footage has it) and possibly an EDL/FCPXML so the editor rebuilds the cut order.
-   - A "DaVinci Resolve (Linux)" export checkbox (and CLI option), for the full export and the separate clips: Resolve free on Linux decodes neither H.264/H.265 nor AAC, so DNxHR HQ (or ProRes 422 HQ) in `.mov` with PCM audio (48 kHz). Large files (~20 MB/s at 1080p30); say so in the UI.
+   - Done: export as separate clips (`--clips`, `--handles`; the player's Clips checkbox) and the DaVinci Resolve format (`--format resolve`; the Resolve checkbox). Maybe later: an EDL/FCPXML beside the clips so an editor rebuilds the cut order, and handles in the player.
 7. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
    - Needs a D-Log M sample clip first: all 35 Kyrkja clips are normal colour, tagged BT.709 10-bit, as DJI may also tag D-Log.
    - DJI records the profile in `StreamMeta.color_mode` (`ColorModeType`: D_LOG = 2, HLG = 9, …). telemetry-parser's Metadata tag only serialises the clip meta, so reading it means decoding StreamMeta ourselves.
