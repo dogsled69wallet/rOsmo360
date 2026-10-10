@@ -15,7 +15,7 @@ use std::time::Instant;
 use telemetry_parser::rig::{RigPicture, geometry::ProjectionKind};
 
 #[derive(Parser)]
-#[command(about = "Tools for DJI Osmo 360 .OSV files")]
+#[command(name = player::NAME, about = "rOsmo360: play and stitch DJI Osmo 360 .OSV files")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

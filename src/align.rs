@@ -44,7 +44,7 @@ const PATCH_H: isize = 6;
 const DISTANCE_PRIOR: f64 = 0.06;
 /// Cost added per degree away from the previous frame's shift: a cell only
 /// moves when the picture clearly says so. With the prior above this cut
-/// frame-to-frame wobble of the shift ~4× (`osmo360 seam` on 0037, 0026,
+/// frame-to-frame wobble of the shift ~4× (`rosmo360 seam` on 0037, 0026,
 /// 0043) without leaving more ghosting.
 const TEMPORAL: f64 = 0.1;
 

@@ -2,7 +2,7 @@
 
 A Rust/Linux replacement for DJI Studio's playback of DJI Osmo 360 `.OSV` footage: correct dual-fisheye stitching, gyro stabilisation, rolling-shutter correction and free-look playback. The goal is to get as close to DJI Studio as possible without its proprietary pieces (AI tracking, its denoise, flow-based seam refinement).
 
-The crate and binary are still called `osmo360`.
+The tool is called **rOsmo360** (the r is for its Rust core); the window title, app id and `--help` use that name. The crate and binary are `rosmo360` (renamed from `osmo360` on 2026-10-10).
 
 ## Status (2026-10-10)
 
@@ -28,6 +28,7 @@ Working and verified on real footage:
   - Plays the LRF proxy (or the OSV at 1920 px or full size) and swaps in a full-res frame on pause.
   - Sound through cpal, with a mute icon and volume slider. While sound plays it is the playback clock.
   - Aspect lock (Free, 16:9, 9:16, 4:3, 1:1, 2:1) letterboxes the view; a saved view takes the same shape.
+  - Shows the Vibing with Ravelund logo while a clip loads, and a "Made by" credit line at the bottom. The logo is `vibewithravelund-lowres-corrected.jpg`, embedded with `include_bytes!`, so it must stay in the repo root.
   - Follows the OS theme and accent through native-theme (KDE colour scheme, GTK/portal, Windows, macOS), live when it changes. iced's dark theme is the fallback.
   - Save the paused frame as PNG: the view as framed (3840 px on the long side) or the whole sphere (7680 × 3840). The CPU stitcher renders it from freshly decoded full-res frames in about 4 s.
 - **Hardware decode on any GPU vendor:** the first of Vulkan Video, VA-API and CUDA that decodes a test frame, else software. `--hwaccel` forces one.
@@ -45,7 +46,7 @@ Not done yet, roughly in priority order:
 
 ```sh
 cargo build --release
-B=target/release/osmo360
+B=target/release/rosmo360
 $B play [clip.OSV]                                    # player (see `$B play --help` for keys)
 $B stitch clip.OSV -t 10 -w 2048 --stabilize horizon -o f.png
 $B render clip.OSV -s 48 -d 12 -w 1280 --stabilize horizon -o out.mp4
@@ -153,7 +154,7 @@ How it was found:
 - Ghosting from close subjects is parallax across the seam (along α). The convergence variants don't fix it: no single distance suits both a hand at 0.5 m and mountains. A hard cut where the lenses disagree drew lines in the sky (before exposure matching) and was dropped.
 - Alignment matches zero-mean NCC patches symmetrically about the output angle (lens 0 at α − δ/2, lens 1 at α + δ/2), so the field needs no inversion. Featureless patches fall back to δ = 0, the calibration's own alignment.
 - telemetry-parser's `DjiMaskProfile` covers the housing and lens guards, not the stick or hands.
-- Tuning with `osmo360 seam` (mismatch = mean lens disagreement across the blend band; jitter = mean per-frame change of the shift):
+- Tuning with `rosmo360 seam` (mismatch = mean lens disagreement across the blend band; jitter = mean per-frame change of the shift):
   - A temporal term (cost per degree from last frame's shift, 0.1) plus a stronger distance prior (0.06) cut eased jitter ~4× (0037: 0.224° → 0.054°/frame) with equal or lower mismatch.
   - Bigger patches lower mismatch slightly but double jitter. Finer cells (256 × 13) change mismatch < 0.5%.
   - A constant shift along the seam (φ) only makes mismatch worse, so the calibration lines up along the seam; the search stays 1-D.

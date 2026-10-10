@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
 use iced::mouse;
-use iced::widget::{button, center, column, container, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
+use iced::widget::{button, center, column, container, image, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
 use iced::window;
 use iced::{Alignment, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme};
 use playback::Playback;
@@ -111,7 +111,12 @@ pub fn run(input: Option<PathBuf>, opts: Options) -> Result<()> {
     .title(App::title)
     .subscription(App::subscription)
     .theme(|app: &App| app.theme.clone())
-    .window_size((1280.0, 820.0))
+    .window(window::Settings {
+        size: iced::Size::new(1280.0, 820.0),
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific { application_id: NAME.to_owned(), ..Default::default() },
+        ..Default::default()
+    })
     .run()
     .context("running the player window")
 }
@@ -288,6 +293,7 @@ enum Message {
 struct App {
     opts: Options,
     theme: Theme,
+    logo: image::Handle,
     clip: Option<Clip>,
     loading: Option<PathBuf>,
     error: Option<String>,
@@ -307,6 +313,7 @@ impl App {
         App {
             opts,
             theme: system_theme(),
+            logo: image::Handle::from_bytes(LOGO),
             clip: None,
             loading: None,
             error: None,
@@ -338,9 +345,9 @@ impl App {
     fn title(&self) -> String {
         let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         match (&self.loading, &self.clip) {
-            (Some(p), _) => format!("osmo360 · loading {}", name(p)),
-            (None, Some(c)) => format!("osmo360 · {}", name(&c.playback.media.input)),
-            (None, None) => "osmo360".to_owned(),
+            (Some(p), _) => format!("{NAME} · loading {}", name(p)),
+            (None, Some(c)) => format!("{NAME} · {}", name(&c.playback.media.input)),
+            (None, None) => NAME.to_owned(),
         }
     }
 
@@ -550,15 +557,25 @@ impl App {
         Task::none()
     }
 
+    /// The logo shown while a clip loads or decodes its first frame.
+    fn logo(&self) -> Element<'_, Message> {
+        image(self.logo.clone()).width(Length::Fixed(420.0)).into()
+    }
+
+    fn loading_text(&self, path: &Path) -> String {
+        format!("Loading {}…", path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()))
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let open = button("Open…").on_press(Message::Open);
         let error = self.error.as_ref().map(|e| text(e.clone()).style(text::danger));
         let Some(clip) = &self.clip else {
             let status = match &self.loading {
-                Some(p) => format!("Loading {}…", p.display()),
+                Some(p) => self.loading_text(p),
                 None => "Open a DJI Osmo 360 .OSV clip to start.".to_owned(),
             };
-            return center(column![text(status), open].push(error).spacing(16).align_x(Alignment::Center)).into();
+            let start = center(column![self.logo(), text(status), open].push(error).spacing(16).align_x(Alignment::Center));
+            return column![start, credit()].into();
         };
         let p = &clip.playback;
         let media = &p.media;
@@ -595,7 +612,12 @@ impl App {
                 })
                 .into()
             }
-            None => center(text("Decoding…")).into(),
+            None => center(column![self.logo(), text("Decoding…")].spacing(16).align_x(Alignment::Center)).into(),
+        };
+        // Opening another clip: the logo stands in until it is ready.
+        let view = match &self.loading {
+            Some(path) => center(column![self.logo(), text(self.loading_text(path))].spacing(16).align_x(Alignment::Center)).into(),
+            None => view,
         };
         let view = container(view).width(Length::Fill).height(Length::Fill).style(|_| container::background(iced::Color::BLACK));
 
@@ -654,8 +676,19 @@ impl App {
         .align_y(Alignment::Center)
         .wrap();
 
-        column![top, view, transport, controls].push(error.map(|e| container(e).padding([0, 10]))).into()
+        column![top, view, transport, controls].push(error.map(|e| container(e).padding([0, 10]))).push(credit()).into()
     }
+}
+
+/// The tool's name: Osmo 360, with an r for its Rust core.
+pub const NAME: &str = "rOsmo360";
+
+const LOGO: &[u8] = include_bytes!("../../vibewithravelund-lowres-corrected.jpg");
+
+/// Who made it, and how: credit to the author and to the AI-assisted way it
+/// was built.
+fn credit<'a>() -> Element<'a, Message> {
+    container(text("Made by Vibing with Ravelund · 2026").size(12).style(text::secondary)).width(Length::Fill).align_x(Alignment::Center).padding([2, 10]).into()
 }
 
 /// Speaker icons for the mute button, drawn in the button's text colour.
