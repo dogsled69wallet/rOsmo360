@@ -9,6 +9,7 @@ mod gpu;
 mod playback;
 mod settings;
 mod source;
+mod thumbs;
 mod timeline;
 
 use crate::ffmpeg::{self, Hwaccel};
@@ -20,7 +21,7 @@ use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
 use iced::mouse;
-use iced::widget::{button, canvas, center, column, progress_bar, container, image, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
+use iced::widget::{button, center, column, progress_bar, container, image, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
 use iced::window;
 use iced::{Alignment, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme};
 use playback::Playback;
@@ -251,6 +252,8 @@ enum Message {
     KeyAdd,
     /// Delete the keyframe at the playhead.
     KeyDelete,
+    /// A thumbnail of clip `.0` at clip time `.1`.
+    Thumb(PathBuf, f64, image::Handle),
     /// How the keyframe at the playhead moves on to the next.
     KeyEase(Ease),
     /// Jump to keyframe `.1` of cut `.0`.
@@ -297,6 +300,8 @@ struct App {
     logo: image::Handle,
     /// Every clip opened so far, ready for the cuts that use it.
     library: Vec<Media>,
+    /// Each clip's timeline thumbnails by clip time, as they arrive.
+    thumbs: std::collections::HashMap<PathBuf, Vec<(f64, image::Handle)>>,
     edit: edit::Edit,
     /// The cut being played, and the one selected on the timeline.
     current: usize,
@@ -351,6 +356,7 @@ impl App {
             theme: system_theme(),
             logo: image::Handle::from_bytes(LOGO),
             library: Vec::new(),
+            thumbs: Default::default(),
             edit: edit::Edit::default(),
             current: 0,
             selected: None,
@@ -610,10 +616,13 @@ impl App {
                     Ok(media) => {
                         self.opts.hw = Some(media.hw);
                         let (input, duration) = (media.input.clone(), media.duration);
+                        let thumbs = (!self.thumbs.contains_key(&input)).then(|| Task::run(thumbs::stream(media.clone()), |m| m));
+                        self.thumbs.entry(input.clone()).or_default();
                         self.library.push(media);
                         if self.loading_adds {
                             self.add_cut(input, duration);
                         }
+                        return Task::batch([self.open_next(), thumbs.unwrap_or_else(Task::none)]);
                     }
                     Err(e) => self.error = Some(e),
                 }
@@ -850,6 +859,11 @@ impl App {
                     self.edit.checkpoint();
                     self.edit.cuts[self.current].keyframes.remove(k);
                 }
+            }
+            Message::Thumb(input, t, handle) => {
+                let thumbs = self.thumbs.entry(input).or_default();
+                let i = thumbs.partition_point(|(at, _)| *at < t);
+                thumbs.insert(i, (t, handle));
             }
             Message::KeyEase(ease) => {
                 if let Some(k) = self.current_key()
@@ -1328,20 +1342,25 @@ impl App {
             .iter()
             .map(|c| {
                 let keys = c.keyframes.iter().enumerate().filter(|(_, k)| k.t >= c.start - tolerance && k.t <= c.end + tolerance).map(|(i, k)| (i, k.t, k.ease)).collect();
-                let block = timeline::Block { label: cut_label(c, self.opts.stabilize), from, len: c.end - c.start, start: c.start, keys };
+                // Only those in the cut, and one either side for its ends.
+                let thumbs = self.thumbs.get(&c.input).map_or_else(Vec::new, |all| {
+                    let from = all.partition_point(|(t, _)| *t < c.start).saturating_sub(1);
+                    let to = (all.partition_point(|(t, _)| *t <= c.end) + 1).min(all.len());
+                    all[from..to].to_vec()
+                });
+                let block = timeline::Block { label: cut_label(c, self.opts.stabilize), from, len: c.end - c.start, start: c.start, keys, thumbs };
                 from += c.end - c.start;
                 block
             })
             .collect();
-        let timeline = canvas(timeline::Timeline {
+        let timeline = timeline::Timeline {
             blocks,
             duration: self.edit.duration(),
             position: self.position(),
             selected: self.selected,
             current: current.map(|k| (self.current, k)),
-        })
-        .width(Length::Fill)
-        .height(timeline::HEIGHT);
+        }
+        .view();
         let can_split = self.edit.cuts.get(self.current).is_some_and(|c| p.target() > c.start + edit::MIN_CUT && p.target() < c.end - edit::MIN_CUT);
         let transport = row![
             button(text(if p.playing { "Pause" } else { "Play" }).width(48).align_x(Alignment::Center)).on_press(Message::Toggle),

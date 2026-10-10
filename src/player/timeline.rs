@@ -1,15 +1,17 @@
 //! The timeline under the view. The top row holds the edit's cuts as
-//! blocks: click one to select it, drag it to move it, drag its edges to
+//! blocks showing thumbnails of their footage: click one to select it, drag it to move it, drag its edges to
 //! trim it. The bottom row is the seek bar with each cut's keyframes as
 //! diamonds (shaped by their ease): click the bar to seek, click a diamond to jump to it, drag one
 //! to retime it.
 
-use super::Message;
+use super::{Message, thumbs};
 use crate::view::Ease;
 use iced::alignment::Vertical;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Text};
+use iced::widget::image::Handle;
 use iced::{Point, Rectangle, Renderer, Size, Theme};
+use std::sync::Arc;
 
 /// Diamond half-size, and how close a click must land to pick a diamond or
 /// a cut's edge.
@@ -17,9 +19,9 @@ const DIAMOND: f32 = 6.0;
 const PICK: f32 = 7.0;
 const BAR: f32 = 8.0;
 /// The cut row's height, and the gap between cut blocks.
-const CUTS: f32 = 22.0;
+const CUTS: f32 = 40.0;
 const GAP: f32 = 2.0;
-pub const HEIGHT: f32 = 50.0;
+pub const HEIGHT: f32 = 68.0;
 /// A press on a cut that moves less than this is a click, not a drag.
 const DRAG_FROM: f32 = 4.0;
 
@@ -34,6 +36,20 @@ pub struct Block {
     /// Its keyframes within the cut: index into the cut's keyframes, clip
     /// time, and how it moves on to the next (drawn as its shape).
     pub keys: Vec<(usize, f64, Ease)>,
+    /// Thumbnails of its clip by clip time, in order (see `thumbs`).
+    pub thumbs: Vec<(f64, Handle)>,
+}
+
+impl Block {
+    /// The thumbnail nearest clip time `t`.
+    fn thumb_at(&self, t: f64) -> Option<&Handle> {
+        let i = self.thumbs.partition_point(|(at, _)| *at < t);
+        let before = i.checked_sub(1).map(|j| &self.thumbs[j]);
+        match (before, self.thumbs.get(i)) {
+            (Some(a), Some(b)) => Some(if t - a.0 < b.0 - t { &a.1 } else { &b.1 }),
+            (a, b) => a.or(b).map(|x| &x.1),
+        }
+    }
 }
 
 pub struct Timeline {
@@ -115,7 +131,72 @@ impl Timeline {
     }
 }
 
-impl canvas::Program<Message> for Timeline {
+impl Timeline {
+    /// The two layers: block backgrounds with their thumbnails, and over them
+    /// everything else, which also takes the mouse. Within one layer iced
+    /// draws images over shapes, so the labels and handles need their own.
+    pub fn view<'a>(self) -> iced::Element<'a, Message> {
+        let t = Arc::new(self);
+        use iced::widget::canvas;
+        iced::widget::stack![
+            canvas(Pictures(t.clone())).width(iced::Length::Fill).height(HEIGHT),
+            canvas(Marks(t)).width(iced::Length::Fill).height(HEIGHT),
+        ]
+        .into()
+    }
+
+    /// A cut block's left and right edges.
+    fn block_x(&self, c: &Block, b: Rectangle) -> (f32, f32) {
+        (self.x(c.from, b) + GAP / 2.0, self.x(c.from + c.len, b) - GAP / 2.0)
+    }
+}
+
+struct Pictures(Arc<Timeline>);
+
+impl canvas::Program<Message> for Pictures {
+    type State = ();
+
+    fn draw(&self, _: &(), renderer: &Renderer, theme: &Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let palette = theme.extended_palette();
+        let mut frame = Frame::new(renderer, bounds.size());
+        for (i, c) in self.0.blocks.iter().enumerate() {
+            let (l, r) = self.0.block_x(c, bounds);
+            let block = Path::rounded_rectangle(Point::new(l, 0.0), Size::new((r - l).max(1.0), CUTS), 4.0.into());
+            frame.fill(&block, if Some(i) == self.0.selected { palette.primary.weak.color } else { palette.background.strong.color });
+            // Thumbnails side by side, each showing the moment at its middle.
+            let (th, inset) = (CUTS - 4.0, 2.0);
+            let tw = th * thumbs::SIZE.0 as f32 / thumbs::SIZE.1 as f32;
+            if c.thumbs.is_empty() || r - l <= 2.0 * inset {
+                continue;
+            }
+            let clip = Rectangle::new(Point::new(l + inset, inset), Size::new(r - l - 2.0 * inset, th));
+            let per_px = c.len / (r - l) as f64;
+            frame.with_clip(clip, |f| {
+                let mut x = clip.x;
+                while x < clip.x + clip.width {
+                    let t = c.start + (x + tw / 2.0 - l) as f64 * per_px;
+                    if let Some(h) = c.thumb_at(t) {
+                        f.draw_image(Rectangle::new(Point::new(x, inset), Size::new(tw, th)), canvas::Image::new(h.clone()));
+                    }
+                    x += tw;
+                }
+            });
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+struct Marks(Arc<Timeline>);
+
+impl std::ops::Deref for Marks {
+    type Target = Timeline;
+
+    fn deref(&self) -> &Timeline {
+        &self.0
+    }
+}
+
+impl canvas::Program<Message> for Marks {
     type State = Drag;
 
     fn update(&self, drag: &mut Drag, event: &iced::Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<canvas::Action<Message>> {
@@ -128,7 +209,7 @@ impl canvas::Program<Message> for Timeline {
                     let c = &self.blocks[cut];
                     match self.edge_at(cut, p.x, bounds) {
                         Some(start) => {
-                            let per_px = self.duration / Self::width(bounds) as f64;
+                            let per_px = self.duration / Timeline::width(bounds) as f64;
                             *drag = Drag::Trim { cut, start, x0: p.x, from: if start { c.start } else { c.start + c.len }, per_px };
                         }
                         None => *drag = Drag::Move { cut, x0: p.x, moved: false, to: cut },
@@ -175,25 +256,27 @@ impl canvas::Program<Message> for Timeline {
     fn draw(&self, drag: &Drag, renderer: &Renderer, theme: &Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
         let palette = theme.extended_palette();
         let mut frame = Frame::new(renderer, bounds.size());
-
         for (i, c) in self.blocks.iter().enumerate() {
-            let (l, r) = (self.x(c.from, bounds) + GAP / 2.0, self.x(c.from + c.len, bounds) - GAP / 2.0);
+            let (l, r) = self.block_x(c, bounds);
             let block = Path::rounded_rectangle(Point::new(l, 0.0), Size::new((r - l).max(1.0), CUTS), 4.0.into());
             let selected = Some(i) == self.selected;
-            frame.fill(&block, if selected { palette.primary.weak.color } else { palette.background.strong.color });
             if selected {
-                frame.stroke(&block, Stroke::default().with_width(1.5).with_color(palette.primary.strong.color));
+                frame.stroke(&block, Stroke::default().with_width(2.0).with_color(palette.primary.strong.color));
             }
-            // Trim handles.
-            for x in [l + 3.0, r - 3.0] {
-                frame.fill(&Path::rounded_rectangle(Point::new(x - 1.0, 5.0), Size::new(2.0, CUTS - 10.0), 1.0.into()), palette.background.base.text.scale_alpha(0.5));
+            // Trim handles, light on a dark edge so they show on any picture.
+            for x in [l + 4.0, r - 4.0] {
+                frame.fill(&Path::rounded_rectangle(Point::new(x - 2.0, 5.0), Size::new(4.0, CUTS - 10.0), 2.0.into()), iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5));
+                frame.fill(&Path::rounded_rectangle(Point::new(x - 1.0, 6.0), Size::new(2.0, CUTS - 12.0), 1.0.into()), iced::Color::from_rgba(1.0, 1.0, 1.0, 0.8));
             }
-            // Labels only where they fit (about 7 px a character).
-            if r - l > c.label.len() as f32 * 7.0 + 16.0 {
+            // Labels only where they fit (about 7 px a character), on a
+            // dark tag, readable over any picture.
+            if r - l > c.label.len() as f32 * 7.0 + 24.0 {
+                let tag = Path::rounded_rectangle(Point::new(l + 9.0, CUTS - 19.0), Size::new(c.label.len() as f32 * 5.9 + 8.0, 15.0), 3.0.into());
+                frame.fill(&tag, iced::Color::from_rgba(0.0, 0.0, 0.0, 0.6));
                 frame.fill_text(Text {
                     content: c.label.clone(),
-                    position: Point::new(l + 8.0, CUTS / 2.0),
-                    color: if selected { palette.primary.weak.text } else { palette.background.strong.text },
+                    position: Point::new(l + 13.0, CUTS - 11.5),
+                    color: iced::Color::WHITE,
                     size: 12.0.into(),
                     align_y: Vertical::Center,
                     ..Default::default()

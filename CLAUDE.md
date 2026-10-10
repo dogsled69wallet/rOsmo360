@@ -46,8 +46,7 @@ Not done yet, roughly in priority order:
 2. **Native widget shapes.** native-theme-iced's per-widget styles (radii, padding, pressed and focus states); only the colours follow the OS today.
 3. **Windows and macOS groundwork.** Add `d3d11va` and `videotoolbox` to `Hwaccel::pick`, and `cargo check` for both targets. Then hide the console window on Windows (the CLI commands still need one), and bundle ffmpeg or document installing it (mind its GPL builds). A macOS `.app` would need signing and notarisation.
 4. **Seam, what's left.** Patch matching is tuned out, the stick is handled by the cut, and the sky by detail-only matching (see Seam below). Further gains need per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
-5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), stabilisation per cut, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
-   - Thumbnails on the cut blocks.
+5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), stabilisation per cut, thumbnails on the cut blocks, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
    - Crossfades between cuts.
    - `preview` reading projects.
    - GPU export: the CPU export runs ~5 fps at 1080p.
@@ -115,7 +114,8 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
 - `src/ffmpeg.rs`: RGB decode/encode through the ffmpeg CLI (used by `stitch`/`render`/photo save, hardware-decoded when possible), plus `Hwaccel` probing and the player's NV12 decode command.
 - `src/player/`:
   - `mod.rs`: iced app: clip loading, widgets, keys, and the `Sphere` shader widget (drag/scroll to look). The open clip is a `project::Cut` holding its keyframes; `follow` says whether the view comes from them or from free look.
-  - `timeline.rs`: canvas timeline. The top row shows the cuts as blocks (select, move, trim at the edges); the bottom row is the seek bar with the keyframe diamonds (click to jump, drag to retime).
+  - `timeline.rs`: canvas timeline. The top row shows the cuts as blocks with thumbnails (select, move, trim at the edges); the bottom row is the seek bar with the keyframe diamonds (click to jump, drag to retime). Two canvases in a `stack`: thumbnails underneath, everything else on top, because within one layer iced draws images over shapes (a `with_clip` region or a second geometry doesn't change that).
+  - `thumbs.rs`: timeline thumbnails, the view straight ahead (horizon, 100° FOV) stitched on the CPU without seam corrections from the proxy's keyframes only (`ffmpeg::key_frames`, `-skip_frame nokey`; times from `showinfo`). A thread per clip when it loads, sent one at a time through a `Task::run` stream; none without a proxy. 0037 takes ~1 s, 0036 (13.5 min, 890 MB proxy) ~16 s, mostly reading the file.
   - `edit.rs`: the edit (cuts in order) with undo/redo snapshots, split/trim/move, and edit-time ↔ (cut, clip time). The app keeps a library of loaded `Media` and makes a fresh `Playback` when the playhead crosses into another clip's cut; `tick` plays on into the next cut at an out point.
   - `playback.rs`: playback clock, streams and full-res stills.
   - `gpu.rs`: iced shader `Primitive`/`Pipeline`: uniforms and NV12 textures, uploaded once per frame id.

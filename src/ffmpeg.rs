@@ -61,6 +61,54 @@ pub fn split_proxy(frame: &Frame, tracks: &[u32]) -> Vec<Frame> {
         .collect()
 }
 
+/// Decodes only `track`'s keyframes, scaled to `size`, and hands each to
+/// `each` with its time until it returns false. Skipping the other frames
+/// makes this cheap (0037's 55 s proxy: 84 frames in about 1 s); the cost
+/// is mostly reading the file.
+pub fn key_frames(input: &Path, track: u32, (w, h): (usize, usize), mut each: impl FnMut(f64, Frame) -> bool) -> Result<()> {
+    let mut child = Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", "-skip_frame", "nokey", "-i"])
+        .arg(input)
+        .args(["-map", &format!("0:v:{track}"), "-vf", &format!("scale={w}:{h},showinfo"), "-fps_mode", "passthrough"])
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running ffmpeg")?;
+    // showinfo logs each frame's time; read it on its own thread, or a
+    // full stderr pipe would stall the decode.
+    let stderr = child.stderr.take().unwrap();
+    let (tx, times) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Some(t) = line.split("pts_time:").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|t| t.parse::<f64>().ok())
+                && tx.send(t).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut stdout = child.stdout.take().unwrap();
+    let result = (|| -> Result<()> {
+        loop {
+            let mut rgb = vec![0; w * h * 3];
+            match stdout.read_exact(&mut rgb) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+            let t = times.recv().context("ffmpeg gave a frame without its time")?;
+            if !each(t, Frame { width: w, height: h, rgb }) {
+                return Ok(());
+            }
+        }
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
 /// RMS and peak level in dBFS of the first audio stream, per `window`
 /// seconds from the start.
 pub fn audio_levels(input: &Path, window: f64) -> Result<Vec<(f64, f64)>> {
