@@ -322,7 +322,7 @@ With the mouse: drag in the view to look around, right-drag to roll, scroll to z
 - **Playback stutters.** Use the **Proxy (LRF)** source; it needs far less than the full `.OSV`. If a clip has no `.LRF`, copy it from the camera's card; DJI records one next to every clip.
 - **Clips load slowly the first time.** Each clip is checked for its calibration and motion data, and the GPU decoder is tested once. Video on a spinning hard drive is slower to start and scrub than on an SSD.
 - **The paused picture keeps changing sharpness.** Turn off **Full res when paused** while keyframing.
-- **Something close to the camera looks doubled or cut at the edges.** That's the seam where the two lenses meet. rOsmo360 lines up close subjects and cuts cleanly where it can't, but a hand or face very close to the seam can still show it. Turn the view so close subjects sit away from the sides of the camera.
+- **Something close to the camera looks doubled or cut at the edges.** That's the seam where the two lenses meet. rOsmo360 lines up close subjects and cuts cleanly where it can't, but a hand or face very close to the seam can still show it, most of all next to the selfie stick, where the two lenses overlap least. Turn the view so close subjects sit away from the sides of the camera.
 - **"World lock" starts tilted.** It holds the clip's first orientation. Start the cut where the camera is level, or use horizon.
 - **No sound.** Check the speaker button isn't muted. On Linux, sound goes through ALSA, which PipeWire and PulseAudio both provide.
 - **Export says it's stitching on the CPU.** No usable GPU was found, so it falls back to the slower CPU stitcher. Update your GPU drivers. The result looks the same.

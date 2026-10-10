@@ -21,6 +21,7 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Stitching** with DJI's own calibration, read from each clip. Per frame it also:
   - evens out the two lenses' exposure along the seam;
   - shifts the lenses to line up close subjects, such as the hand on a selfie stick, so they don't ghost.
+  - fades each lens out smoothly where DJI's masks hide the selfie stick, so sun glare in one lens leaves no line in the sky.
 - **Stabilisation** from the camera's built-in 1 kHz motion data, with rolling-shutter correction:
   - **Horizon**: a level horizon that follows where you point the camera.
   - **World lock**: the view stays fixed in the world.
