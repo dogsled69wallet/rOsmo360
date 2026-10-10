@@ -49,7 +49,6 @@ Not done yet, roughly in priority order:
    - Thumbnails on the cut blocks.
    - Crossfades between cuts.
    - Stabilisation mode per cut, and choosing a keyframe's ease (smooth, linear or hold) in the GUI.
-   - Asking before closing or opening a project with unsaved changes.
    - `preview` reading projects.
    - GPU export: the CPU export runs ~5 fps at 1080p.
    - Spherical metadata on equirect export.
@@ -90,7 +89,7 @@ Player keys:
 - S: stabilisation mode. R: rolling shutter. P: projection. M: mute.
 - Ctrl+O: open. Seek bar: drag to scrub.
 - 0: reset view. F: fullscreen.
-- Ctrl+O / Add clip…: append clips (several at once) as cuts. C: split the cut at the playhead. Drag a cut's edge to trim it, drag the cut to move it. Shift+Del: delete the selected cut. Ctrl+Z / Ctrl+Shift+Z: undo / redo. Ctrl+S / Ctrl+Shift+S / Ctrl+Shift+O: save / save as / open a project (`project::Project` JSON, the file `export` reads; clips under the project's folder are stored relative). `play edit.json` opens one. Export… renders the edit with the CLI's `export` on a thread (progress and Cancel in the top bar), at the picked resolution, in the aspect lock's shape (16:9 when free), with the player's stabilisation and rolling-shutter settings.
+- Ctrl+O / Add clip…: append clips (several at once) as cuts. C: split the cut at the playhead. Drag a cut's edge to trim it, drag the cut to move it. Shift+Del: delete the selected cut. Ctrl+Z / Ctrl+Shift+Z: undo / redo. Ctrl+S / Ctrl+Shift+S / Ctrl+Shift+O: save / save as / open a project (`project::Project` JSON, the file `export` reads; clips under the project's folder are stored relative). `play edit.json` opens one. Closing the window or opening another project with unsaved changes asks Save / Don't save / Cancel (rfd message dialog; `exit_on_close_request` is off and `window::close_requests` drives it). Export… renders the edit with the CLI's `export` on a thread (progress and Cancel in the top bar), at the picked resolution, in the aspect lock's shape (16:9 when free), with the player's stabilisation and rolling-shutter settings.
 - K: keyframe the view at the playhead (updates one there). `[` `]`: previous/next keyframe. Del: delete it. On the timeline: click a diamond to jump, drag it to retime.
 - While following keyframes (after play, seek or a keyframe edit) the view comes from them; looking around by hand takes over from that view until the next play or seek.
 

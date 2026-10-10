@@ -111,6 +111,8 @@ pub fn run(inputs: Vec<PathBuf>, opts: Options) -> Result<()> {
     .theme(|app: &App| app.theme.clone())
     .window(window::Settings {
         size: iced::Size::new(1280.0, 820.0),
+        // Closing asks first when the edit has unsaved changes.
+        exit_on_close_request: false,
         #[cfg(target_os = "linux")]
         platform_specific: window::settings::PlatformSpecific { application_id: NAME.to_owned(), ..Default::default() },
         ..Default::default()
@@ -175,6 +177,21 @@ impl fmt::Display for Source {
     }
 }
 
+/// What waits on the edit being saved or let go.
+#[derive(Debug, Clone, Copy)]
+enum Then {
+    Close,
+    OpenProject,
+}
+
+/// An answer to "save changes first?".
+#[derive(Debug, Clone, Copy)]
+enum Choice {
+    Save,
+    Discard,
+    Cancel,
+}
+
 /// The playing cut's clip: its playback plus the frame the view draws.
 struct Clip {
     playback: Playback,
@@ -188,6 +205,10 @@ enum Message {
     Picked(Vec<PathBuf>),
     OpenProject,
     ProjectPicked(Option<PathBuf>),
+    /// The window's close button was pressed.
+    CloseRequested,
+    /// The answer to "save changes first?" before doing `.0`.
+    Confirmed(Then, Choice),
     /// Save the project; to a new file if true or never saved.
     SaveProject(bool),
     SaveProjectTo(Option<PathBuf>),
@@ -267,6 +288,8 @@ struct App {
     /// The project file, once opened or saved, and the edit version saved.
     project: Option<PathBuf>,
     saved_version: u64,
+    /// What to do once the project has been saved.
+    after_save: Option<Then>,
     /// Exports are this many pixels on the short side.
     resolution: crate::Resolution,
     /// A running export: its cancel flag and how far it has got.
@@ -313,6 +336,7 @@ impl App {
             loading_adds: true,
             project: None,
             saved_version: 0,
+            after_save: None,
             resolution: crate::Resolution::P1080,
             exporting: None,
             clip: None,
@@ -435,6 +459,35 @@ impl App {
         }
     }
 
+    /// Asks whether to save the edit before doing `then`.
+    fn confirm(&self, then: Then) -> Task<Message> {
+        let name = self.project.as_ref().and_then(|p| p.file_name()).map_or_else(|| "this edit".to_owned(), |n| n.to_string_lossy().into_owned());
+        let ask = rfd::AsyncMessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Unsaved changes")
+            .set_description(format!("Save the changes to {name} first?"))
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom("Save".into(), "Don't save".into(), "Cancel".into()));
+        Task::perform(ask.show(), move |answer| {
+            // Backends report custom buttons by label, some as yes/no.
+            let choice = match answer {
+                rfd::MessageDialogResult::Yes => Choice::Save,
+                rfd::MessageDialogResult::No => Choice::Discard,
+                rfd::MessageDialogResult::Custom(label) if label == "Save" => Choice::Save,
+                rfd::MessageDialogResult::Custom(label) if label == "Don't save" => Choice::Discard,
+                _ => Choice::Cancel,
+            };
+            Message::Confirmed(then, choice)
+        })
+    }
+
+    /// Does what waited on the edit being saved or let go.
+    fn proceed(&mut self, then: Then) -> Task<Message> {
+        match then {
+            Then::Close => iced::exit(),
+            Then::OpenProject => self.update(Message::OpenProject),
+        }
+    }
+
     fn unsaved(&self) -> bool {
         self.edit.version != self.saved_version && !self.edit.cuts.is_empty()
     }
@@ -469,7 +522,8 @@ impl App {
         });
         let theme = Subscription::run(theme_changes);
         let busy = self.clip.as_ref().is_some_and(|c| c.playback.busy());
-        if busy { Subscription::batch([keys, theme, window::frames().map(|_| Message::Tick)]) } else { Subscription::batch([keys, theme]) }
+        let close = window::close_requests().map(|_| Message::CloseRequested);
+        if busy { Subscription::batch([keys, theme, close, window::frames().map(|_| Message::Tick)]) } else { Subscription::batch([keys, theme, close]) }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -508,6 +562,21 @@ impl App {
                 }
                 return self.open_next();
             }
+            Message::OpenProject if self.unsaved() => return self.confirm(Then::OpenProject),
+            Message::CloseRequested if self.unsaved() => return self.confirm(Then::Close),
+            Message::CloseRequested => return iced::exit(),
+            Message::Confirmed(then, choice) => match choice {
+                Choice::Save => {
+                    self.after_save = Some(then);
+                    return self.update(Message::SaveProject(false));
+                }
+                Choice::Discard => {
+                    // Let the changes go: the next save starts fresh.
+                    self.saved_version = self.edit.version;
+                    return self.proceed(then);
+                }
+                Choice::Cancel => {}
+            },
             Message::OpenProject => {
                 let dir = self.project.as_ref().and_then(|p| p.parent().map(Path::to_owned));
                 return Task::perform(
@@ -521,7 +590,8 @@ impl App {
                     Message::ProjectPicked,
                 );
             }
-            Message::ProjectPicked(None) | Message::SaveProjectTo(None) => {}
+            Message::ProjectPicked(None) => {}
+            Message::SaveProjectTo(None) => self.after_save = None,
             Message::ProjectPicked(Some(path)) => {
                 let project = match Project::load(&path) {
                     Ok(p) => p,
@@ -616,8 +686,14 @@ impl App {
                     self.saved_version = self.edit.version;
                     self.save_status = Some(format!("Saved {}", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())));
                     self.project = Some(path);
+                    if let Some(then) = self.after_save.take() {
+                        return self.proceed(then);
+                    }
                 }
-                Err(e) => self.error = Some(format!("Saving the project failed: {e:#}")),
+                Err(e) => {
+                    self.after_save = None;
+                    self.error = Some(format!("Saving the project failed: {e:#}"));
+                }
             },
             Message::Tick => self.tick(),
             Message::Key(key, mods) => return self.key(key, mods),
