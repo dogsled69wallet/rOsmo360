@@ -4,7 +4,7 @@ A Rust/Linux replacement for DJI Studio's playback of DJI Osmo 360 `.OSV` footag
 
 The tool is called **rOsmo360** (the r is for its Rust core); the window title, app id and `--help` use that name. The crate and binary are `rosmo360` (renamed from `osmo360` on 2026-10-10).
 
-## Status (2026-10-10)
+## Status (2026-10-10, branch `timeline`)
 
 Working and verified on real footage:
 
@@ -45,7 +45,15 @@ Not done yet, roughly in priority order:
 2. **Native widget shapes.** native-theme-iced's per-widget styles (radii, padding, pressed and focus states); only the colours follow the OS today.
 3. **Windows and macOS groundwork.** Add `d3d11va` and `videotoolbox` to `Hwaccel::pick`, and `cargo check` for both targets. Then hide the console window on Windows (the CLI commands still need one), and bundle ffmpeg or document installing it (mind its GPL builds). A macOS `.app` would need signing and notarisation.
 4. **Seam, what's left.** Patch matching is tuned out, the stick is handled by the cut, and the sky by detail-only matching (see Seam below). Further gains need per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
-5. **Keyframing in the player.** The CLI `export` renders `view::Reframe` keyframes; the player should record and edit the same `Reframe` (set a keyframe at the current time and view, scrub to preview via `Reframe::camera_at`, save and load the JSON), and maybe export through the CLI's pipeline. Also: GPU export (CPU export runs ~5 fps at 1080×1920), and spherical metadata on equirect export.
+5. **Timeline polish (branch `timeline`).** Done there: keyframes, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
+   - Thumbnails on the cut blocks.
+   - Crossfades between cuts.
+   - Stabilisation mode per cut, and choosing a keyframe's ease (smooth, linear or hold) in the GUI.
+   - Asking before closing or opening a project with unsaved changes.
+   - `preview` reading projects.
+   - GPU export: the CPU export runs ~5 fps at 1080p.
+   - Spherical metadata on equirect export.
+   - Merging `timeline` into master and releasing (0.2.0?) when the user says so.
 6. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
    - Needs a D-Log M sample clip first: all 35 Kyrkja clips are normal colour, tagged BT.709 10-bit, as DJI may also tag D-Log.
    - DJI records the profile in `StreamMeta.color_mode` (`ColorModeType`: D_LOG = 2, HLG = 9, …). telemetry-parser's Metadata tag only serialises the clip meta, so reading it means decoding StreamMeta ourselves.
