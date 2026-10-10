@@ -7,6 +7,7 @@ mod edit;
 mod export;
 mod gpu;
 mod playback;
+mod settings;
 mod source;
 mod timeline;
 
@@ -51,8 +52,18 @@ impl fmt::Debug for Media {
     }
 }
 
-/// Settings from the command line; the GUI updates them so the next clip
-/// opens the way the last one was left.
+/// What the command line asked for; what it leaves out comes from the
+/// remembered settings.
+pub struct Launch {
+    pub osv_size: Option<u32>,
+    pub hw: Option<Hwaccel>,
+    pub stabilize: Option<Mode>,
+    pub imu_axes: ImuAxes,
+    pub world_z_down: bool,
+}
+
+/// Settings for loading and playing clips; the GUI updates them so the
+/// next clip opens the way the last one was left.
 #[derive(Clone)]
 pub struct Options {
     pub osv_size: Option<u32>,
@@ -89,10 +100,18 @@ impl Media {
     }
 }
 
-pub fn run(inputs: Vec<PathBuf>, opts: Options) -> Result<()> {
+pub fn run(inputs: Vec<PathBuf>, launch: Launch) -> Result<()> {
+    let settings = settings::Settings::load();
+    let opts = Options {
+        osv_size: launch.osv_size.or(settings.osv_size),
+        hw: launch.hw,
+        stabilize: launch.stabilize.unwrap_or(settings.stabilize),
+        imu_axes: launch.imu_axes,
+        world_z_down: launch.world_z_down,
+    };
     iced::application(
         move || {
-            let mut app = App::new(opts.clone());
+            let mut app = App::new(opts.clone(), settings.clone());
             let is_project = |p: &PathBuf| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
             let task = match inputs.iter().find(|p| is_project(p)) {
                 Some(project) => app.update(Message::ProjectPicked(Some(project.clone()))),
@@ -319,10 +338,12 @@ struct App {
     aspect: Aspect,
     /// What the last save did, or that one is running.
     save_status: Option<String>,
+    /// The settings as last written, to save only when they change.
+    saved_settings: settings::Settings,
 }
 
 impl App {
-    fn new(opts: Options) -> Self {
+    fn new(opts: Options, saved: settings::Settings) -> Self {
         App {
             opts,
             theme: system_theme(),
@@ -337,7 +358,7 @@ impl App {
             project: None,
             saved_version: 0,
             after_save: None,
-            resolution: crate::Resolution::P1080,
+            resolution: saved.resolution,
             exporting: None,
             clip: None,
             held: None,
@@ -345,15 +366,44 @@ impl App {
             error: None,
             look: View::default(),
             follow: true,
-            rolling_shutter: true,
-            full_on_pause: true,
+            rolling_shutter: saved.rolling_shutter,
+            full_on_pause: saved.full_on_pause,
             fullscreen: false,
-            volume: 1.0,
-            muted: false,
+            volume: saved.volume,
+            muted: saved.muted,
             view_size: Size::new(16.0, 9.0),
-            aspect: Aspect::Free,
+            aspect: saved.aspect.map_or(Aspect::Free, |[w, h]| Aspect::Ratio(w, h)),
             save_status: None,
+            saved_settings: saved,
         }
+    }
+
+    /// The settings to remember, as they are now.
+    fn settings(&self) -> settings::Settings {
+        settings::Settings {
+            stabilize: self.opts.stabilize,
+            osv_size: self.opts.osv_size,
+            rolling_shutter: self.rolling_shutter,
+            full_on_pause: self.full_on_pause,
+            volume: self.volume,
+            muted: self.muted,
+            resolution: self.resolution,
+            aspect: match self.aspect {
+                Aspect::Free => None,
+                Aspect::Ratio(w, h) => Some([w, h]),
+            },
+        }
+    }
+
+    /// Handles `message`, then saves the settings if it changed any.
+    fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        let now = self.settings();
+        if now != self.saved_settings {
+            now.save();
+            self.saved_settings = now;
+        }
+        task
     }
 
     /// What the speakers get: nothing while muted, so unmuting restores
@@ -447,8 +497,13 @@ impl App {
             .into(),
             None => row![
                 tooltip(
+                    labelled("Aspect", pick_list(&Aspect::ALL[..], Some(self.aspect), Message::Aspect)),
+                    text("The shape of the view, of saved views and of the export (16:9 when free)"),
+                    tooltip::Position::Bottom,
+                ),
+                tooltip(
                     button("Export…").on_press_maybe((!self.edit.cuts.is_empty()).then_some(Message::Export)),
-                    text("Render the edit to MP4 with sound, in the aspect lock's shape (16:9 when free)"),
+                    text("Render the edit to MP4 with sound, at this resolution, in the aspect's shape"),
                     tooltip::Position::Bottom,
                 ),
                 pick_list(&crate::Resolution::ALL[..], Some(self.resolution), Message::Resolution),
@@ -526,7 +581,7 @@ impl App {
         if busy { Subscription::batch([keys, theme, close, window::frames().map(|_| Message::Tick)]) } else { Subscription::batch([keys, theme, close]) }
     }
 
-    fn update(&mut self, message: Message) -> Task<Message> {
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Open => {
                 let dir = self.clip.as_ref().and_then(|c| c.playback.media.input.parent().map(Path::to_owned));
@@ -1316,7 +1371,6 @@ impl App {
             labelled("Stabilisation", pick_list(&Mode::ALL[..], Some(media.stab.mode()), Message::Stab)),
             labelled("Projection", pick_list(&Projection::ALL[..], Some(shown_view.projection), Message::Projection)),
             labelled("Playback source", pick_list(sources, Some(source), Message::Source)),
-            labelled("Aspect", pick_list(&Aspect::ALL[..], Some(self.aspect), Message::Aspect)),
             labelled("FOV", slider(lo..=hi, shown_view.fov, Message::Fov).width(120)),
             toggler(self.rolling_shutter).label("Rolling shutter").on_toggle(Message::RollingShutter),
             tooltip(

@@ -59,14 +59,16 @@ enum Cmd {
         /// Clips to open at start, one cut each in this order, or a saved
         /// project (.json); otherwise use the Open buttons.
         input: Vec<PathBuf>,
-        /// Stream the OSV itself at this size (pixels square) instead of the LRF proxy.
+        /// Stream the OSV itself at this size (pixels square) instead of the
+        /// LRF proxy [default: the last source used].
         #[arg(long)]
         osv_size: Option<u32>,
         /// Video decoder; the first that works, in this order, if omitted.
         #[arg(long, value_enum)]
         hwaccel: Option<ffmpeg::Hwaccel>,
-        #[arg(long, value_enum, default_value_t = stab::Mode::Horizon)]
-        stabilize: stab::Mode,
+        /// Stabilisation mode [default: the last one used, at first horizon].
+        #[arg(long, value_enum)]
+        stabilize: Option<stab::Mode>,
         #[arg(long, value_enum, default_value_t = stab::ImuAxes::X180)]
         imu_axes: stab::ImuAxes,
         #[arg(long)]
@@ -183,15 +185,19 @@ enum Cmd {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 enum Resolution {
     #[value(name = "720p")]
+    #[serde(rename = "720p")]
     P720,
     #[value(name = "1080p")]
+    #[serde(rename = "1080p")]
     P1080,
     #[value(name = "1440p")]
+    #[serde(rename = "1440p")]
     P1440,
     #[value(name = "2160p", alias = "4k")]
+    #[serde(rename = "2160p")]
     P2160,
 }
 
@@ -576,7 +582,7 @@ fn main() -> Result<()> {
         }
         Cmd::Info { input } => info(&input)?,
         Cmd::Play { input, osv_size, hwaccel, stabilize, imu_axes, world_z_down } => {
-            player::run(input, player::Options { osv_size, hw: hwaccel, stabilize, imu_axes, world_z_down })?;
+            player::run(input, player::Launch { osv_size, hw: hwaccel, stabilize, imu_axes, world_z_down })?;
         }
         Cmd::Seam { input, start, duration, dump } => seam_report(&input, start, duration, dump.as_deref())?,
         Cmd::Stitch { input, time, output, width, opts } => {

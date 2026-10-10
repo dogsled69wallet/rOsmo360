@@ -33,7 +33,8 @@ Working and verified on real footage:
   - Perspective, little-planet and flat equirect projections.
   - Plays the LRF proxy (or the OSV at 1920 px or full size) and swaps in a full-res frame on pause, unless "Full res when paused" is off (then paused frames stay at the source's quality, which keeps keyframing steady).
   - Sound through cpal, with a mute icon and volume slider. While sound plays it is the playback clock.
-  - Aspect lock (Free, 16:9, 9:16, 4:3, 1:1, 2:1) letterboxes the view; a saved view takes the same shape.
+  - Aspect lock (Free, 16:9, 9:16, 4:3, 1:1, 2:1) letterboxes the view; a saved view and the export take the same shape. It sits in the top bar with Export… and the export resolution.
+  - Settings are remembered between runs (`settings.rs`).
   - Shows the Vibing with Ravelund logo while a clip loads, and a "Made by" credit line at the bottom. The logo is `vibewithravelund-lowres-corrected.jpg`, embedded with `include_bytes!`, so it must stay in the repo root.
   - Follows the OS theme and accent through native-theme (KDE colour scheme, GTK/portal, Windows, macOS), live when it changes. iced's dark theme is the fallback.
   - Save the paused frame as PNG: the view as framed (3840 px on the long side) or the whole sphere (7680 × 3840). The CPU stitcher renders it from freshly decoded full-res frames in about 4 s.
@@ -122,6 +123,7 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
   - `shader.wgsl`: GPU port of `stitch.rs`.
   - `source.rs`: NV12 decode threads (LRF proxy / OSV) and full-res stills.
   - `audio.rs`: ffmpeg → f32 PCM → cpal output; frames played minus device latency give the clock.
+  - `settings.rs`: settings remembered between runs (stabilisation, playback source, rolling shutter, full res when paused, volume/mute, export resolution, aspect lock) in `~/.config/rosmo360/settings.json` (XDG; `%APPDATA%` on Windows, Application Support on macOS). `App::update` saves them whenever a message changes them; `play --stabilize/--osv-size` override.
   - `export.rs`: PNG save of the paused frame.
 
 ## Hard-won facts (do not re-derive)
