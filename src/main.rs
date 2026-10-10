@@ -1,6 +1,9 @@
+mod align;
+mod exposure;
 mod ffmpeg;
 mod imu;
 mod player;
+mod ring;
 mod stab;
 mod stitch;
 
@@ -35,16 +38,20 @@ enum Cmd {
         #[command(flatten)]
         opts: RenderOpts,
     },
-    /// Play the clip in a window with free look, stabilisation and rolling-shutter correction.
+    /// Play clips in a window with free look, stabilisation and rolling-shutter correction.
     ///
     /// Drag: look around · right-drag or Q/E: roll · arrows: pitch, seek (shift: yaw) ·
     /// scroll: zoom · space: play/pause · , .: frame step · S: stabilisation ·
-    /// R: rolling shutter · P: projection · 0: reset view · F: fullscreen
+    /// R: rolling shutter · P: projection · 0: reset view · F: fullscreen · Ctrl+O: open
     Play {
-        input: PathBuf,
+        /// Clip to open at start; otherwise use the Open button.
+        input: Option<PathBuf>,
         /// Stream the OSV itself at this size (pixels square) instead of the LRF proxy.
         #[arg(long)]
         osv_size: Option<u32>,
+        /// Video decoder; the first that works, in this order, if omitted.
+        #[arg(long, value_enum)]
+        hwaccel: Option<ffmpeg::Hwaccel>,
         #[arg(long, value_enum, default_value_t = stab::Mode::Horizon)]
         stabilize: stab::Mode,
         #[arg(long, value_enum, default_value_t = stab::ImuAxes::X180)]
@@ -94,6 +101,12 @@ struct RenderOpts {
     /// Skip rolling-shutter correction.
     #[arg(long)]
     no_rs: bool,
+    /// Skip evening out the lenses' exposure at the seam.
+    #[arg(long)]
+    no_exposure: bool,
+    /// Skip shifting the lenses to line up close subjects at the seam.
+    #[arg(long)]
+    no_align: bool,
 }
 
 /// Everything needed to turn decoded lens frames at a given time into an
@@ -107,6 +120,15 @@ struct Pipeline {
     width: usize,
     only: Option<usize>,
     rs_steps: usize,
+    seam: Option<exposure::Seam>,
+    aligner: Option<align::Aligner>,
+}
+
+/// Seam state carried from frame to frame so it eases instead of flickering.
+#[derive(Default)]
+struct Carry {
+    gains: Option<exposure::Gains>,
+    field: Option<align::Field>,
 }
 
 impl Pipeline {
@@ -135,6 +157,8 @@ impl Pipeline {
         }
         let readout_ms = cameras[0].readout.map_or(0.0, |r| r.time_us / 1000.0);
         let rs_steps = if opts.no_rs || readout_ms == 0.0 || !stab.has_data() { 1 } else { 33 };
+        let seam = if opts.no_exposure || opts.only.is_some() { None } else { exposure::Seam::new(&lenses) };
+        let aligner = if opts.no_align || opts.only.is_some() { None } else { align::Aligner::new(&lenses) };
         Ok(Pipeline {
             lenses,
             tracks,
@@ -144,6 +168,8 @@ impl Pipeline {
             width: opts.width,
             only: opts.only,
             rs_steps,
+            seam,
+            aligner,
         })
     }
 
@@ -152,13 +178,28 @@ impl Pipeline {
         (t * self.fps).round() / self.fps
     }
 
-    fn render(&self, frames: &[stitch::Frame], t: f64) -> stitch::Frame {
+    /// Stitches one frame, measuring the seam afresh and easing towards it.
+    fn render(&self, frames: &[stitch::Frame], t: f64, carry: &mut Carry) -> stitch::Frame {
         let views = if self.stab.has_data() {
             self.stab.rig_from_view(t * 1000.0, self.readout_ms, self.rs_steps)
         } else {
             vec![[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]]
         };
-        stitch::equirect(&self.lenses, frames, self.width, self.only, &views)
+        let rgb = |i: usize, u: f64, v: f64| stitch::sample(&frames[self.lenses[i].input], u, v).map(|c| c / 255.0);
+        let exposure = self.seam.as_ref().map(|seam| {
+            let now = seam.measure(|i, u, v| Some(rgb(i, u, v)));
+            let g = carry.gains.get_or_insert(now);
+            g.ease(&now, exposure::EASE);
+            (seam, *g)
+        });
+        let align = self.aligner.as_ref().map(|aligner| {
+            let now = aligner.measure(|i, u, v| Some(rgb(i, u, v).iter().sum::<f64>() / 3.0));
+            let f = carry.field.get_or_insert_with(|| now.clone());
+            f.ease(&now, align::EASE);
+            (aligner, f.clone())
+        });
+        let seam = stitch::Seam { exposure: exposure.as_ref().map(|(s, g)| (*s, g)), align: align.as_ref().map(|(a, f)| (*a, f)) };
+        stitch::equirect(&self.lenses, frames, self.width, self.only, &views, &seam)
     }
 
     fn decoders(&self, input: &Path, start: f64) -> Result<Vec<ffmpeg::Decoder>> {
@@ -189,39 +230,14 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Play { input, osv_size, stabilize, imu_axes, world_z_down } => {
-            let opts = RenderOpts {
-                width: 0,
-                variant: None,
-                only: None,
-                stabilize,
-                smooth: 500.0,
-                imu_axes,
-                world_z_down,
-                no_rs: false,
-            };
-            let p = Pipeline::new(&input, &opts)?;
-            let proxy = ["LRF", "lrf"].iter().map(|ext| input.with_extension(ext)).find(|p| p.exists());
-            if proxy.is_none() && osv_size.is_none() {
-                eprintln!("no .LRF proxy next to the clip; streaming the OSV at 1920 px");
-            }
-            player::run(player::Media {
-                duration: ffmpeg::duration(&input)?,
-                input,
-                proxy,
-                osv_size,
-                lenses: p.lenses,
-                tracks: p.tracks,
-                stab: p.stab,
-                readout_ms: p.readout_ms,
-                fps: p.fps,
-            })?;
+        Cmd::Play { input, osv_size, hwaccel, stabilize, imu_axes, world_z_down } => {
+            player::run(input, player::Options { osv_size, hw: hwaccel, stabilize, imu_axes, world_z_down })?;
         }
         Cmd::Stitch { input, time, output, opts } => {
             let p = Pipeline::new(&input, &opts)?;
             let time = p.snap(time);
             let frames = next_frames(&mut p.decoders(&input, time)?)?.context("no frame at that time")?;
-            let out = p.render(&frames, time);
+            let out = p.render(&frames, time, &mut Carry::default());
             image::save_buffer(&output, &out.rgb, out.width as u32, out.height as u32, image::ColorType::Rgb8)?;
             eprintln!("wrote {}", output.display());
         }
@@ -232,10 +248,11 @@ fn main() -> Result<()> {
             let mut encoder = ffmpeg::Encoder::new(&output, (p.width, p.width / 2), p.fps, &input, start)?;
             let total = duration.map(|d| (d * p.fps).round() as usize);
             let began = Instant::now();
+            let mut carry = Carry::default();
             let mut n = 0;
             while total.is_none_or(|total| n < total) {
                 let Some(frames) = next_frames(&mut decoders)? else { break };
-                encoder.write(&p.render(&frames, start + n as f64 / p.fps))?;
+                encoder.write(&p.render(&frames, start + n as f64 / p.fps, &mut carry))?;
                 n += 1;
                 if n % 10 == 0 {
                     eprint!("\rframe {n}{}  {:.2} fps", total.map_or(String::new(), |t| format!("/{t}")), n as f64 / began.elapsed().as_secs_f64());

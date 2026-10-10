@@ -29,12 +29,30 @@ struct Uniforms {
     user2: vec4f,
     // width, height, zoom (tan of half the vertical FOV), projection mode.
     screen: vec4f,
-    // rolling-shutter steps, 1 if the surface re-encodes to sRGB, unused...
+    // rolling-shutter steps, 1 if the surface re-encodes to sRGB, then the
+    // view's top-left corner in framebuffer pixels.
     misc: vec4f,
     lenses: array<Lens, 2>,
     // rig_from_view at instants spread over the readout, three rows each.
     views: array<vec4f, 99>,
+    // Exposure matching (exposure.rs): the first lens's axis and two ring
+    // directions, fade-in angles in .w of the first two; then per lens, per
+    // azimuth bin, RGB gains.
+    seam: array<vec4f, 3>,
+    gains: array<vec4f, 64>,
+    // Seam alignment shifts (align.rs), radians, four cells per vector.
+    field: array<vec4f, 224>,
 }
+
+const BINS: u32 = 32u;
+// Must match align.rs.
+const CELLS_PHI: u32 = 128u;
+const CELLS_ALPHA: u32 = 7u;
+const CELL_ALPHA_LO: f32 = 84.0;
+const CELL_ALPHA_HI: f32 = 96.0;
+const TAPER_LO: f32 = 83.0;
+const TAPER_HI: f32 = 97.0;
+const TAPER_WIDTH: f32 = 12.0;
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var samp: sampler;
@@ -154,21 +172,67 @@ fn screen_ray(pos: vec2f) -> vec3f {
     return normalize(vec3f(ndc.x * aspect * u.screen.z, ndc.y * u.screen.z, 1.0));
 }
 
+fn field_cell(x: i32, y: u32) -> f32 {
+    let c = min(y, CELLS_ALPHA - 1u) * CELLS_PHI + u32((x + i32(CELLS_PHI)) % i32(CELLS_PHI));
+    return u.field[c / 4u][c % 4u];
+}
+
+// Matches Aligner::warp in align.rs: where lens `lens` looks for output
+// direction `d`.
+fn align_warp(lens: u32, d: vec3f) -> vec3f {
+    let axis = u.seam[0].xyz;
+    let ca = clamp(dot(d, axis), -1.0, 1.0);
+    let alpha = acos(ca);
+    let a = degrees(alpha);
+    let taper = max(1.0 - max(max(TAPER_LO - a, a - TAPER_HI), 0.0) / TAPER_WIDTH, 0.0);
+    if taper <= 0.0 {
+        return d;
+    }
+    let phi = atan2(dot(d, u.seam[2].xyz), dot(d, u.seam[1].xyz));
+    let x = fract(phi / (2.0 * PI) + 1.0) * f32(CELLS_PHI) - 0.5;
+    let y = clamp((a - CELL_ALPHA_LO) / (CELL_ALPHA_HI - CELL_ALPHA_LO) * f32(CELLS_ALPHA - 1u), 0.0, f32(CELLS_ALPHA - 1u));
+    let x0 = floor(x);
+    let y0 = floor(y);
+    let fx = x - x0;
+    let fy = y - y0;
+    let xi = i32(x0);
+    let yi = u32(y0);
+    let top = mix(field_cell(xi, yi), field_cell(xi + 1, yi), fx);
+    let bot = mix(field_cell(xi, yi + 1u), field_cell(xi + 1, yi + 1u), fx);
+    let half = 0.5 * mix(top, bot, fy) * taper;
+    let shifted = select(alpha + half, alpha - half, lens == 0u);
+    let ring = vec3f(cos(phi) * u.seam[1].xyz + sin(phi) * u.seam[2].xyz);
+    return cos(shifted) * axis + sin(shifted) * ring;
+}
+
+// Matches Seam::gain in exposure.rs.
+fn exposure_gain(lens: u32, d: vec3f, theta: f32) -> vec3f {
+    let phi = atan2(dot(d, u.seam[2].xyz), dot(d, u.seam[1].xyz));
+    let x = fract(phi / (2.0 * PI) + 1.0) * f32(BINS) - 0.5;
+    let i = floor(x);
+    let f = x - i;
+    let b0 = u32(i32(i) + i32(BINS)) % BINS;
+    let b1 = (b0 + 1u) % BINS;
+    let g = mix(u.gains[lens * BINS + b0].rgb, u.gains[lens * BINS + b1].rgb, f);
+    let fade = smoothstep(u.seam[0].w, u.seam[1].w, theta);
+    return mix(vec3f(1.0), g, fade);
+}
+
 @fragment
 fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-    let v = rows(u.user0, u.user1, u.user2, screen_ray(pos.xy));
+    let v = rows(u.user0, u.user1, u.user2, screen_ray(pos.xy - u.misc.zw));
     let steps = u32(u.misc.x);
     let mid = view_at(steps / 2u, v);
     var acc = vec3f(0.0);
     var wsum = 0.0;
     for (var i = 0u; i < 2u; i++) {
-        var h = project(i, mid);
+        var h = project(i, align_warp(i, mid));
         if !h.ok {
             continue;
         }
         if steps > 1u {
             let k = u32(round(clamp(h.row, 0.0, 1.0) * f32(steps - 1u)));
-            h = project(i, view_at(k, v));
+            h = project(i, align_warp(i, view_at(k, v)));
             if !h.ok {
                 continue;
             }
@@ -178,7 +242,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         if w <= 0.0 {
             continue;
         }
-        acc += nv12(l.a1.w, h.uv) * w;
+        acc += nv12(l.a1.w, h.uv) * exposure_gain(i, mid, h.theta) * w;
         wsum += w;
     }
     if wsum <= 0.0 {

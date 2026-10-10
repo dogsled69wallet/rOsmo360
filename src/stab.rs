@@ -42,6 +42,20 @@ pub enum Mode {
     Lock,
 }
 
+impl Mode {
+    pub const ALL: [Mode; 3] = [Mode::Off, Mode::Horizon, Mode::Lock];
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Mode::Off => "Off",
+            Mode::Horizon => "Horizon",
+            Mode::Lock => "World lock",
+        })
+    }
+}
+
 pub struct Stabilizer {
     /// (ms, world_from_imu)
     quats: Vec<(f64, Quat)>,

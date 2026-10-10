@@ -1,11 +1,13 @@
 //! Frame sources for the player: NV12 pictures streamed from ffmpeg on
 //! background threads, either the LRF proxy (both lenses side by side, cheap
-//! to decode) or the OSV lens tracks via VA-API.
+//! to decode) or the OSV lens tracks, on whichever hardware decoder works.
 
-use anyhow::{Context, Result, bail};
+use crate::ffmpeg::{self, Hwaccel};
+use crate::stitch::Lens;
+use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
@@ -40,10 +42,35 @@ pub struct Frame {
     pub pictures: Vec<Picture>,
 }
 
+impl Frame {
+    /// Display RGB (0..1) at `lens`'s full-resolution picture pixel, wherever
+    /// this frame's layout and scale put it. Must match the shader's mapping.
+    pub fn rgb_at(&self, lens: &Lens, track: u32, u: f64, v: f64) -> Option<[f64; 3]> {
+        let (pic, off_x) = match self.layout {
+            Layout::SideBySide => (self.pictures.first()?, track as f64 * self.pictures.first()?.height as f64),
+            Layout::PerTrack => (self.pictures.get(track as usize)?, 0.0),
+        };
+        let cell = if self.layout == Layout::SideBySide { pic.height } else { pic.width } as f64;
+        let s = cell / lens.calib_dim[0] as f64;
+        let (x, y) = ((s * u + off_x) as i64, (s * v) as i64);
+        if x < 0 || y < 0 || x >= pic.width as i64 || y >= pic.height as i64 {
+            return None;
+        }
+        let (x, y, w) = (x as usize, y as usize, pic.width as usize);
+        let c = (y / 2) * w + (x / 2) * 2;
+        let px = |b: u8| b as f64 / 255.0;
+        let yy = (px(pic.y()[y * w + x]) - 16.0 / 255.0) * (255.0 / 219.0);
+        let cu = (px(pic.uv()[c]) - 128.0 / 255.0) * (255.0 / 224.0);
+        let cv = (px(pic.uv()[c + 1]) - 128.0 / 255.0) * (255.0 / 224.0);
+        // BT.709, limited range, as in the shader.
+        Some([yy + 1.5748 * cv, yy - 0.1873 * cu - 0.4681 * cv, yy + 1.8556 * cu].map(|v| v.clamp(0.0, 1.0)))
+    }
+}
+
 #[derive(Clone)]
 pub enum Kind {
     Lrf(PathBuf),
-    /// OSV tracks scaled on the GPU to this many pixels square.
+    /// OSV tracks scaled to this many pixels square.
     Osv { path: PathBuf, tracks: Vec<u32>, size: u32 },
 }
 
@@ -52,15 +79,15 @@ pub struct Stream {
     pub frames: Receiver<Frame>,
 }
 
-pub fn spawn(kind: Kind, start: f64, fps: f64) -> Result<Stream> {
+pub fn spawn(kind: Kind, hw: Hwaccel, start: f64, fps: f64) -> Result<Stream> {
     let (tx, rx) = sync_channel(3);
     let procs: Vec<(Child, u32, u32)> = match &kind {
         Kind::Lrf(path) => {
             let (w, h) = dims(path, 0)?;
-            vec![(ffmpeg_nv12(path, 0, start, None, false)?, w, h)]
+            vec![(decode(path, 0, start, None, hw)?, w, h)]
         }
         Kind::Osv { path, tracks, size } => {
-            tracks.iter().map(|&t| Ok((ffmpeg_nv12(path, t, start, Some(*size), true)?, *size, *size))).collect::<Result<_>>()?
+            tracks.iter().map(|&t| Ok((decode(path, t, start, Some(*size), hw)?, *size, *size))).collect::<Result<_>>()?
         }
     };
     let layout = match &kind {
@@ -96,51 +123,35 @@ fn kill(procs: Vec<(Child, u32, u32)>) {
     }
 }
 
-/// Decodes one full-resolution frame of every OSV track, trying VA-API first.
-pub fn still(path: &Path, tracks: &[u32], t: f64) -> Result<Frame> {
+/// Decodes one full-resolution frame of every OSV track, falling back to
+/// software if the hardware decoder fails.
+pub fn still(path: &Path, tracks: &[u32], t: f64, hw: Hwaccel) -> Result<Frame> {
     let pictures = tracks
         .iter()
         .map(|&track| {
             let (w, h) = dims(path, track)?;
-            let read = |hw: bool| -> Result<Vec<u8>> {
-                let mut child = ffmpeg_nv12(path, track, t, None, hw)?;
+            let read = |hw| -> Result<Vec<u8>> {
+                let mut child = decode(path, track, t, None, hw)?;
                 let mut data = vec![0; (w * h * 3 / 2) as usize];
                 child.stdout.take().unwrap().read_exact(&mut data)?;
                 let _ = child.kill();
                 let _ = child.wait();
                 Ok(data)
             };
-            let data = read(true).or_else(|_| read(false))?;
+            let data = read(hw).or_else(|_| read(Hwaccel::Software))?;
             Ok(Picture { width: w, height: h, data })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Frame { pts: t, layout: Layout::PerTrack, pictures })
 }
 
-fn ffmpeg_nv12(path: &Path, track: u32, start: f64, size: Option<u32>, hw: bool) -> Result<Child> {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-v", "error", "-nostdin"]);
-    if hw {
-        cmd.args(["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]);
-    }
-    cmd.args(["-ss", &start.to_string(), "-i"]).arg(path).args(["-map", &format!("0:v:{track}")]);
-    let filter = match (hw, size) {
-        (true, Some(s)) => format!("scale_vaapi=w={s}:h={s}:format=nv12,hwdownload,format=nv12"),
-        (true, None) => "scale_vaapi=format=nv12,hwdownload,format=nv12".to_owned(),
-        (false, Some(s)) => format!("scale={s}:{s},format=nv12"),
-        (false, None) => "format=nv12".to_owned(),
-    };
-    cmd.args(["-vf", &filter, "-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null());
+fn decode(path: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel) -> Result<Child> {
+    let mut cmd = ffmpeg::nv12(path, track, start, size, hw)?;
+    cmd.args(["-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null());
     cmd.spawn().context("running ffmpeg")
 }
 
 fn dims(path: &Path, track: u32) -> Result<(u32, u32)> {
-    let out = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", &format!("v:{track}"), "-show_entries", "stream=width,height", "-of", "csv=p=0"])
-        .arg(path)
-        .output()
-        .context("running ffprobe")?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    let Some((w, h)) = s.trim().split_once(',') else { bail!("no video track {track} in {}", path.display()) };
-    Ok((w.parse()?, h.parse()?))
+    let (w, h) = ffmpeg::dimensions(path, track)?;
+    Ok((w as u32, h as u32))
 }

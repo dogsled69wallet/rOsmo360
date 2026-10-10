@@ -4,6 +4,8 @@
 //! Conventions are video-types' geometry module: rig axes x right, y down,
 //! z forward; `Lens::rotation` is rig-from-camera; blend ramps are per lens.
 
+use crate::align::{Aligner, Field};
+use crate::exposure::Gains;
 use anyhow::{Result, bail};
 use rayon::prelude::*;
 use telemetry_parser::rig::geometry::{self, LensModel, MaskPolarity, Quat};
@@ -57,7 +59,7 @@ impl Lens {
 
     /// Projects a rig-frame direction to picture pixels, plus its angle from
     /// the optical axis. `None` where the lens has no valid picture.
-    fn project(&self, d: [f64; 3]) -> Option<(f64, f64, f64)> {
+    pub(crate) fn project(&self, d: [f64; 3]) -> Option<(f64, f64, f64)> {
         let c = apply(self.cam_from_rig, d);
         let rho = (c[0] * c[0] + c[1] * c[1]).sqrt();
         let theta = rho.atan2(c[2]);
@@ -91,13 +93,20 @@ impl Lens {
     }
 }
 
+/// Per-frame seam corrections: exposure matching and close-subject alignment.
+#[derive(Default)]
+pub struct Seam<'a> {
+    pub exposure: Option<(&'a crate::exposure::Seam, &'a Gains)>,
+    pub align: Option<(&'a Aligner, &'a Field)>,
+}
+
 /// Feathered composite: each lens weighted by its own blend ramp, normalised.
 /// `only` forces a single lens (for checking alignment in the overlap zone).
 ///
 /// `views` holds `rig_from_view` at instants spread evenly over the frame's
 /// readout. With more than one, each ray is re-aimed with the rotation at the
 /// sensor row it lands on (rolling-shutter correction, top-down readout).
-pub fn equirect(lenses: &[Lens], frames: &[Frame], out_w: usize, only: Option<usize>, views: &[M3]) -> Frame {
+pub fn equirect(lenses: &[Lens], frames: &[Frame], out_w: usize, only: Option<usize>, views: &[M3], seam: &Seam<'_>) -> Frame {
     use std::f64::consts::PI;
     let out_h = out_w / 2;
     let mut rgb = vec![0u8; out_w * out_h * 3];
@@ -110,11 +119,12 @@ pub fn equirect(lenses: &[Lens], frames: &[Frame], out_w: usize, only: Option<us
             let mut acc = [0f64; 3];
             let mut wsum = 0.0;
             for (i, lens) in lenses.iter().enumerate() {
-                let Some(mut hit) = lens.project(mid) else { continue };
+                let warp = |d: [f64; 3]| seam.align.map_or(d, |(a, f)| a.warp(f, i, d));
+                let Some(mut hit) = lens.project(warp(mid)) else { continue };
                 if views.len() > 1 {
                     let row = (hit.1 / frames[lens.input].height as f64).clamp(0.0, 1.0);
                     let at = views[(row * (views.len() - 1) as f64).round() as usize];
-                    let Some(h) = lens.project(apply(at, d)) else { continue };
+                    let Some(h) = lens.project(warp(apply(at, d))) else { continue };
                     hit = h;
                 }
                 let (u, v, theta) = hit;
@@ -127,8 +137,9 @@ pub fn equirect(lenses: &[Lens], frames: &[Frame], out_w: usize, only: Option<us
                     continue;
                 }
                 let px = sample(&frames[lens.input], u, v);
+                let gain = seam.exposure.map_or([1.0; 3], |(s, g)| s.gain(g, i, mid, theta));
                 for c in 0..3 {
-                    acc[c] += px[c] * w;
+                    acc[c] += px[c] * gain[c] * w;
                 }
                 wsum += w;
             }
@@ -185,7 +196,7 @@ fn fill_row(row: &mut [bool], pts: &[[f64; 2]], py: f64, value: bool) {
     }
 }
 
-fn sample(f: &Frame, u: f64, v: f64) -> [f64; 3] {
+pub(crate) fn sample(f: &Frame, u: f64, v: f64) -> [f64; 3] {
     let x0 = (u - 0.5).floor();
     let y0 = (v - 0.5).floor();
     let (fx, fy) = (u - 0.5 - x0, v - 0.5 - y0);

@@ -1,24 +1,25 @@
-//! Real-time 360 player: free look on all three axes, stabilisation and
-//! rolling-shutter correction on the GPU. Plays from the LRF proxy and swaps
-//! in a full-resolution OSV frame whenever playback is paused.
+//! Real-time 360 player: an iced window with the stitched view, an open-file
+//! dialog and playback controls. Free look on all three axes, stabilisation
+//! and rolling-shutter correction run in the view's shader.
 
 mod gpu;
+mod playback;
 mod source;
 
-use crate::stab::{Mode, Stabilizer};
-use crate::stitch::{Lens, M3, mat_mul};
-use anyhow::Result;
-use source::{Frame, Kind, Stream};
-use std::path::PathBuf;
+use crate::ffmpeg::{self, Hwaccel};
+use crate::stab::{ImuAxes, Mode, Stabilizer};
+use crate::stitch::{M3, mat_mul};
+use anyhow::{Context, Result};
+use gpu::{Rig, Shown};
+use iced::keyboard::{self, Key, key::Named};
+use iced::mouse;
+use iced::widget::{button, center, column, container, pick_list, row, shader, slider, space, text, toggler};
+use iced::window;
+use iced::{Alignment, Element, Length, Point, Rectangle, Subscription, Task, Theme};
+use playback::Playback;
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
-use std::time::Instant;
-use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Fullscreen, Window, WindowId};
 
 pub struct Media {
     pub input: PathBuf,
@@ -26,38 +27,142 @@ pub struct Media {
     pub proxy: Option<PathBuf>,
     /// Stream the OSV at this size instead of the proxy.
     pub osv_size: Option<u32>,
-    pub lenses: Vec<Lens>,
-    pub tracks: Vec<u32>,
+    /// Pixels square of the OSV's lens tracks.
+    pub osv_full: u32,
+    pub hw: Hwaccel,
+    pub rig: Arc<Rig>,
     pub stab: Stabilizer,
     pub readout_ms: f64,
     pub fps: f64,
     pub duration: f64,
 }
 
-pub fn run(media: Media) -> Result<()> {
-    let event_loop = EventLoop::new()?;
-    let mut app = App::new(media);
-    event_loop.run_app(&mut app)?;
-    app.error.map_or(Ok(()), Err)
+impl fmt::Debug for Media {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Media").field("input", &self.input).finish_non_exhaustive()
+    }
 }
 
-const PROJECTIONS: [&str; 3] = ["perspective", "little planet", "equirect"];
+/// Settings from the command line; the GUI updates them so the next clip
+/// opens the way the last one was left.
+#[derive(Clone)]
+pub struct Options {
+    pub osv_size: Option<u32>,
+    /// Forced decoder, or the one found by probing the first clip.
+    pub hw: Option<Hwaccel>,
+    pub stabilize: Mode,
+    pub imu_axes: ImuAxes,
+    pub world_z_down: bool,
+}
+
+impl Media {
+    fn load(input: PathBuf, opts: &Options) -> Result<Media> {
+        let render = crate::RenderOpts {
+            width: 0,
+            variant: None,
+            only: None,
+            stabilize: opts.stabilize,
+            smooth: 500.0,
+            imu_axes: opts.imu_axes,
+            world_z_down: opts.world_z_down,
+            no_rs: false,
+            no_exposure: false,
+            no_align: false,
+        };
+        let p = crate::Pipeline::new(&input, &render)?;
+        let proxy = ["LRF", "lrf"].iter().map(|ext| input.with_extension(ext)).find(|p| p.exists());
+        let hw = match opts.hw {
+            Some(hw) => hw,
+            None => Hwaccel::pick(&input, p.tracks[0])?,
+        };
+        eprintln!("decoding with {hw:?}");
+        Ok(Media {
+            duration: ffmpeg::duration(&input)?,
+            osv_full: ffmpeg::dimensions(&input, p.tracks[0])?.0 as u32,
+            proxy,
+            osv_size: opts.osv_size,
+            hw,
+            rig: Arc::new(Rig::new(p.lenses, p.tracks)),
+            stab: p.stab,
+            readout_ms: p.readout_ms,
+            fps: p.fps,
+            input,
+        })
+    }
+}
+
+pub fn run(input: Option<PathBuf>, opts: Options) -> Result<()> {
+    iced::application(
+        move || {
+            let mut app = App::new(opts.clone());
+            let task = match &input {
+                Some(path) => app.open(path.clone()),
+                None => Task::none(),
+            };
+            (app, task)
+        },
+        App::update,
+        App::view,
+    )
+    .title(App::title)
+    .subscription(App::subscription)
+    .theme(|_: &App| Theme::Dark)
+    .window_size((1280.0, 820.0))
+    .run()
+    .context("running the player window")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Projection {
+    Perspective,
+    LittlePlanet,
+    Equirect,
+}
+
+impl Projection {
+    const ALL: [Projection; 3] = [Projection::Perspective, Projection::LittlePlanet, Projection::Equirect];
+}
+
+impl fmt::Display for Projection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Projection::Perspective => "Perspective",
+            Projection::LittlePlanet => "Little planet",
+            Projection::Equirect => "Equirect",
+        })
+    }
+}
+
+/// What the player streams while playing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Source {
+    Proxy,
+    Osv(u32),
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Source::Proxy => f.write_str("Proxy (LRF)"),
+            Source::Osv(s) => write!(f, "OSV {s} px"),
+        }
+    }
+}
 
 struct Look {
     yaw: f64,
     pitch: f64,
     roll: f64,
     fov_deg: f64,
-    projection: u32,
+    projection: Projection,
 }
 
 impl Look {
     fn reset(&mut self) {
-        *self = Look { projection: self.projection, ..Look::default() };
-        if self.projection == 1 {
-            self.pitch = -90f64.to_radians();
-            self.fov_deg = 120.0;
-        }
+        *self = match self.projection {
+            Projection::LittlePlanet => Look::default(),
+            projection => Look { yaw: 0.0, pitch: 0.0, roll: 0.0, fov_deg: 90.0, projection },
+        };
     }
 
     /// view_from_screen-ray: yaw about +y, then pitch about +x, then roll.
@@ -74,388 +179,405 @@ impl Look {
     fn zoom(&self) -> f32 {
         (self.fov_deg.to_radians() / 2.0).tan() as f32
     }
+
+    /// The planet zooms out until the whole sphere is a small disc, the way
+    /// DJI Studio's tiny planet does.
+    fn fov_range(&self) -> (f64, f64) {
+        if self.projection == Projection::LittlePlanet { (10.0, 179.5) } else { (20.0, 150.0) }
+    }
+
+    /// Zooms by `steps` scroll notches, each scaling the picture by 10%:
+    /// near the planet's limit a fixed step in degrees would barely move.
+    fn zoom_by(&mut self, steps: f64) {
+        let (lo, hi) = self.fov_range();
+        let half = ((self.fov_deg.to_radians() / 2.0).tan() * 1.1f64.powf(steps)).atan();
+        self.fov_deg = (2.0 * half.to_degrees()).clamp(lo, hi);
+    }
 }
 
+/// Opens on the little planet, as DJI Studio does.
 impl Default for Look {
     fn default() -> Self {
-        Look { yaw: 0.0, pitch: 0.0, roll: 0.0, fov_deg: 90.0, projection: 0 }
+        Look { yaw: 0.0, pitch: -90f64.to_radians(), roll: 0.0, fov_deg: 120.0, projection: Projection::LittlePlanet }
     }
+}
+
+/// An open clip: its playback plus the frame the view draws.
+struct Clip {
+    playback: Playback,
+    shown: Option<Arc<Shown>>,
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    Open,
+    Picked(Option<PathBuf>),
+    /// Never cloned in flight, so the clip can be taken back out of the `Arc`.
+    Loaded(Arc<Result<Media, String>>),
+    Tick,
+    Key(Key, keyboard::Modifiers),
+    Toggle,
+    Scrub(f64),
+    ScrubDone,
+    Look { yaw: f64, pitch: f64, roll: f64 },
+    /// Scroll notches; positive zooms out.
+    Zoom(f64),
+    Fov(f64),
+    Stab(Mode),
+    Projection(Projection),
+    Source(Source),
+    RollingShutter(bool),
+    ResetView,
+    Fullscreen,
 }
 
 struct App {
-    media: Media,
-    window: Option<Arc<Window>>,
-    gpu: Option<gpu::Gpu>,
-    error: Option<anyhow::Error>,
-
+    opts: Options,
+    clip: Option<Clip>,
+    loading: Option<PathBuf>,
+    error: Option<String>,
     look: Look,
     rolling_shutter: bool,
-    mods: ModifiersState,
-    cursor: Option<PhysicalPosition<f64>>,
-    drag: Option<MouseButton>,
-
-    playing: bool,
-    /// Playback clock: `anchor_pts` at `anchor_at`.
-    anchor_pts: f64,
-    anchor_at: Instant,
-    shown_pts: f64,
-    stream: Option<Stream>,
-    pending: Option<Frame>,
-    /// While paused, a stream is only kept for its first frame.
-    preview_only: bool,
-    still: Option<(f64, Receiver<Result<Frame>>)>,
-    showing_full: bool,
-    /// Something changed that a paused, idle player has to redraw for.
-    dirty: bool,
+    fullscreen: bool,
 }
 
 impl App {
-    fn new(media: Media) -> Self {
+    fn new(opts: Options) -> Self {
         App {
-            media,
-            window: None,
-            gpu: None,
+            opts,
+            clip: None,
+            loading: None,
             error: None,
             look: Look::default(),
             rolling_shutter: true,
-            mods: ModifiersState::empty(),
-            cursor: None,
-            drag: None,
-            playing: false,
-            anchor_pts: 0.0,
-            anchor_at: Instant::now(),
-            shown_pts: 0.0,
-            stream: None,
-            pending: None,
-            preview_only: false,
-            still: None,
-            showing_full: false,
-            dirty: true,
+            fullscreen: false,
         }
     }
 
-    fn kind(&self) -> Kind {
-        match (&self.media.proxy, self.media.osv_size) {
-            (Some(p), None) => Kind::Lrf(p.clone()),
-            (_, size) => Kind::Osv { path: self.media.input.clone(), tracks: self.media.tracks.clone(), size: size.unwrap_or(1920) },
+    /// Parses the clip and probes the decoder off the UI thread.
+    fn open(&mut self, path: PathBuf) -> Task<Message> {
+        self.loading = Some(path.clone());
+        self.error = None;
+        let opts = self.opts.clone();
+        Task::perform(blocking(move || Media::load(path, &opts).map_err(|e| format!("{e:#}"))), |r| Message::Loaded(Arc::new(r)))
+    }
+
+    fn title(&self) -> String {
+        let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match (&self.loading, &self.clip) {
+            (Some(p), _) => format!("osmo360 · loading {}", name(p)),
+            (None, Some(c)) => format!("osmo360 · {}", name(&c.playback.media.input)),
+            (None, None) => "osmo360".to_owned(),
         }
     }
 
-    fn snap(&self, t: f64) -> f64 {
-        let last = (self.media.duration - 1.0 / self.media.fps).max(0.0);
-        ((t * self.media.fps).round() / self.media.fps).clamp(0.0, last)
-    }
-
-    fn clock(&self) -> f64 {
-        if self.playing { self.anchor_pts + self.anchor_at.elapsed().as_secs_f64() } else { self.anchor_pts }
-    }
-
-    fn start_stream(&mut self, t: f64) {
-        self.pending = None;
-        self.stream = match source::spawn(self.kind(), t, self.media.fps) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                self.error = Some(e);
-                None
-            }
-        };
-    }
-
-    fn play(&mut self) {
-        if self.shown_pts >= self.snap(self.media.duration) {
-            self.shown_pts = 0.0;
-        }
-        self.playing = true;
-        self.preview_only = false;
-        self.still = None;
-        self.anchor_pts = self.shown_pts;
-        self.anchor_at = Instant::now();
-        self.start_stream(self.shown_pts);
-    }
-
-    fn pause(&mut self) {
-        self.playing = false;
-        self.anchor_pts = self.shown_pts;
-        self.stream = None;
-        self.pending = None;
-        self.request_still(self.shown_pts);
-    }
-
-    fn seek(&mut self, t: f64) {
-        let t = self.snap(t);
-        if self.playing {
-            self.anchor_pts = t;
-            self.anchor_at = Instant::now();
-            self.start_stream(t);
-        } else {
-            self.anchor_pts = t;
-            self.preview_only = true;
-            self.start_stream(t);
-            self.request_still(t);
-        }
-    }
-
-    fn request_still(&mut self, t: f64) {
-        let (tx, rx) = channel();
-        let (path, tracks) = (self.media.input.clone(), self.media.tracks.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send(source::still(&path, &tracks, t));
+    fn subscription(&self) -> Subscription<Message> {
+        let keys = keyboard::listen().filter_map(|e| match e {
+            keyboard::Event::KeyPressed { key, modifiers, .. } => Some(Message::Key(key, modifiers)),
+            _ => None,
         });
-        self.still = Some((t, rx));
+        let busy = self.clip.as_ref().is_some_and(|c| c.playback.busy());
+        if busy { Subscription::batch([keys, window::frames().map(|_| Message::Tick)]) } else { keys }
     }
 
-    fn upload(&mut self, frame: &Frame, full: bool) {
-        if let Some(gpu) = &mut self.gpu {
-            gpu.upload(frame, &self.media.lenses, &self.media.tracks);
-        }
-        self.shown_pts = frame.pts;
-        self.showing_full = full;
-    }
-
-    /// Pulls whatever the decoders have ready for the current clock.
-    fn advance(&mut self) {
-        if self.stream.is_some() {
-            let due = if self.playing { self.clock() + 0.5 / self.media.fps } else { f64::INFINITY };
-            let mut latest = None;
-            let mut ended = false;
-            loop {
-                let next = match self.pending.take() {
-                    Some(f) => f,
-                    None => match self.stream.as_ref().unwrap().frames.try_recv() {
-                        Ok(f) => f,
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            ended = true;
-                            break;
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Open => {
+                let dir = self.clip.as_ref().and_then(|c| c.playback.media.input.parent().map(Path::to_owned));
+                return Task::perform(
+                    async move {
+                        let mut dialog = rfd::AsyncFileDialog::new().set_title("Open Osmo 360 clip").add_filter("Osmo 360 video", &["OSV", "osv"]);
+                        if let Some(dir) = dir {
+                            dialog = dialog.set_directory(dir);
                         }
+                        dialog.pick_file().await.map(|f| f.path().to_owned())
                     },
+                    Message::Picked,
+                );
+            }
+            Message::Picked(Some(path)) => return self.open(path),
+            Message::Picked(None) => {}
+            Message::Loaded(result) => {
+                self.loading = None;
+                match Arc::into_inner(result).expect("loaded clip is not shared") {
+                    Ok(media) => {
+                        self.opts.hw = Some(media.hw);
+                        let playback = Playback::new(media);
+                        self.error = playback.error.clone();
+                        self.clip = Some(Clip { playback, shown: None });
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            Message::Tick => self.tick(),
+            Message::Key(key, mods) => return self.key(key, mods),
+            Message::Toggle => self.with_playback(Playback::toggle),
+            Message::Scrub(t) => self.with_playback(|p| p.scrub(t)),
+            Message::ScrubDone => self.with_playback(Playback::scrub_end),
+            Message::Look { yaw, pitch, roll } => {
+                self.look.yaw += yaw;
+                self.look.pitch += pitch;
+                self.look.roll += roll;
+            }
+            Message::Zoom(deg) => self.look.zoom_by(deg),
+            Message::Fov(deg) => self.look.fov_deg = deg,
+            Message::Stab(mode) => {
+                self.opts.stabilize = mode;
+                self.with_playback(|p| p.media.stab.set_mode(mode));
+            }
+            Message::Projection(p) => {
+                self.look.projection = p;
+                self.look.reset();
+            }
+            Message::Source(s) => {
+                let size = match s {
+                    Source::Proxy => None,
+                    Source::Osv(size) => Some(size),
                 };
-                if next.pts <= due {
-                    latest = Some(next);
-                    if self.preview_only {
-                        break;
-                    }
-                } else {
-                    self.pending = Some(next);
-                    break;
-                }
+                self.opts.osv_size = size;
+                self.with_playback(|p| p.set_osv_size(size));
             }
-            if let Some(f) = latest {
-                // A paused preview never replaces the full-resolution still.
-                if !(self.preview_only && self.showing_full && self.still.is_none()) {
-                    self.upload(&f, false);
-                }
-                if self.preview_only {
-                    self.stream = None;
-                }
-            } else if self.playing && self.shown_pts < self.clock() - 0.25 {
-                // Decoding is slower than real time: let the clock wait for it.
-                self.anchor_pts = self.shown_pts;
-                self.anchor_at = Instant::now();
-            }
-            if ended && self.playing {
-                self.pause();
+            Message::RollingShutter(on) => self.rolling_shutter = on,
+            Message::ResetView => self.look.reset(),
+            Message::Fullscreen => {
+                self.fullscreen = !self.fullscreen;
+                let mode = if self.fullscreen { window::Mode::Fullscreen } else { window::Mode::Windowed };
+                return window::latest().and_then(move |id| window::set_mode(id, mode));
             }
         }
-        if let Some((t, rx)) = &self.still {
-            match rx.try_recv() {
-                Ok(Ok(frame)) => {
-                    let current = !self.playing && (*t - self.anchor_pts).abs() < 0.5 / self.media.fps;
-                    self.still = None;
-                    if current {
-                        self.upload(&frame, true);
-                    }
-                }
-                Ok(Err(e)) => {
-                    eprintln!("full-resolution frame failed: {e:#}");
-                    self.still = None;
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => self.still = None,
-            }
+        Task::none()
+    }
+
+    fn with_playback(&mut self, f: impl FnOnce(&mut Playback)) {
+        if let Some(c) = &mut self.clip {
+            f(&mut c.playback);
+            self.error = c.playback.error.clone();
         }
     }
 
-    fn redraw(&mut self) {
-        self.dirty = false;
-        self.advance();
-        let steps = if self.rolling_shutter && self.media.readout_ms > 0.0 { gpu::RS_STEPS_MAX } else { 1 };
-        let rig_from_view = if self.media.stab.has_data() {
-            self.media.stab.rig_from_view(self.shown_pts * 1000.0, self.media.readout_ms, steps)
-        } else {
-            vec![[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]]
-        };
-        let view = gpu::View { user: self.look.matrix(), zoom: self.look.zoom(), projection: self.look.projection, rig_from_view };
-        if let Some(gpu) = &mut self.gpu
-            && let Err(e) = gpu.render(&view)
-        {
-            self.error = Some(e);
+    fn tick(&mut self) {
+        let Some(c) = &mut self.clip else { return };
+        if let Some((frame, fix)) = c.playback.tick() {
+            c.shown = Some(Arc::new(Shown::new(frame, fix)));
         }
-        self.update_title();
+        self.error = c.playback.error.clone();
     }
 
-    fn update_title(&self) {
-        let Some(w) = &self.window else { return };
-        let mode = match self.media.stab.mode() {
-            Mode::Off => "stab off",
-            Mode::Horizon => "horizon",
-            Mode::Lock => "world lock",
-        };
-        w.set_title(&format!(
-            "osmo360 · {:.2} / {:.1} s {} · {} · RS {} · {} · {} · fov {:.0}° · yaw {:.0}° pitch {:.0}° roll {:.0}°",
-            self.shown_pts,
-            self.media.duration,
-            if self.playing { "▶" } else { "❚❚" },
-            mode,
-            if self.rolling_shutter { "on" } else { "off" },
-            if self.showing_full { "full res" } else if self.still.is_some() { "loading full res…" } else { "proxy" },
-            PROJECTIONS[self.look.projection as usize],
-            self.look.fov_deg,
-            self.look.yaw.to_degrees(),
-            self.look.pitch.to_degrees(),
-            self.look.roll.to_degrees(),
-        ));
-    }
-
-    fn key(&mut self, event: &KeyEvent, el: &ActiveEventLoop) {
-        if event.state != ElementState::Pressed {
-            return;
-        }
+    fn key(&mut self, key: Key, mods: keyboard::Modifiers) -> Task<Message> {
         let step = 5f64.to_radians();
-        let shift = self.mods.shift_key();
-        match &event.logical_key {
-            Key::Named(NamedKey::Escape) => el.exit(),
-            Key::Named(NamedKey::Space) => {
-                if self.playing {
-                    self.pause()
-                } else {
-                    self.play()
-                }
-            }
-            Key::Named(NamedKey::ArrowLeft) if shift => self.look.yaw -= 2.0 * step,
-            Key::Named(NamedKey::ArrowRight) if shift => self.look.yaw += 2.0 * step,
-            Key::Named(NamedKey::ArrowLeft) => self.seek(self.shown_pts - 5.0),
-            Key::Named(NamedKey::ArrowRight) => self.seek(self.shown_pts + 5.0),
-            Key::Named(NamedKey::ArrowUp) => self.look.pitch += step,
-            Key::Named(NamedKey::ArrowDown) => self.look.pitch -= step,
-            Key::Named(NamedKey::Home) => self.look.reset(),
-            Key::Character(c) => match c.as_str() {
+        match key.as_ref() {
+            Key::Named(Named::Escape) if self.fullscreen => return self.update(Message::Fullscreen),
+            Key::Named(Named::Space) => self.with_playback(Playback::toggle),
+            Key::Named(Named::ArrowLeft) if mods.shift() => self.look.yaw -= 2.0 * step,
+            Key::Named(Named::ArrowRight) if mods.shift() => self.look.yaw += 2.0 * step,
+            Key::Named(Named::ArrowLeft) => self.with_playback(|p| p.seek(p.shown_pts - 5.0)),
+            Key::Named(Named::ArrowRight) => self.with_playback(|p| p.seek(p.shown_pts + 5.0)),
+            Key::Named(Named::ArrowUp) => self.look.pitch += step,
+            Key::Named(Named::ArrowDown) => self.look.pitch -= step,
+            Key::Named(Named::Home) => self.look.reset(),
+            Key::Character(c) => match c {
+                "o" if mods.command() => return self.update(Message::Open),
                 "q" | "Q" => self.look.roll -= step,
                 "e" | "E" => self.look.roll += step,
                 "0" => self.look.reset(),
-                "," if !self.playing => self.seek(self.shown_pts - 1.0 / self.media.fps),
-                "." if !self.playing => self.seek(self.shown_pts + 1.0 / self.media.fps),
-                "+" | "=" => self.zoom_by(-5.0),
-                "-" => self.zoom_by(5.0),
+                "," => self.with_playback(|p| p.step(-1.0)),
+                "." => self.with_playback(|p| p.step(1.0)),
+                "+" | "=" => self.look.zoom_by(-1.0),
+                "-" => self.look.zoom_by(1.0),
                 "s" | "S" => {
-                    let next = match self.media.stab.mode() {
+                    let mode = self.clip.as_ref().map_or(self.opts.stabilize, |c| c.playback.media.stab.mode());
+                    let next = match mode {
                         Mode::Off => Mode::Horizon,
                         Mode::Horizon => Mode::Lock,
                         Mode::Lock => Mode::Off,
                     };
-                    self.media.stab.set_mode(next);
+                    return self.update(Message::Stab(next));
                 }
                 "r" | "R" => self.rolling_shutter = !self.rolling_shutter,
                 "p" | "P" => {
-                    self.look.projection = (self.look.projection + 1) % PROJECTIONS.len() as u32;
-                    self.look.reset();
+                    let i = Projection::ALL.iter().position(|&p| p == self.look.projection).unwrap_or(0);
+                    return self.update(Message::Projection(Projection::ALL[(i + 1) % Projection::ALL.len()]));
                 }
-                "f" | "F" => {
-                    if let Some(w) = &self.window {
-                        w.set_fullscreen(if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) });
-                    }
-                }
+                "f" | "F" => return self.update(Message::Fullscreen),
                 _ => {}
             },
             _ => {}
         }
+        Task::none()
     }
 
-    fn zoom_by(&mut self, deg: f64) {
-        let (lo, hi) = if self.look.projection == 1 { (60.0, 170.0) } else { (20.0, 150.0) };
-        self.look.fov_deg = (self.look.fov_deg + deg).clamp(lo, hi);
+    fn view(&self) -> Element<'_, Message> {
+        let open = button("Open…").on_press(Message::Open);
+        let error = self.error.as_ref().map(|e| text(e.clone()).style(text::danger));
+        let Some(clip) = &self.clip else {
+            let status = match &self.loading {
+                Some(p) => format!("Loading {}…", p.display()),
+                None => "Open a DJI Osmo 360 .OSV clip to start.".to_owned(),
+            };
+            return center(column![text(status), open].push(error).spacing(16).align_x(Alignment::Center)).into();
+        };
+        let p = &clip.playback;
+        let media = &p.media;
+
+        let status = match &self.loading {
+            Some(path) => format!("Loading {}…", path.display()),
+            None => format!("{} · {:?} decode", p.quality(), media.hw),
+        };
+        let top = row![open, text(media.input.display().to_string()), space().width(Length::Fill), text(status)]
+            .spacing(12)
+            .padding([6, 10])
+            .align_y(Alignment::Center);
+
+        let view: Element<'_, Message> = match &clip.shown {
+            Some(shown) => shader(Sphere {
+                rig: media.rig.clone(),
+                shown: shown.clone(),
+                user: self.look.matrix(),
+                zoom: self.look.zoom(),
+                projection: self.look.projection as u32,
+                rig_from_view: p.rig_from_view(self.rolling_shutter),
+                fov_deg: self.look.fov_deg,
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+            None => center(text("Decoding…")).into(),
+        };
+        let view = container(view).width(Length::Fill).height(Length::Fill).style(|_| container::background(iced::Color::BLACK));
+
+        let last = (media.duration - 1.0 / media.fps).max(0.0);
+        let transport = row![
+            button(text(if p.playing { "Pause" } else { "Play" }).width(48).align_x(Alignment::Center)).on_press(Message::Toggle),
+            text(format!("{} / {}", clock(p.position()), clock(media.duration))),
+            slider(0.0..=last, p.position().min(last), Message::Scrub).step(1.0 / media.fps).on_release(Message::ScrubDone),
+        ]
+        .spacing(12)
+        .padding([4, 10])
+        .align_y(Alignment::Center);
+
+        let mut sources = Vec::new();
+        if media.proxy.is_some() {
+            sources.push(Source::Proxy);
+        }
+        sources.push(Source::Osv(1920.min(media.osv_full)));
+        sources.push(Source::Osv(media.osv_full));
+        sources.dedup();
+        let source = match (media.osv_size, &media.proxy) {
+            (None, Some(_)) => Source::Proxy,
+            (size, _) => Source::Osv(size.unwrap_or(1920)),
+        };
+        let (lo, hi) = self.look.fov_range();
+        let controls = row![
+            labelled("Stabilisation", pick_list(&Mode::ALL[..], Some(media.stab.mode()), Message::Stab)),
+            labelled("Projection", pick_list(&Projection::ALL[..], Some(self.look.projection), Message::Projection)),
+            labelled("Playback source", pick_list(sources, Some(source), Message::Source)),
+            labelled("FOV", slider(lo..=hi, self.look.fov_deg, Message::Fov).width(120)),
+            toggler(self.rolling_shutter).label("Rolling shutter").on_toggle(Message::RollingShutter),
+            button("Reset view").on_press(Message::ResetView),
+            button(if self.fullscreen { "Exit fullscreen" } else { "Fullscreen" }).on_press(Message::Fullscreen),
+        ]
+        .spacing(18)
+        .padding([6, 10])
+        .align_y(Alignment::Center)
+        .wrap();
+
+        column![top, view, transport, controls].push(error.map(|e| container(e).padding([0, 10]))).into()
     }
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let attrs = Window::default_attributes().with_title("osmo360").with_inner_size(LogicalSize::new(1280.0, 720.0));
-        let result = el.create_window(attrs).map_err(anyhow::Error::from).and_then(|w| {
-            let w = Arc::new(w);
-            let gpu = gpu::Gpu::new(w.clone(), &self.media.lenses)?;
-            Ok((w, gpu))
-        });
-        match result {
-            Ok((w, gpu)) => {
-                self.window = Some(w);
-                self.gpu = Some(gpu);
-                self.play();
-            }
-            Err(e) => {
-                self.error = Some(e);
-                el.exit();
-            }
-        }
-    }
+fn labelled<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    row![text(label), widget.into()].spacing(6).align_y(Alignment::Center).into()
+}
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+fn clock(t: f64) -> String {
+    format!("{}:{:05.2}", (t / 60.0) as u32, t % 60.0)
+}
+
+/// Runs `f` on its own thread so blocking work (parsing, ffprobe) stays off
+/// the executor.
+fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl Future<Output = T> {
+    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    async move { rx.await.expect("loader thread panicked") }
+}
+
+/// The 360 view widget: draws the shader primitive and turns drags and the
+/// scroll wheel into look and zoom messages.
+struct Sphere {
+    rig: Arc<Rig>,
+    shown: Arc<Shown>,
+    user: M3,
+    zoom: f32,
+    projection: u32,
+    rig_from_view: Vec<M3>,
+    fov_deg: f64,
+}
+
+#[derive(Default)]
+struct Drag {
+    button: Option<mouse::Button>,
+    last: Option<Point>,
+}
+
+impl shader::Program<Message> for Sphere {
+    type State = Drag;
+    type Primitive = gpu::Primitive;
+
+    fn update(&self, drag: &mut Drag, event: &iced::Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<shader::Action<Message>> {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::Resized(size) => {
-                if let Some(gpu) = &mut self.gpu {
-                    gpu.resize(size.width, size.height);
-                }
+            iced::Event::Mouse(mouse::Event::ButtonPressed(b @ (mouse::Button::Left | mouse::Button::Right))) => {
+                drag.last = Some(cursor.position_over(bounds)?);
+                drag.button = Some(*b);
+                Some(shader::Action::capture())
             }
-            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            WindowEvent::KeyboardInput { event, .. } => self.key(&event, el),
-            WindowEvent::MouseInput { state, button, .. } => {
-                self.drag = (state == ElementState::Pressed).then_some(button);
+            iced::Event::Mouse(mouse::Event::ButtonReleased(_)) if drag.button.is_some() => {
+                drag.button = None;
+                Some(shader::Action::capture())
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                if let (Some(prev), Some(button), Some(gpu)) = (self.cursor, self.drag, &self.gpu) {
-                    // Grab-style: the picture follows the pointer.
-                    let k = self.look.fov_deg.to_radians() / gpu.size().1 as f64;
-                    let (dx, dy) = (position.x - prev.x, position.y - prev.y);
-                    match button {
-                        MouseButton::Left => {
-                            self.look.yaw -= dx * k;
-                            self.look.pitch += dy * k;
-                        }
-                        MouseButton::Right => self.look.roll += dx * k,
-                        _ => {}
-                    }
-                }
-                self.cursor = Some(position);
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as f64,
-                    MouseScrollDelta::PixelDelta(p) => p.y / 40.0,
+            iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                let (button, last) = (drag.button?, drag.last?);
+                drag.last = Some(*position);
+                // Grab-style: the picture follows the pointer.
+                let k = self.fov_deg.to_radians() / bounds.height as f64;
+                let (dx, dy) = ((position.x - last.x) as f64, (position.y - last.y) as f64);
+                let look = match button {
+                    mouse::Button::Right => Message::Look { yaw: 0.0, pitch: 0.0, roll: dx * k },
+                    _ => Message::Look { yaw: -dx * k, pitch: dy * k, roll: 0.0 },
                 };
-                self.zoom_by(-lines * 5.0);
+                Some(shader::Action::publish(look).and_capture())
             }
-            WindowEvent::RedrawRequested => {
-                self.redraw();
-                return;
+            iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                cursor.position_over(bounds)?;
+                let lines = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y as f64,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y as f64 / 40.0,
+                };
+                Some(shader::Action::publish(Message::Zoom(-lines)).and_capture())
             }
-            _ => {}
-        }
-        self.dirty = true;
-        if self.error.is_some() {
-            el.exit();
+            _ => None,
         }
     }
 
-    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        let busy = self.playing || self.stream.is_some() || self.still.is_some();
-        if let Some(w) = &self.window
-            && (busy || self.dirty)
-        {
-            w.request_redraw();
+    fn draw(&self, _: &Drag, _: mouse::Cursor, _: Rectangle) -> gpu::Primitive {
+        gpu::Primitive {
+            rig: self.rig.clone(),
+            shown: self.shown.clone(),
+            user: self.user,
+            zoom: self.zoom,
+            projection: self.projection,
+            rig_from_view: self.rig_from_view.clone(),
         }
-        el.set_control_flow(ControlFlow::Wait);
+    }
+
+    fn mouse_interaction(&self, drag: &Drag, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
+        if drag.button.is_some() {
+            mouse::Interaction::Grabbing
+        } else if cursor.is_over(bounds) {
+            mouse::Interaction::Grab
+        } else {
+            mouse::Interaction::default()
+        }
     }
 }

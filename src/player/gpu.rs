@@ -1,11 +1,16 @@
-//! wgpu state for the player: one full-screen pass running `shader.wgsl`.
+//! The 360 view as an iced shader primitive: one pass of `shader.wgsl` over
+//! the widget's rectangle, sharing iced's wgpu device.
 
 use super::source::{Frame, Layout};
+use crate::align::{Aligner, CELLS_ALPHA, CELLS_PHI, Field};
+use crate::exposure::{BINS, FADE_FROM, FADE_TO, Gains, Seam};
 use crate::stitch::{Lens, M3};
-use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
+use iced::wgpu;
+use iced::widget::shader::{self, Viewport};
+use iced::Rectangle;
 use std::sync::Arc;
-use winit::window::Window;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const RS_STEPS_MAX: usize = 33;
 
@@ -30,10 +35,57 @@ struct Uniforms {
     misc: [f32; 4],
     lenses: [LensU; 2],
     views: [[f32; 4]; RS_STEPS_MAX * 3],
+    /// Exposure seam basis rows; .w of the first two are the fade angles.
+    seam: [[f32; 4]; 3],
+    gains: [[f32; 4]; BINS * 2],
+    /// Seam alignment shifts, four cells per vector.
+    field: [[f32; 4]; CELLS_PHI * CELLS_ALPHA / 4],
 }
 
-/// What the shader needs each frame besides the pictures.
-pub struct View {
+/// Numbers rigs and frames so each is uploaded once however often it is drawn.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A clip's lens geometry; the pipeline rebuilds its masks only when another
+/// clip is opened.
+pub struct Rig {
+    id: u64,
+    pub lenses: Vec<Lens>,
+    pub tracks: Vec<u32>,
+    pub seam: Option<Seam>,
+    pub aligner: Option<Aligner>,
+}
+
+impl Rig {
+    pub fn new(lenses: Vec<Lens>, tracks: Vec<u32>) -> Self {
+        let (seam, aligner) = (Seam::new(&lenses), Aligner::new(&lenses));
+        Rig { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), lenses, tracks, seam, aligner }
+    }
+}
+
+/// Per-frame seam corrections: exposure matching and close-subject alignment.
+#[derive(Clone, Default)]
+pub struct SeamFix {
+    pub gains: Gains,
+    pub field: Field,
+}
+
+/// A decoded frame as handed to the view, with its seam corrections.
+pub struct Shown {
+    id: u64,
+    frame: Frame,
+    fix: SeamFix,
+}
+
+impl Shown {
+    pub fn new(frame: Frame, fix: SeamFix) -> Self {
+        Shown { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), frame, fix }
+    }
+}
+
+/// Everything one draw needs; rebuilt by the view on every redraw.
+pub struct Primitive {
+    pub rig: Arc<Rig>,
+    pub shown: Arc<Shown>,
     /// view_from_screen-ray rotation of the user's free look.
     pub user: M3,
     /// Tangent of half the vertical field of view (or the planet zoom).
@@ -43,64 +95,34 @@ pub struct View {
     pub rig_from_view: Vec<M3>,
 }
 
+impl std::fmt::Debug for Primitive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Primitive").field("rig", &self.rig.id).finish_non_exhaustive()
+    }
+}
+
 struct Plane {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
 }
 
-pub struct Gpu {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
+pub struct Pipeline {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniforms: wgpu::Buffer,
+    srgb: bool,
     /// Per texture slot: Y plane, UV plane.
     slots: [(Plane, Plane); 2],
     masks: [Plane; 2],
     bind_group: wgpu::BindGroup,
     lens_u: [LensU; 2],
+    rig_id: u64,
+    shown_id: u64,
 }
 
-impl Gpu {
-    pub fn new(window: Arc<Window>, lenses: &[Lens]) -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let surface = instance.create_surface(window.clone())?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .context("no GPU adapter")?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: None,
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::Performance,
-            trace: wgpu::Trace::Off,
-        }))?;
-
-        let size = window.inner_size();
-        let mut config = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-            .context("surface unsupported by adapter")?;
-        // The shader produces display-encoded values: write them to a plain
-        // 8-bit surface untouched. A float surface would be read as linear
-        // light, so only fall back to an sRGB one, decoding in the shader.
-        let caps = surface.get_capabilities(&adapter);
-        let plain = [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm];
-        if let Some(f) = caps.formats.iter().find(|f| plain.contains(f)) {
-            config.format = *f;
-        } else if let Some(f) = caps.formats.iter().find(|f| f.is_srgb()) {
-            config.format = *f;
-        }
-        eprintln!("surface format {:?} (offered {:?})", config.format, caps.formats);
-        config.present_mode = wgpu::PresentMode::AutoVsync;
-        surface.configure(&device, &config);
-
+impl shader::Pipeline for Pipeline {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("stitch"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -144,8 +166,8 @@ impl Gpu {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("stitch"),
@@ -163,9 +185,9 @@ impl Gpu {
                 module: &shader,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
-                targets: &[Some(config.format.into())],
+                targets: &[Some(format.into())],
             }),
-            multiview_mask: None,
+            multiview: None,
             cache: None,
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -181,56 +203,59 @@ impl Gpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        let blank = |device: &wgpu::Device, f| plane(device, 2, 2, f);
-        let slots = [
-            (blank(&device, wgpu::TextureFormat::R8Unorm), blank(&device, wgpu::TextureFormat::Rg8Unorm)),
-            (blank(&device, wgpu::TextureFormat::R8Unorm), blank(&device, wgpu::TextureFormat::Rg8Unorm)),
-        ];
-        let masks = [0, 1].map(|i| {
-            let l = &lenses[i];
-            let [w, h] = l.calib_dim;
-            let p = plane(&device, w as u32, h as u32, wgpu::TextureFormat::R8Unorm);
-            let bytes: Vec<u8> = l.valid.iter().map(|&v| if v { 255 } else { 0 }).collect();
-            write(&queue, &p.texture, &bytes, w as u32, h as u32, 1);
-            p
-        });
-        let lens_u = [0, 1].map(|i| lens_uniform(&lenses[i]));
-        let bind_group = bind(&device, &layout, &uniforms, &sampler, &slots, &masks);
-
-        Ok(Gpu { surface, device, queue, config, pipeline, layout, sampler, uniforms, slots, masks, bind_group, lens_u })
-    }
-
-    pub fn resize(&mut self, w: u32, h: u32) {
-        if w > 0 && h > 0 {
-            self.config.width = w;
-            self.config.height = h;
-            self.surface.configure(&self.device, &self.config);
+        let slots = [0, 1].map(|_| (plane(device, 2, 2, wgpu::TextureFormat::R8Unorm), plane(device, 1, 1, wgpu::TextureFormat::Rg8Unorm)));
+        let masks = [0, 1].map(|_| plane(device, 1, 1, wgpu::TextureFormat::R8Unorm));
+        let bind_group = bind(device, &layout, &uniforms, &sampler, &slots, &masks);
+        Pipeline {
+            pipeline,
+            layout,
+            sampler,
+            uniforms,
+            srgb: format.is_srgb(),
+            slots,
+            masks,
+            bind_group,
+            lens_u: [LensU::zeroed(); 2],
+            rig_id: 0,
+            shown_id: 0,
         }
     }
+}
 
-    pub fn size(&self) -> (u32, u32) {
-        (self.config.width, self.config.height)
+impl Pipeline {
+    fn set_rig(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rig: &Rig) {
+        self.masks = [0, 1].map(|i| {
+            let l = &rig.lenses[i];
+            let [w, h] = l.calib_dim;
+            let p = plane(device, w as u32, h as u32, wgpu::TextureFormat::R8Unorm);
+            let bytes: Vec<u8> = l.valid.iter().map(|&v| if v { 255 } else { 0 }).collect();
+            write(queue, &p.texture, &bytes, w as u32, h as u32, 1);
+            p
+        });
+        self.lens_u = [0, 1].map(|i| lens_uniform(&rig.lenses[i]));
+        self.bind_group = bind(device, &self.layout, &self.uniforms, &self.sampler, &self.slots, &self.masks);
+        self.rig_id = rig.id;
+        self.shown_id = 0;
     }
 
     /// Uploads a frame's pictures and points each lens at its part of them.
-    pub fn upload(&mut self, frame: &Frame, lenses: &[Lens], tracks: &[u32]) {
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame, rig: &Rig) {
         let mut rebind = false;
         for (slot, pic) in frame.pictures.iter().enumerate().take(2) {
             let (y, uv) = &mut self.slots[slot];
             if y.texture.width() != pic.width || y.texture.height() != pic.height {
-                *y = plane(&self.device, pic.width, pic.height, wgpu::TextureFormat::R8Unorm);
-                *uv = plane(&self.device, pic.width / 2, pic.height / 2, wgpu::TextureFormat::Rg8Unorm);
+                *y = plane(device, pic.width, pic.height, wgpu::TextureFormat::R8Unorm);
+                *uv = plane(device, pic.width / 2, pic.height / 2, wgpu::TextureFormat::Rg8Unorm);
                 rebind = true;
             }
-            write(&self.queue, &y.texture, pic.y(), pic.width, pic.height, 1);
-            write(&self.queue, &uv.texture, pic.uv(), pic.width / 2, pic.height / 2, 2);
+            write(queue, &y.texture, pic.y(), pic.width, pic.height, 1);
+            write(queue, &uv.texture, pic.uv(), pic.width / 2, pic.height / 2, 2);
         }
         if rebind {
-            self.bind_group = bind(&self.device, &self.layout, &self.uniforms, &self.sampler, &self.slots, &self.masks);
+            self.bind_group = bind(device, &self.layout, &self.uniforms, &self.sampler, &self.slots, &self.masks);
         }
-        for (i, lens) in lenses.iter().enumerate().take(2) {
-            let track = tracks[lens.input];
+        for (i, lens) in rig.lenses.iter().enumerate().take(2) {
+            let track = rig.tracks[lens.input];
             let (slot, pic) = match frame.layout {
                 Layout::SideBySide => (0, &frame.pictures[0]),
                 Layout::PerTrack => (track as usize, &frame.pictures[track as usize]),
@@ -245,50 +270,62 @@ impl Gpu {
             u.a1 = [(s * a.a[1][0] / h) as f32, (s * a.a[1][1] / h) as f32, (s * a.t[1] / h) as f32, slot as f32];
         }
     }
+}
 
-    pub fn render(&mut self, view: &View) -> Result<()> {
+impl shader::Primitive for Primitive {
+    type Pipeline = Pipeline;
+
+    fn prepare(&self, p: &mut Pipeline, device: &wgpu::Device, queue: &wgpu::Queue, bounds: &Rectangle, viewport: &Viewport) {
+        if p.rig_id != self.rig.id {
+            p.set_rig(device, queue, &self.rig);
+        }
+        if p.shown_id != self.shown.id {
+            p.upload(device, queue, &self.shown.frame, &self.rig);
+            p.shown_id = self.shown.id;
+        }
+        let px = *bounds * viewport.scale_factor();
         let mut u = Uniforms::zeroed();
-        u.user = rows(view.user);
-        u.screen = [self.config.width as f32, self.config.height as f32, view.zoom, view.projection as f32];
-        let steps = view.rig_from_view.len().min(RS_STEPS_MAX);
-        u.misc = [steps as f32, self.config.format.is_srgb() as u8 as f32, 0.0, 0.0];
-        u.lenses = self.lens_u;
-        for (k, m) in view.rig_from_view.iter().take(steps).enumerate() {
+        u.user = rows(self.user);
+        u.screen = [px.width, px.height, self.zoom, self.projection as f32];
+        let steps = self.rig_from_view.len().min(RS_STEPS_MAX);
+        u.misc = [steps as f32, p.srgb as u8 as f32, px.x, px.y];
+        u.lenses = p.lens_u;
+        for (k, m) in self.rig_from_view.iter().take(steps).enumerate() {
             u.views[k * 3..k * 3 + 3].copy_from_slice(&rows(*m));
         }
-        self.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
-
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return Ok(());
-            }
-            _ => return Ok(()),
-        };
-        let target = frame.texture.create_view(&Default::default());
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
+        if let Some(seam) = &self.rig.seam {
+            u.seam = rows(seam.ring.basis);
+            u.seam[0][3] = FADE_FROM as f32;
+            u.seam[1][3] = FADE_TO as f32;
         }
-        self.queue.submit([enc.finish()]);
-        self.queue.present(frame);
-        Ok(())
+        for (lens, bins) in self.shown.fix.gains.0.iter().enumerate() {
+            for (b, g) in bins.iter().enumerate() {
+                u.gains[lens * BINS + b] = [g[0], g[1], g[2], 0.0];
+            }
+        }
+        for (v, cells) in u.field.iter_mut().zip(self.shown.fix.field.0.chunks_exact(4)) {
+            v.copy_from_slice(cells);
+        }
+        queue.write_buffer(&p.uniforms, 0, bytemuck::bytes_of(&u));
+    }
+
+    fn render(&self, p: &Pipeline, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, clip: &Rectangle<u32>) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("stitch"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+        pass.set_pipeline(&p.pipeline);
+        pass.set_bind_group(0, &p.bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
