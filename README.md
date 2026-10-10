@@ -8,6 +8,8 @@ A 360° video player and editor for **DJI Osmo 360** footage, written in Rust. I
 
 Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 
+Ready-made Linux builds, with an install script and an AppImage, are on the [releases page](https://github.com/ravelund/rOsmo360/releases/latest); see [Installing](#installing).
+
 ## Why
 
 I vibed this tool primarily for Linux, since I couldn't find anything close to DJI Studio there. The goal of rOsmo360 is to bring most of DJI Studio's playback and editing to Linux users. It isn't Linux-exclusive, though: Windows and macOS support is in the pipeline.
@@ -36,8 +38,9 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Timeline** of cuts from one or more clips: split, trim, move and delete them, with undo and redo. Each cut shows thumbnails of its footage, and the timeline zooms in for fine work.
 - **Keyframes** for the view: where it looks (yaw, pitch, roll), the zoom, and the projection, so a shot can pan, zoom or morph into a little planet. Each keyframe eases into the next smoothly, at a steady speed, or holds and then cuts.
 - **Stabilisation per cut**: one cut world-locked, the next following the horizon.
-- **Projects**: save the edit and open it again later.
+- **Projects**: save the edit and open it again later. A cut can carry a short note, shown on the timeline.
 - **Export** the edit to MP4 with its sound, from 720p to 4K, in the aspect lock's shape. It renders on the GPU, about four times faster than the CPU (21 frames a second at 1080p on an RTX 3090).
+- **Export for another editor**: a file per cut (`My hike - 001.mp4`, `- 002` …), and a DaVinci Resolve format (DNxHR HQ with PCM sound in `.mov`) that Resolve's free Linux version can read.
 
 ### Command line
 

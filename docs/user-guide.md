@@ -25,13 +25,29 @@ This guide walks through the whole app. For building it, see the [README](../REA
 
 ## 1. Getting started
 
-You need:
+### Installing
+
+Install `ffmpeg` from your distribution first (`sudo apt install ffmpeg`, `sudo dnf install ffmpeg` or `sudo pacman -S ffmpeg`). Then take one of the ready-made builds from the [releases page](https://github.com/ravelund/rOsmo360/releases/latest). They run on x86_64 Linux: Ubuntu 22.04, Debian 12, Fedora 36 and newer.
+
+- **Install script**: puts `rosmo360` in `~/.local/bin` and adds **rOsmo360** to your application menu.
+
+  ```sh
+  curl -fsSL https://github.com/ravelund/rOsmo360/releases/latest/download/install.sh | sh
+  ```
+
+  Run it again to update. `--uninstall` removes it; your settings stay.
+- **AppImage**: download `rOsmo360-x86_64.AppImage`, make it executable (`chmod +x rOsmo360-x86_64.AppImage`) and double-click it, or run it with clips or a project after it. Wherever this guide says `rosmo360 <command>`, you can also run `./rOsmo360-x86_64.AppImage <command>`.
+
+To build it yourself instead, see the [README](../README.md#building).
+
+### What you need
+
 
 - Clips from the Osmo 360 (`.OSV`). Copy the `.LRF` file that the camera records next to each clip as well. It's a small preview version, and rOsmo360 uses it for smooth playback, scrubbing and thumbnails.
 - `ffmpeg` and `ffprobe` installed and on your `PATH`.
 - A GPU with up-to-date drivers (Vulkan on Linux). It decodes the video, draws the view and renders exports.
 
-Start the app with `rosmo360 play`. You can also name what to open:
+Start **rOsmo360** from your application menu, or from a terminal with `rosmo360 play`. In a terminal you can also name what to open:
 
 ```sh
 rosmo360 play                  # the start screen
@@ -134,6 +150,8 @@ Playback runs through the cuts in order. At the end of one cut it carries on int
 
 Each cut shows thumbnails of its footage, the view straight ahead. They fill in a moment after a clip loads; a long clip takes a few seconds.
 
+A cut's label shows its clip and length, its stabilisation when it differs, and its note when there's room. Notes come from the project file (`"note": "summit arrival"`), so whoever put the edit together can say what each cut is for; the player shows them but doesn't edit them yet.
+
 ### Zooming the timeline
 
 With a long edit, short cuts and close keyframes get narrow. Zoom in:
@@ -163,6 +181,8 @@ More:
 - **Delete a keyframe**: go to it and press **Delete**, or the ◆× button.
 
 **Following and looking.** After you play, seek or change a keyframe, the view follows the keyframes. As soon as you look around by hand, you take over from the view they showed, until the next play or seek. So you can always look around freely without changing anything; only K saves a view.
+
+**Cuts without keyframes** hold the view the edit had last: the view at the end of the nearest cut before them that has keyframes. The export frames them the same way. If no earlier cut has keyframes, the player keeps whatever view you look at, but the export looks straight ahead, so press K in such a cut to keep its view.
 
 Keyframes belong to their cut and stay pinned to the footage. Moving or trimming a cut keeps its camera moves on the same moments. Keyframes trimmed off the end are kept for when you extend the cut again.
 
