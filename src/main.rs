@@ -661,7 +661,7 @@ fn main() -> Result<()> {
                 // One clip is a project of one cut.
                 let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
                 let (start, end) = span(&input, start, duration, Some(&reframe))?;
-                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None }] }
+                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None }] }
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);

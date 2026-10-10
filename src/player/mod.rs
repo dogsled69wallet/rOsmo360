@@ -1100,7 +1100,7 @@ impl App {
     /// ones leave playback where it is.
     fn add_cut(&mut self, input: PathBuf, duration: f64) {
         self.edit.checkpoint();
-        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default(), stabilize: Some(self.opts.stabilize) });
+        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None });
         let i = self.edit.cuts.len() - 1;
         self.selected = Some(i);
         if self.clip.is_none() {
@@ -1412,7 +1412,7 @@ impl App {
                     let to = (all.partition_point(|(t, _)| *t <= c.end) + 1).min(all.len());
                     all[from..to].to_vec()
                 });
-                let block = timeline::Block { label: cut_label(c, self.opts.stabilize), from, len: c.end - c.start, start: c.start, keys, thumbs };
+                let block = timeline::Block { labels: cut_labels(c, self.opts.stabilize), from, len: c.end - c.start, start: c.start, keys, thumbs };
                 from += c.end - c.start;
                 block
             })
@@ -1602,12 +1602,19 @@ fn labelled<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Elem
 
 /// A cut's name on the timeline: its clip, length, and stabilisation when
 /// that isn't horizon (the usual).
-fn cut_label(c: &Cut, default: Mode) -> String {
-    let label = format!("{} · {:.1} s", clip_name(&c.input), c.end - c.start);
+/// A cut's names on the timeline, longest first, for the block to show the
+/// first that fits: its clip, length, stabilisation when that isn't horizon
+/// (the usual), and note.
+fn cut_labels(c: &Cut, default: Mode) -> Vec<String> {
+    let mut label = format!("{} · {:.1} s", clip_name(&c.input), c.end - c.start);
     match c.stabilize.unwrap_or(default) {
-        Mode::Horizon => label,
-        Mode::Off => format!("{label} · unstabilised"),
-        Mode::Lock => format!("{label} · world lock"),
+        Mode::Horizon => {}
+        Mode::Off => label += " · unstabilised",
+        Mode::Lock => label += " · world lock",
+    }
+    match c.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(note) => vec![format!("{label} · {note}"), label],
+        None => vec![label],
     }
 }
 

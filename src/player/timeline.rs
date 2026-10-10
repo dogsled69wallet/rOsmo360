@@ -34,7 +34,8 @@ const DRAG_FROM: f32 = 4.0;
 
 /// One cut as the timeline shows it.
 pub struct Block {
-    pub label: String,
+    /// Its names, longest first; the first that fits is shown.
+    pub labels: Vec<String>,
     /// Where it starts on the timeline, and how long it lasts.
     pub from: f64,
     pub len: f64,
@@ -335,13 +336,13 @@ impl canvas::Program<Message> for Marks {
                 frame.fill(&Path::rounded_rectangle(Point::new(x - 2.0, 5.0), Size::new(4.0, CUTS - 10.0), 2.0.into()), iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5));
                 frame.fill(&Path::rounded_rectangle(Point::new(x - 1.0, 6.0), Size::new(2.0, CUTS - 12.0), 1.0.into()), iced::Color::from_rgba(1.0, 1.0, 1.0, 0.8));
             }
-            // Labels only where they fit (about 7 px a character), on a
+            // The longest label that fits (about 7 px a character), on a
             // dark tag, readable over any picture.
-            if r - l > c.label.len() as f32 * 7.0 + 24.0 {
-                let tag = Path::rounded_rectangle(Point::new(l + 9.0, CUTS - 19.0), Size::new(c.label.len() as f32 * 5.9 + 8.0, 15.0), 3.0.into());
+            if let Some(label) = c.labels.iter().find(|s| r - l > s.chars().count() as f32 * 7.0 + 24.0) {
+                let tag = Path::rounded_rectangle(Point::new(l + 9.0, CUTS - 19.0), Size::new(label.chars().count() as f32 * 5.9 + 8.0, 15.0), 3.0.into());
                 frame.fill(&tag, iced::Color::from_rgba(0.0, 0.0, 0.0, 0.6));
                 frame.fill_text(Text {
-                    content: c.label.clone(),
+                    content: label.clone(),
                     position: Point::new(l + 13.0, CUTS - 11.5),
                     color: iced::Color::WHITE,
                     size: 12.0.into(),

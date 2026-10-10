@@ -47,10 +47,13 @@ Not done yet, roughly in priority order:
 3. **Windows and macOS groundwork.** Add `d3d11va` and `videotoolbox` to `Hwaccel::pick`, and `cargo check` for both targets. Then hide the console window on Windows (the CLI commands still need one), and bundle ffmpeg or document installing it (mind its GPL builds). A macOS `.app` would need signing and notarisation.
 4. **Seam, what's left.** Patch matching is tuned out, the stick is handled by the cut, and the sky by detail-only matching (see Seam below). Further gains need per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
 5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), stabilisation per cut, thumbnails on the cut blocks, timeline zoom, `preview` of projects, GPU export, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
-   - Crossfades between cuts.
    - Spherical metadata on equirect export.
    - Merging `timeline` into master and releasing (0.2.0?) when the user says so.
-6. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
+6. **Version 0.3 (agreed with the user, 2026-10-10): crossfades and sound.**
+   - Crossfades between cuts (picture and sound), in the player and the export.
+   - Music: a track under the edit, with its level.
+   - Each cut's volume, and mute.
+7. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
    - Needs a D-Log M sample clip first: all 35 Kyrkja clips are normal colour, tagged BT.709 10-bit, as DJI may also tag D-Log.
    - DJI records the profile in `StreamMeta.color_mode` (`ColorModeType`: D_LOG = 2, HLG = 9, …). telemetry-parser's Metadata tag only serialises the clip meta, so reading it means decoding StreamMeta ourselves.
 
@@ -103,7 +106,7 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
   - Rolling-shutter re-aim.
 - `src/stab.rs`: `Stabilizer::rig_from_view(t_ms, readout_ms, steps)`, and `pose` (heading, tilt) for `scan`. Defines the `Mode` and `ImuAxes` enums.
 - `src/view.rs`: `View` (yaw/pitch/roll/fov in degrees, projection), `Reframe` (keyframes, JSON with carry-over of missing fields) and `Camera` (what gets drawn). Shared by the player and `export`/`preview`. `Camera::ray` mirrors the shader's `screen_ray`; change them together.
-- `src/project.rs`: `Project` (aspect, cuts) and `Cut` (input, in, out, its own `Keyframes` in clip time, and an optional `stabilize` that wins over `--stabilize`; the player sets it on every cut, from the picker or S while that cut plays). Keyframes stay pinned to the footage, so moving or trimming a cut keeps its camera moves; those outside in/out are kept for when it is extended again.
+- `src/project.rs`: `Project` (aspect, cuts) and `Cut` (input, in, out, its own `Keyframes` in clip time, and an optional `stabilize` that wins over `--stabilize`; the player sets it on every cut, from the picker or S while that cut plays; and an optional `note`, which the timeline shows after the clip name when there's room, for whoever assembled the edit to say what the cut is for). Keyframes stay pinned to the footage, so moving or trimming a cut keeps its camera moves; those outside in/out are kept for when it is extended again.
 - `src/sheet.rs`: contact sheets for `preview`, with a tiny built-in bitmap font for the time labels.
 - `src/ring.rs`: the seam ring: azimuth φ around lens 0's axis and angle α from it.
 - `src/exposure.rs`: per-frame exposure matching (`Seam::measure`, `Seam::gain`).
