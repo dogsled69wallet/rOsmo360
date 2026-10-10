@@ -71,6 +71,9 @@ In the player:
 | Rolling-shutter correction | R |
 | Mute | M |
 | Reset view / fullscreen | 0 / F |
+| Keyframe the current view | K, or the ◆+ button (on a keyframe, it updates it) |
+| Jump to the previous / next keyframe | `[` / `]`, or click a ◆ on the timeline |
+| Move / delete a keyframe | Drag its ◆ / Delete |
 
 Command-line tools:
 

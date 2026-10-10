@@ -1,5 +1,5 @@
-//! The playback clock: plays from the stream (proxy or scaled OSV) and swaps
-//! in a full-resolution OSV frame whenever playback is paused.
+//! The playback clock: plays from the stream (proxy or scaled OSV) and, if
+//! asked to, swaps in a full-resolution OSV frame whenever playback is paused.
 
 use super::gpu::RS_STEPS_MAX;
 use super::source::{self, Frame, Kind, Stream};
@@ -25,6 +25,9 @@ pub struct Playback {
     preview_only: bool,
     still: Option<(f64, Receiver<Result<Frame>>)>,
     showing_full: bool,
+    /// Swap in a full-resolution frame when paused. Off, a paused frame
+    /// stays the stream's quality, so stopping doesn't change the picture.
+    full_on_pause: bool,
     /// While the seek bar is dragged: whether to resume playing on release,
     /// and the latest position asked for while a preview was still decoding.
     scrub: Option<(bool, Option<f64>)>,
@@ -42,7 +45,7 @@ pub struct Playback {
 }
 
 impl Playback {
-    pub fn new(media: Media, volume: f32) -> Self {
+    pub fn new(media: Media, volume: f32, full_on_pause: bool) -> Self {
         let mut p = Playback {
             media,
             playing: false,
@@ -54,6 +57,7 @@ impl Playback {
             preview_only: false,
             still: None,
             showing_full: false,
+            full_on_pause,
             scrub: None,
             fix: SeamFix::default(),
             audio: None,
@@ -225,7 +229,28 @@ impl Playback {
         if self.scrub.is_some() { self.anchor_pts } else { self.shown_pts }
     }
 
+    /// Turns the full-resolution paused frame on or off, swapping the one on
+    /// screen now if paused.
+    pub fn set_full_on_pause(&mut self, on: bool) {
+        self.full_on_pause = on;
+        if !self.playing && self.scrub.is_none() {
+            if on {
+                self.request_still(self.shown_pts);
+            } else {
+                self.still = None;
+                if self.showing_full {
+                    self.showing_full = false;
+                    self.preview_only = true;
+                    self.start_stream(self.shown_pts);
+                }
+            }
+        }
+    }
+
     fn request_still(&mut self, t: f64) {
+        if !self.full_on_pause {
+            return;
+        }
         let (tx, rx) = channel();
         let (path, tracks, hw) = (self.media.input.clone(), self.media.rig.tracks.clone(), self.media.hw);
         std::thread::spawn(move || {

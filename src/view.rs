@@ -234,28 +234,80 @@ impl Keyframes {
 
     /// The view at clip time `t`; `None` without keyframes.
     pub fn camera_at(&self, t: f64) -> Option<Camera> {
+        let (view, planet) = self.blend(t)?;
+        Some(Camera { planet, ..view.camera() })
+    }
+
+    /// The view at clip time `t` as angles, to carry on from by hand. Mid-
+    /// morph it takes the nearer keyframe's projection.
+    pub fn view_at(&self, t: f64) -> Option<View> {
+        self.blend(t).map(|(view, _)| view)
+    }
+
+    /// The interpolated view at `t`, plus its perspective-to-planet morph.
+    fn blend(&self, t: f64) -> Option<(View, Option<f64>)> {
         let k = &self.0;
         let i = k.partition_point(|f| f.t <= t);
+        let held = |f: &Keyframe| (f.view, f.view.projection.planet());
         if i == 0 || i == k.len() {
-            return k.get(i.saturating_sub(1)).map(|f| f.view.camera());
+            return k.get(i.saturating_sub(1)).map(held);
         }
         let (a, b) = (&k[i - 1], &k[i]);
         let x = ((t - a.t) / (b.t - a.t)).clamp(0.0, 1.0);
         let u = match a.ease {
             Ease::Smooth => x * x * (3.0 - 2.0 * x),
             Ease::Linear => x,
-            Ease::Hold => return Some(a.view.camera()),
+            Ease::Hold => return Some(held(a)),
         };
         let lerp = |p: f64, q: f64| p + (q - p) * u;
         let (va, vb) = (a.view, b.view);
         let zoom = |v: View| (v.fov.to_radians() / 2.0).tan().ln();
-        let view = View { yaw: lerp(va.yaw, vb.yaw), pitch: lerp(va.pitch, vb.pitch), roll: lerp(va.roll, vb.roll), ..va };
+        let near = if u < 0.5 { va } else { vb };
+        let view = View {
+            yaw: lerp(va.yaw, vb.yaw),
+            pitch: lerp(va.pitch, vb.pitch),
+            roll: lerp(va.roll, vb.roll),
+            fov: 2.0 * lerp(zoom(va), zoom(vb)).exp().atan().to_degrees(),
+            projection: near.projection,
+        };
         let planet = match (va.projection.planet(), vb.projection.planet()) {
             (Some(p), Some(q)) => Some(lerp(p, q)),
             // Equirect has no in-between: cut half way.
-            _ => if u < 0.5 { va } else { vb }.projection.planet(),
+            _ => near.projection.planet(),
         };
-        Some(Camera { user: view.matrix(), zoom: lerp(zoom(va), zoom(vb)).exp(), planet })
+        Some((view, planet))
+    }
+
+    /// The keyframe within `tolerance` seconds of `t`, if any.
+    pub fn near(&self, t: f64, tolerance: f64) -> Option<usize> {
+        self.0.iter().position(|f| (f.t - t).abs() <= tolerance)
+    }
+
+    /// Sets the view at `t`: updates a keyframe within `tolerance`, else
+    /// adds one, easing like the keyframe before it. Returns its index.
+    pub fn set(&mut self, t: f64, view: View, tolerance: f64) -> usize {
+        if let Some(i) = self.near(t, tolerance) {
+            self.0[i].view = view;
+            return i;
+        }
+        let i = self.0.partition_point(|f| f.t < t);
+        let ease = i.checked_sub(1).map_or(Ease::default(), |p| self.0[p].ease);
+        self.0.insert(i, Keyframe { t, view, ease });
+        i
+    }
+
+    pub fn remove(&mut self, i: usize) {
+        self.0.remove(i);
+    }
+
+    /// Moves keyframe `i` to time `t`, kept between its neighbours (`gap`
+    /// seconds clear of them) so the order and indices stay as they are.
+    pub fn retime(&mut self, i: usize, t: f64, gap: f64) {
+        let lo = i.checked_sub(1).map_or(f64::NEG_INFINITY, |p| self.0[p].t + gap);
+        let hi = self.0.get(i + 1).map_or(f64::INFINITY, |n| n.t - gap);
+        if lo <= hi {
+            self.0[i].t = t.clamp(lo, hi);
+        }
     }
 }
 
@@ -381,6 +433,21 @@ mod tests {
         assert_eq!(r.aspect.map(|a| a.size(1080)), Some([1080, 1920]));
         let back: Reframe = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn edits_keyframes() {
+        let mut k = Keyframes::default();
+        let v = |yaw| View { yaw, ..View::home(Projection::Perspective) };
+        assert_eq!(k.set(2.0, v(10.0), 0.01), 0);
+        assert_eq!(k.set(1.0, v(0.0), 0.01), 0);
+        assert_eq!(k.set(2.005, v(20.0), 0.01), 1);
+        assert_eq!((k.len(), k[1].view.yaw), (2, 20.0));
+        assert_eq!(k.view_at(1.5).unwrap().yaw, 10.0);
+        k.retime(0, 5.0, 0.1);
+        assert!((k[0].t - 1.9).abs() < 1e-9);
+        k.remove(0);
+        assert_eq!(k.near(2.0, 0.01), Some(0));
     }
 
     #[test]

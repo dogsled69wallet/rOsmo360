@@ -31,7 +31,7 @@ Working and verified on real footage:
   - wgpu shader stitch, drawn as an iced shader widget.
   - Free look on yaw, pitch and roll.
   - Perspective, little-planet and flat equirect projections.
-  - Plays the LRF proxy (or the OSV at 1920 px or full size) and swaps in a full-res frame on pause.
+  - Plays the LRF proxy (or the OSV at 1920 px or full size) and swaps in a full-res frame on pause, unless "Full res when paused" is off (then paused frames stay at the source's quality, which keeps keyframing steady).
   - Sound through cpal, with a mute icon and volume slider. While sound plays it is the playback clock.
   - Aspect lock (Free, 16:9, 9:16, 4:3, 1:1, 2:1) letterboxes the view; a saved view takes the same shape.
   - Shows the Vibing with Ravelund logo while a clip loads, and a "Made by" credit line at the bottom. The logo is `vibewithravelund-lowres-corrected.jpg`, embedded with `include_bytes!`, so it must stay in the repo root.
@@ -82,6 +82,8 @@ Player keys:
 - S: stabilisation mode. R: rolling shutter. P: projection. M: mute.
 - Ctrl+O: open. Seek bar: drag to scrub.
 - 0: reset view. F: fullscreen.
+- K: keyframe the view at the playhead (updates one there). `[` `]`: previous/next keyframe. Del: delete it. On the timeline: click a diamond to jump, drag it to retime.
+- While following keyframes (after play, seek or a keyframe edit) the view comes from them; looking around by hand takes over from that view until the next play or seek.
 
 Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for sound on Linux; PipeWire and PulseAudio serve it through their ALSA plugins.
 
@@ -104,7 +106,8 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
 - `src/imu.rs`: reads telemetry-parser's Quaternion/Gyro/Accel tags.
 - `src/ffmpeg.rs`: RGB decode/encode through the ffmpeg CLI (used by `stitch`/`render`/photo save, hardware-decoded when possible), plus `Hwaccel` probing and the player's NV12 decode command.
 - `src/player/`:
-  - `mod.rs`: iced app: clip loading, widgets, keys, and the `Sphere` shader widget (drag/scroll to look).
+  - `mod.rs`: iced app: clip loading, widgets, keys, and the `Sphere` shader widget (drag/scroll to look). The open clip is a `project::Cut` holding its keyframes; `follow` says whether the view comes from them or from free look.
+  - `timeline.rs`: canvas timeline (seek bar with keyframe diamonds: click to jump, drag to retime).
   - `playback.rs`: playback clock, streams and full-res stills.
   - `gpu.rs`: iced shader `Primitive`/`Pipeline`: uniforms and NV12 textures, uploaded once per frame id.
   - `shader.wgsl`: GPU port of `stitch.rs`.

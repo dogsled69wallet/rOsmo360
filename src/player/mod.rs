@@ -7,16 +7,18 @@ mod export;
 mod gpu;
 mod playback;
 mod source;
+mod timeline;
 
 use crate::ffmpeg::{self, Hwaccel};
 use crate::stab::{ImuAxes, Mode, Stabilizer};
+use crate::project::Cut;
 use crate::stitch::M3;
 use crate::view::{Camera, Projection, View};
 use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
 use iced::mouse;
-use iced::widget::{button, center, column, container, image, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
+use iced::widget::{button, canvas, center, column, container, image, pick_list, responsive, row, shader, slider, space, svg, text, toggler, tooltip};
 use iced::window;
 use iced::{Alignment, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme};
 use playback::Playback;
@@ -171,6 +173,8 @@ impl fmt::Display for Source {
 struct Clip {
     playback: Playback,
     shown: Option<Arc<Shown>>,
+    /// The clip as a cut, holding its keyframes.
+    cut: Cut,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +188,14 @@ enum Message {
     Toggle,
     Scrub(f64),
     ScrubDone,
+    /// Add a keyframe with the current view at the playhead, or update the
+    /// one there.
+    KeyAdd,
+    /// Delete the keyframe at the playhead.
+    KeyDelete,
+    KeyJump(usize),
+    /// Drag keyframe `.0` to time `.1`.
+    KeyMove(usize, f64),
     Look { yaw: f64, pitch: f64, roll: f64 },
     /// Scroll notches; positive zooms out.
     Zoom(f64),
@@ -192,6 +204,7 @@ enum Message {
     Projection(Projection),
     Source(Source),
     RollingShutter(bool),
+    FullOnPause(bool),
     Mute,
     Volume(f32),
     Aspect(Aspect),
@@ -213,8 +226,14 @@ struct App {
     clip: Option<Clip>,
     loading: Option<PathBuf>,
     error: Option<String>,
+    /// The free-look view: what is shown unless following keyframes.
     look: View,
+    /// Show the keyframes' view rather than `look`. Playing, seeking and
+    /// keyframe edits turn it on; looking around by hand turns it off.
+    follow: bool,
     rolling_shutter: bool,
+    /// Show a full-resolution frame when paused.
+    full_on_pause: bool,
     fullscreen: bool,
     volume: f32,
     muted: bool,
@@ -234,7 +253,9 @@ impl App {
             loading: None,
             error: None,
             look: View::default(),
+            follow: true,
             rolling_shutter: true,
+            full_on_pause: true,
             fullscreen: false,
             volume: 1.0,
             muted: false,
@@ -299,32 +320,69 @@ impl App {
                 match Arc::into_inner(result).expect("loaded clip is not shared") {
                     Ok(media) => {
                         self.opts.hw = Some(media.hw);
-                        let playback = Playback::new(media, self.volume());
+                        let cut = Cut { input: media.input.clone(), start: 0.0, end: media.duration, keyframes: Default::default() };
+                        let playback = Playback::new(media, self.volume(), self.full_on_pause);
                         self.error = playback.error.clone();
-                        self.clip = Some(Clip { playback, shown: None });
+                        self.clip = Some(Clip { playback, shown: None, cut });
+                        self.follow = true;
                     }
                     Err(e) => self.error = Some(e),
                 }
             }
             Message::Tick => self.tick(),
             Message::Key(key, mods) => return self.key(key, mods),
-            Message::Toggle => self.with_playback(Playback::toggle),
-            Message::Scrub(t) => self.with_playback(|p| p.scrub(t)),
-            Message::ScrubDone => self.with_playback(Playback::scrub_end),
-            Message::Look { yaw, pitch, roll } => {
-                self.look.yaw += yaw.to_degrees();
-                self.look.pitch += pitch.to_degrees();
-                self.look.roll += roll.to_degrees();
+            Message::Toggle => {
+                self.follow = true;
+                self.with_playback(Playback::toggle);
             }
-            Message::Zoom(deg) => self.look.zoom_by(deg),
-            Message::Fov(deg) => self.look.fov = deg,
+            Message::Scrub(t) => {
+                self.follow = true;
+                self.with_playback(|p| p.scrub(t));
+            }
+            Message::ScrubDone => self.with_playback(Playback::scrub_end),
+            Message::KeyAdd => {
+                let view = self.shown_view();
+                let tolerance = self.tolerance();
+                if let Some(c) = &mut self.clip {
+                    c.cut.keyframes.set(c.playback.shown_pts, view, tolerance);
+                    self.follow = true;
+                }
+            }
+            Message::KeyDelete => {
+                if let (Some(i), Some(c)) = (self.current_key(), &mut self.clip) {
+                    c.cut.keyframes.remove(i);
+                }
+            }
+            Message::KeyJump(i) => {
+                self.follow = true;
+                if let Some(t) = self.clip.as_ref().and_then(|c| c.cut.keyframes.get(i)).map(|k| k.t) {
+                    self.with_playback(|p| p.seek(t));
+                }
+            }
+            Message::KeyMove(i, t) => {
+                self.follow = true;
+                if let Some(c) = &mut self.clip {
+                    c.cut.keyframes.retime(i, t, 1.0 / c.playback.media.fps);
+                    let t = c.cut.keyframes[i].t;
+                    c.playback.scrub(t);
+                }
+            }
+            Message::Look { yaw, pitch, roll } => {
+                let look = self.free_look();
+                look.yaw += yaw.to_degrees();
+                look.pitch += pitch.to_degrees();
+                look.roll += roll.to_degrees();
+            }
+            Message::Zoom(deg) => self.free_look().zoom_by(deg),
+            Message::Fov(deg) => self.free_look().fov = deg,
             Message::Stab(mode) => {
                 self.opts.stabilize = mode;
                 self.with_playback(|p| p.media.stab.set_mode(mode));
             }
             Message::Projection(p) => {
-                self.look.projection = p;
-                self.look.reset();
+                let look = self.free_look();
+                look.projection = p;
+                look.reset();
             }
             Message::Source(s) => {
                 let size = match s {
@@ -335,6 +393,10 @@ impl App {
                 self.with_playback(|p| p.set_osv_size(size));
             }
             Message::RollingShutter(on) => self.rolling_shutter = on,
+            Message::FullOnPause(on) => {
+                self.full_on_pause = on;
+                self.with_playback(|p| p.set_full_on_pause(on));
+            }
             Message::ViewSize(size) => self.view_size = size,
             Message::Aspect(a) => self.aspect = a,
             Message::ThemeChanged => self.theme = system_theme(),
@@ -366,7 +428,7 @@ impl App {
                         // Even sizes keep image tools that halve chroma happy.
                         let px = |v: f32| ((v * k / 2.0).round() as usize).max(1) * 2;
                         export::Shot::View {
-                            camera: self.look.camera(),
+                            camera: self.camera(),
                             size: (px(self.view_size.width), px(self.view_size.height)),
                         }
                     }
@@ -402,7 +464,7 @@ impl App {
                 self.muted = false;
                 self.with_playback(|p| p.set_volume(v));
             }
-            Message::ResetView => self.look.reset(),
+            Message::ResetView => self.free_look().reset(),
             Message::Fullscreen => {
                 self.fullscreen = !self.fullscreen;
                 let mode = if self.fullscreen { window::Mode::Fullscreen } else { window::Mode::Windowed };
@@ -410,6 +472,54 @@ impl App {
             }
         }
         Task::none()
+    }
+
+    /// Half a frame: how near the playhead must be to sit on a keyframe.
+    fn tolerance(&self) -> f64 {
+        self.clip.as_ref().map_or(0.0, |c| 0.5 / c.playback.media.fps)
+    }
+
+    /// The keyframe at the shown frame, if there is one.
+    fn current_key(&self) -> Option<usize> {
+        let c = self.clip.as_ref()?;
+        c.cut.keyframes.near(c.playback.shown_pts, self.tolerance())
+    }
+
+    /// The view on screen, as angles.
+    fn shown_view(&self) -> View {
+        match &self.clip {
+            Some(c) if self.follow => c.cut.keyframes.view_at(c.playback.shown_pts).unwrap_or(self.look),
+            _ => self.look,
+        }
+    }
+
+    /// The view on screen, ready to draw: mid-morph between perspective and
+    /// little planet when following keyframes.
+    fn camera(&self) -> Camera {
+        match &self.clip {
+            Some(c) if self.follow => c.cut.keyframes.camera_at(c.playback.shown_pts).unwrap_or_else(|| self.look.camera()),
+            _ => self.look.camera(),
+        }
+    }
+
+    /// The view to change by hand: stops following keyframes, carrying on
+    /// from the view they show now.
+    fn free_look(&mut self) -> &mut View {
+        if self.follow {
+            self.look = self.shown_view();
+            self.follow = false;
+        }
+        &mut self.look
+    }
+
+    /// Jumps to the nearest keyframe before (`-1`) or after (`1`) the playhead.
+    fn key_step(&mut self, dir: f64) -> Task<Message> {
+        let tolerance = self.tolerance();
+        let Some(c) = &self.clip else { return Task::none() };
+        let now = c.playback.shown_pts;
+        let keys = &c.cut.keyframes;
+        let next = if dir < 0.0 { keys.iter().rposition(|k| k.t < now - tolerance) } else { keys.iter().position(|k| k.t > now + tolerance) };
+        next.map_or(Task::none(), |i| self.update(Message::KeyJump(i)))
     }
 
     fn with_playback(&mut self, f: impl FnOnce(&mut Playback)) {
@@ -432,22 +542,35 @@ impl App {
         match key.as_ref() {
             Key::Named(Named::Escape) if self.fullscreen => return self.update(Message::Fullscreen),
             Key::Named(Named::Space) => self.with_playback(Playback::toggle),
-            Key::Named(Named::ArrowLeft) if mods.shift() => self.look.yaw -= 2.0 * step,
-            Key::Named(Named::ArrowRight) if mods.shift() => self.look.yaw += 2.0 * step,
-            Key::Named(Named::ArrowLeft) => self.with_playback(|p| p.seek(p.shown_pts - 5.0)),
-            Key::Named(Named::ArrowRight) => self.with_playback(|p| p.seek(p.shown_pts + 5.0)),
-            Key::Named(Named::ArrowUp) => self.look.pitch += step,
-            Key::Named(Named::ArrowDown) => self.look.pitch -= step,
-            Key::Named(Named::Home) => self.look.reset(),
+            Key::Named(Named::ArrowLeft) if mods.shift() => self.free_look().yaw -= 2.0 * step,
+            Key::Named(Named::ArrowRight) if mods.shift() => self.free_look().yaw += 2.0 * step,
+            Key::Named(Named::ArrowLeft) => {
+                self.follow = true;
+                self.with_playback(|p| p.seek(p.shown_pts - 5.0));
+            }
+            Key::Named(Named::ArrowRight) => {
+                self.follow = true;
+                self.with_playback(|p| p.seek(p.shown_pts + 5.0));
+            }
+            Key::Named(Named::ArrowUp) => self.free_look().pitch += step,
+            Key::Named(Named::ArrowDown) => self.free_look().pitch -= step,
+            Key::Named(Named::Home) => self.free_look().reset(),
+            Key::Named(Named::Delete | Named::Backspace) => return self.update(Message::KeyDelete),
             Key::Character(c) => match c {
                 "o" if mods.command() => return self.update(Message::Open),
-                "q" | "Q" => self.look.roll -= step,
-                "e" | "E" => self.look.roll += step,
-                "0" => self.look.reset(),
-                "," => self.with_playback(|p| p.step(-1.0)),
-                "." => self.with_playback(|p| p.step(1.0)),
-                "+" | "=" => self.look.zoom_by(-1.0),
-                "-" => self.look.zoom_by(1.0),
+                "q" | "Q" => self.free_look().roll -= step,
+                "e" | "E" => self.free_look().roll += step,
+                "0" => self.free_look().reset(),
+                "k" | "K" => return self.update(Message::KeyAdd),
+                "[" => return self.key_step(-1.0),
+                "]" => return self.key_step(1.0),
+                "," | "." => {
+                    self.follow = true;
+                    let frames = if c == "," { -1.0 } else { 1.0 };
+                    self.with_playback(|p| p.step(frames));
+                }
+                "+" | "=" => self.free_look().zoom_by(-1.0),
+                "-" => self.free_look().zoom_by(1.0),
                 "s" | "S" => {
                     let mode = self.clip.as_ref().map_or(self.opts.stabilize, |c| c.playback.media.stab.mode());
                     let next = match mode {
@@ -460,7 +583,7 @@ impl App {
                 "r" | "R" => self.rolling_shutter = !self.rolling_shutter,
                 "m" | "M" => return self.update(Message::Mute),
                 "p" | "P" => {
-                    let i = Projection::ALL.iter().position(|&p| p == self.look.projection).unwrap_or(0);
+                    let i = Projection::ALL.iter().position(|&p| p == self.shown_view().projection).unwrap_or(0);
                     return self.update(Message::Projection(Projection::ALL[(i + 1) % Projection::ALL.len()]));
                 }
                 "f" | "F" => return self.update(Message::Fullscreen),
@@ -504,14 +627,15 @@ impl App {
             .padding([6, 10])
             .align_y(Alignment::Center);
 
+        let shown_view = self.shown_view();
         let view: Element<'_, Message> = match &clip.shown {
             Some(shown) => {
                 let sphere = Sphere {
                     rig: media.rig.clone(),
                     shown: shown.clone(),
-                    camera: self.look.camera(),
+                    camera: self.camera(),
                     rig_from_view: p.rig_from_view(self.rolling_shutter),
-                    fov_deg: self.look.fov,
+                    fov_deg: shown_view.fov,
                 };
                 let aspect = self.aspect;
                 // A locked aspect is the largest box of that shape that fits.
@@ -534,6 +658,7 @@ impl App {
         let view = container(view).width(Length::Fill).height(Length::Fill).style(|_| container::background(iced::Color::BLACK));
 
         let last = (media.duration - 1.0 / media.fps).max(0.0);
+        let current = self.current_key();
         let transport = row![
             button(text(if p.playing { "Pause" } else { "Play" }).width(48).align_x(Alignment::Center)).on_press(Message::Toggle),
             tooltip(
@@ -547,7 +672,20 @@ impl App {
                 tooltip::Position::Top,
             ),
             text(format!("{} / {}", clock(p.position()), clock(media.duration))),
-            slider(0.0..=last, p.position().min(last), Message::Scrub).step(1.0 / media.fps).on_release(Message::ScrubDone),
+            tooltip(
+                icon_button(KEY_ADD, Some(Message::KeyAdd)),
+                text(if current.is_some() { "Update this keyframe with the view (K)" } else { "Add a keyframe with this view (K)" }),
+                tooltip::Position::Top,
+            ),
+            tooltip(icon_button(KEY_DELETE, current.map(|_| Message::KeyDelete)), text("Delete this keyframe (Del)"), tooltip::Position::Top),
+            canvas(timeline::Timeline {
+                duration: last,
+                position: p.position().min(last),
+                keys: clip.cut.keyframes.iter().map(|k| k.t).collect(),
+                current,
+            })
+            .width(Length::Fill)
+            .height(24),
             tooltip(
                 button(svg(svg::Handle::from_memory(if self.muted { SPEAKER_MUTED } else { SPEAKER })).width(20).height(20))
                     .padding(5)
@@ -572,14 +710,19 @@ impl App {
             (None, Some(_)) => Source::Proxy,
             (size, _) => Source::Osv(size.unwrap_or(1920)),
         };
-        let (lo, hi) = self.look.fov_range();
+        let (lo, hi) = shown_view.fov_range();
         let controls = row![
             labelled("Stabilisation", pick_list(&Mode::ALL[..], Some(media.stab.mode()), Message::Stab)),
-            labelled("Projection", pick_list(&Projection::ALL[..], Some(self.look.projection), Message::Projection)),
+            labelled("Projection", pick_list(&Projection::ALL[..], Some(shown_view.projection), Message::Projection)),
             labelled("Playback source", pick_list(sources, Some(source), Message::Source)),
             labelled("Aspect", pick_list(&Aspect::ALL[..], Some(self.aspect), Message::Aspect)),
-            labelled("FOV", slider(lo..=hi, self.look.fov, Message::Fov).width(120)),
+            labelled("FOV", slider(lo..=hi, shown_view.fov, Message::Fov).width(120)),
             toggler(self.rolling_shutter).label("Rolling shutter").on_toggle(Message::RollingShutter),
+            tooltip(
+                toggler(self.full_on_pause).label("Full res when paused").on_toggle(Message::FullOnPause),
+                text("Off: paused frames stay at the playback source's quality"),
+                tooltip::Position::Top,
+            ),
             button("Reset view").on_press(Message::ResetView),
             button(if self.fullscreen { "Exit fullscreen" } else { "Fullscreen" }).on_press(Message::Fullscreen),
         ]
@@ -601,6 +744,14 @@ const LOGO: &[u8] = include_bytes!("../../vibewithravelund-lowres-corrected.jpg"
 /// was built.
 fn credit<'a>() -> Element<'a, Message> {
     container(text(concat!("rOsmo360 ", env!("CARGO_PKG_VERSION"), " · Made by Vibing with Ravelund · 2026")).size(12).style(text::secondary)).width(Length::Fill).align_x(Alignment::Center).padding([2, 10]).into()
+}
+
+/// Keyframe icons: a diamond with a plus (add or update) or a cross (delete).
+const KEY_ADD: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M10 2 18 10 10 18 2 10z" fill="white"/><path d="M19 15v8M15 19h8" stroke-linecap="round"/></svg>"#;
+const KEY_DELETE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M10 2 18 10 10 18 2 10z"/><path d="m16 16 6 6M22 16l-6 6" stroke-linecap="round"/></svg>"#;
+
+fn icon_button<'a>(icon: &'static [u8], on_press: Option<Message>) -> Element<'a, Message> {
+    button(svg(svg::Handle::from_memory(icon)).width(20).height(20)).padding(5).on_press_maybe(on_press).into()
 }
 
 /// Speaker icons for the mute button, drawn in the button's text colour.
