@@ -60,7 +60,9 @@ Not done yet, roughly in priority order:
    4. A `track` command for a colour, as a second follow source (`"follow": "track.csv"`). Track on sphere directions or in a perspective view around the last position, not on the equirect (it stretches at the poles).
    5. `scan --image`: opt-in columns from a low-res proxy stitch (open-sky fraction, horizon openness; maybe a "drop below" estimate). Opt-in because it decodes (~2 min on 0036) while plain `scan` reads only telemetry.
    Not chosen: person detection (needs an ONNX model; heavy dependency, YOLO is AGPL). Update the highlights skill with each step.
-8. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
+8. **Colour: D-Log M and a 10-bit pipeline (a later release, agreed with the user 2026-10-10; they will film D-Log M sample footage).** Together, because log footage needs the bits.
+   - Today (0.2.6) a D-Log clip should load and export, flat and untransformed, but only in 8 bits: GPU export uploads NV12, CPU export decodes rgb24, and `--format resolve` writes 8-bit DNxHR HQ. The log curve survives for grading in Resolve; the precision doesn't, so heavy grades may band. Exposure matching assumes display-space colour and may even the seam less well on log (unmeasured).
+   - Plan: P010 textures and a 16-bit render target; the Resolve format as 10-bit DNxHR HQX (`dnxhr_hqx`, `yuv422p10le`), left in log for grading; read the colour mode so the player and MP4 export apply a D-Log M → Rec.709 LUT, and tag the output's colour correctly.
    - Needs a D-Log M sample clip first: all 35 Kyrkja clips are normal colour, tagged BT.709 10-bit, as DJI may also tag D-Log.
    - DJI records the profile in `StreamMeta.color_mode` (`ColorModeType`: D_LOG = 2, HLG = 9, …). telemetry-parser's Metadata tag only serialises the clip meta, so reading it means decoding StreamMeta ourselves.
 
