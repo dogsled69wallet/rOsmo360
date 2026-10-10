@@ -20,6 +20,7 @@ Working and verified on real footage:
   - `imu`: dump attitude CSV.
   - `stitch`: one frame to an equirect PNG.
   - `render`: span to an equirect MP4 with audio.
+  - `seam`: seam alignment quality over a span (ghosting left, frame-to-frame wobble).
 - **Real-time player** (`play`), an iced GUI:
   - Open dialog (Ctrl+O), seek bar, and pickers for stabilisation, projection, playback source, FOV and rolling shutter.
   - wgpu shader stitch, drawn as an iced shader widget.
@@ -37,7 +38,7 @@ Not done yet, roughly in priority order:
 
 1. **Zero-copy decode.** Hand Vulkan Video frames to wgpu without the CPU round trip. This would allow full-res playback on the dev laptop.
 2. **Seam ghosting, next step.** Patch matching is tuned out (see Seam below); what ghosting is left needs per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
-3. **Export from the player** with the current view or keyframed reframing to a flat MP4. Also write spherical metadata on equirect export.
+3. **Export from the player (deferred: it stays a player for now).** The current view or keyframed reframing to a flat MP4, and spherical metadata on equirect export. Photo save (PNG) is done.
 4. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
    - Needs a D-Log M sample clip first: all 35 Kyrkja clips are normal colour, tagged BT.709 10-bit, as DJI may also tag D-Log.
    - DJI records the profile in `StreamMeta.color_mode` (`ColorModeType`: D_LOG = 2, HLG = 9, …). telemetry-parser's Metadata tag only serialises the clip meta, so reading it means decoding StreamMeta ourselves.
@@ -68,6 +69,7 @@ Player keys:
 - Scroll: zoom.
 - Space: play/pause. ←/→: seek ±5 s. `,` `.`: frame step.
 - S: stabilisation mode. R: rolling shutter. P: projection. M: mute.
+- Ctrl+O: open. Seek bar: drag to scrub.
 - 0: reset view. F: fullscreen.
 
 Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for sound on Linux; PipeWire and PulseAudio serve it through their ALSA plugins.
