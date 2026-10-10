@@ -82,6 +82,7 @@ Player keys:
 - S: stabilisation mode. R: rolling shutter. P: projection. M: mute.
 - Ctrl+O: open. Seek bar: drag to scrub.
 - 0: reset view. F: fullscreen.
+- Ctrl+O / Add clip…: append clips (several at once) as cuts. C: split the cut at the playhead. Drag a cut's edge to trim it, drag the cut to move it. Shift+Del: delete the selected cut. Ctrl+Z / Ctrl+Shift+Z: undo / redo. Ctrl+S / Ctrl+Shift+S / Ctrl+Shift+O: save / save as / open a project (`project::Project` JSON, the file `export` reads; clips under the project's folder are stored relative). `play edit.json` opens one.
 - K: keyframe the view at the playhead (updates one there). `[` `]`: previous/next keyframe. Del: delete it. On the timeline: click a diamond to jump, drag it to retime.
 - While following keyframes (after play, seek or a keyframe edit) the view comes from them; looking around by hand takes over from that view until the next play or seek.
 
@@ -107,7 +108,8 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
 - `src/ffmpeg.rs`: RGB decode/encode through the ffmpeg CLI (used by `stitch`/`render`/photo save, hardware-decoded when possible), plus `Hwaccel` probing and the player's NV12 decode command.
 - `src/player/`:
   - `mod.rs`: iced app: clip loading, widgets, keys, and the `Sphere` shader widget (drag/scroll to look). The open clip is a `project::Cut` holding its keyframes; `follow` says whether the view comes from them or from free look.
-  - `timeline.rs`: canvas timeline (seek bar with keyframe diamonds: click to jump, drag to retime).
+  - `timeline.rs`: canvas timeline. The top row shows the cuts as blocks (select, move, trim at the edges); the bottom row is the seek bar with the keyframe diamonds (click to jump, drag to retime).
+  - `edit.rs`: the edit (cuts in order) with undo/redo snapshots, split/trim/move, and edit-time ↔ (cut, clip time). The app keeps a library of loaded `Media` and makes a fresh `Playback` when the playhead crosses into another clip's cut; `tick` plays on into the next cut at an out point.
   - `playback.rs`: playback clock, streams and full-res stills.
   - `gpu.rs`: iced shader `Primitive`/`Pipeline`: uniforms and NV12 textures, uploaded once per frame id.
   - `shader.wgsl`: GPU port of `stitch.rs`.

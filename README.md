@@ -56,6 +56,8 @@ The program is `target/release/rosmo360`.
 ```sh
 rosmo360 play                 # opens the player; use Open… or Ctrl+O
 rosmo360 play clip.OSV        # opens a clip straight away
+rosmo360 play a.OSV b.OSV     # several clips, one after another on the timeline
+rosmo360 play edit.json       # a saved project
 ```
 
 In the player:
@@ -74,6 +76,14 @@ In the player:
 | Keyframe the current view | K, or the ◆+ button (on a keyframe, it updates it) |
 | Jump to the previous / next keyframe | `[` / `]`, or click a ◆ on the timeline |
 | Move / delete a keyframe | Drag its ◆ / Delete |
+| Add clips to the edit | Add clip… (Ctrl+O); several at once is fine |
+| Split the cut at the playhead | C, or ✂ |
+| Trim / move a cut | Drag its edge / drag the cut on the timeline |
+| Delete the selected cut | Shift+Delete, or 🗑 |
+| Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
+| Save / open a project | Ctrl+S (Ctrl+Shift+S: save as) / Ctrl+Shift+O |
+
+A project saves the cuts, their keyframes and the aspect lock, in the same file `rosmo360 export` renders (see below). Clips in the project's folder are stored by relative path, so the folder can be moved as a whole.
 
 Command-line tools:
 

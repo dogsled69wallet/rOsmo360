@@ -52,6 +52,19 @@ impl Project {
         Ok(project)
     }
 
+    /// Writes the project as JSON. Clips in the project's folder or below
+    /// are stored relative to it, so the folder can move as a whole.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let dir = path.parent().unwrap_or(Path::new(""));
+        let mut project = self.clone();
+        for cut in &mut project.cuts {
+            if let Ok(rel) = cut.input.strip_prefix(dir) {
+                cut.input = rel.to_owned();
+            }
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&project)? + "\n").with_context(|| format!("writing {}", path.display()))
+    }
+
     /// Length of the edit in seconds.
     pub fn duration(&self) -> f64 {
         self.cuts.iter().map(|c| c.end - c.start).sum()
@@ -88,6 +101,10 @@ mod tests {
         assert_eq!(p.duration(), 16.0);
         assert_eq!(p.cuts[1].keyframes.len(), 0);
         assert_eq!(p.cuts[0].keyframes[1].view.projection, Projection::LittlePlanet);
+        let saved = dir.join("again.json");
+        p.save(&saved).unwrap();
+        assert!(std::fs::read_to_string(&saved).unwrap().contains(r#""input": "a.OSV""#));
+        assert_eq!(Project::load(&saved).unwrap(), p);
         std::fs::write(&path, r#"{"cuts": [{"input": "a.OSV", "in": 5, "out": 2}]}"#).unwrap();
         assert!(Project::load(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();

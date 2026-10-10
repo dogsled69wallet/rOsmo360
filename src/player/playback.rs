@@ -46,6 +46,8 @@ pub struct Playback {
     sound_waits: bool,
     volume: f32,
     pub error: Option<String>,
+    /// Playback reached the end of the clip and stopped.
+    pub ended: bool,
 }
 
 impl Playback {
@@ -68,8 +70,9 @@ impl Playback {
             sound_waits: false,
             volume,
             error: None,
+            ended: false,
         };
-        p.play();
+        p.seek(0.0);
         p
     }
 
@@ -155,6 +158,7 @@ impl Playback {
             self.shown_pts = 0.0;
         }
         self.playing = true;
+        self.ended = false;
         self.preview_only = false;
         self.still = None;
         self.anchor_pts = self.shown_pts;
@@ -175,6 +179,7 @@ impl Playback {
     /// Jumps to `t`. While paused a proxy frame shows first, then the
     /// full-resolution one.
     pub fn seek(&mut self, t: f64) {
+        self.ended = false;
         let t = self.snap(t);
         self.anchor_pts = t;
         if self.playing {
@@ -186,6 +191,31 @@ impl Playback {
             self.start_stream(t);
             self.request_still(t);
         }
+    }
+
+    /// Goes to `t`, then plays or stays paused.
+    pub fn jump(&mut self, t: f64, play: bool) {
+        match (play, self.playing) {
+            (true, true) => self.seek(t),
+            (true, false) => {
+                self.shown_pts = self.snap(t);
+                self.play();
+            }
+            (false, playing) => {
+                if playing {
+                    self.playing = false;
+                    self.hold_sound();
+                    self.stream = None;
+                    self.pending = None;
+                }
+                self.seek(t);
+            }
+        }
+    }
+
+    /// The playback clock: where playback is now, between frames too.
+    pub fn now(&self) -> f64 {
+        self.clock()
     }
 
     pub fn step(&mut self, frames: f64) {
@@ -326,6 +356,7 @@ impl Playback {
             }
             if ended && self.playing {
                 self.pause();
+                self.ended = true;
             }
         }
         if let Some((t, size, rx)) = &self.still {

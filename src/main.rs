@@ -53,10 +53,12 @@ enum Cmd {
     /// Drag: look around · right-drag or Q/E: roll · arrows: pitch, seek (shift: yaw) ·
     /// scroll: zoom · space: play/pause · , .: frame step · S: stabilisation ·
     /// R: rolling shutter · P: projection · M: mute · 0: reset view · F: fullscreen · Ctrl+O: open ·
-    /// K: keyframe the view here · [ ]: previous/next keyframe · Del: delete keyframe
+    /// K: keyframe the view here · [ ]: previous/next keyframe · Del: delete keyframe ·
+    /// C: split the cut · Shift+Del: delete the selected cut · Ctrl+Z / Ctrl+Shift+Z: undo / redo
     Play {
-        /// Clip to open at start; otherwise use the Open button.
-        input: Option<PathBuf>,
+        /// Clips to open at start, one cut each in this order, or a saved
+        /// project (.json); otherwise use the Open buttons.
+        input: Vec<PathBuf>,
         /// Stream the OSV itself at this size (pixels square) instead of the LRF proxy.
         #[arg(long)]
         osv_size: Option<u32>,
