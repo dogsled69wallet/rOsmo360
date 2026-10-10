@@ -1,0 +1,8 @@
+#!/bin/sh
+# Without a command (double-clicked, or given clips or a project) open the player;
+# otherwise run the command line as usual: `rOsmo360-x86_64.AppImage export ...`.
+here="$(dirname "$(readlink -f "$0")")"
+case "${1:-}" in
+    ""|*.OSV|*.osv|*.json|*/*) exec "$here/usr/bin/rosmo360" play "$@" ;;
+    *) exec "$here/usr/bin/rosmo360" "$@" ;;
+esac

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=rOsmo360
+GenericName=360° Video Editor
+Comment=Play and edit DJI Osmo 360 footage
+Exec=rosmo360 play %F
+Icon=rosmo360
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+Keywords=360;Osmo;DJI;OSV;video;stitch;reframe;
+StartupWMClass=rOsmo360

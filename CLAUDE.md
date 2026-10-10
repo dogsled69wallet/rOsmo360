@@ -4,7 +4,7 @@ A Rust/Linux replacement for DJI Studio's playback of DJI Osmo 360 `.OSV` footag
 
 The tool is called **rOsmo360** (the r is for its Rust core); the window title, app id and `--help` use that name. The crate and binary are `rosmo360` (renamed from `osmo360` on 2026-10-10).
 
-## Status (2026-10-10, branch `timeline`)
+## Status (2026-10-10, version 0.2.5)
 
 Working and verified on real footage:
 
@@ -48,7 +48,6 @@ Not done yet, roughly in priority order:
 4. **Seam, what's left.** Patch matching is tuned out, the stick is handled by the cut, and the sky by detail-only matching (see Seam below). Further gains need per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
 5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), stabilisation per cut, thumbnails on the cut blocks, timeline zoom, `preview` of projects, GPU export, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
    - Spherical metadata on equirect export.
-   - Merging `timeline` into master and releasing (0.2.0?) when the user says so.
 6. **Version 0.3 (agreed with the user, 2026-10-10): crossfades and sound.**
    - Crossfades between cuts (picture and sound), in the player and the export.
    - Music: a track under the edit, with its level.
@@ -128,6 +127,15 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
   - `audio.rs`: ffmpeg → f32 PCM → cpal output; frames played minus device latency give the clock.
   - `settings.rs`: settings remembered between runs (stabilisation, playback source, rolling shutter, full res when paused, volume/mute, export resolution, aspect lock) in `~/.config/rosmo360/settings.json` (XDG; `%APPDATA%` on Windows, Application Support on macOS). `App::update` saves them whenever a message changes them; `play --stabilize/--osv-size` override.
   - `export.rs`: PNG save of the paused frame.
+
+## Releasing
+
+`packaging/build-release.sh` writes the GitHub release files into `dist/`: `rosmo360-x86_64-linux.tar.gz` (binary, `install.sh`, menu entry, icons), `rOsmo360-x86_64.AppImage`, `install.sh` alone and `SHA256SUMS`. The names carry no version, so `releases/latest/download/<name>` (which `install.sh` downloads when run on its own) stays valid.
+
+- It builds in an Ubuntu 22.04 container (`packaging/Dockerfile`): built on CachyOS the binary needs glibc 2.44 and won't start on Ubuntu 24.04 or Debian 12; this one needs 2.35. Checked on clean ubuntu:22.04 and debian:12 containers.
+- The binary links only libasound, libgcc_s, libm and libc; iced loads Vulkan, Wayland and X11 at run time. The AppImage bundles nothing else: ffmpeg comes from the system, because a bundled (static) ffmpeg would lack the VA-API, Vulkan and CUDA decoders full-res stills and export depend on, and a bundled libasound would miss the system's PipeWire/Pulse ALSA plugins.
+- `AppRun` opens the player when given nothing, a clip or a project, and otherwise passes the command line through.
+- The icon is `packaging/rosmo360.svg` (`rosmo360.png` is rendered from it with `rsvg-convert -w 256`); the desktop file is `rOsmo360.desktop`, matching the app id so Wayland compositors find the icon.
 
 ## Hard-won facts (do not re-derive)
 

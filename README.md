@@ -55,13 +55,26 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 
 Developed and tested on Linux (KDE Plasma, NVIDIA RTX 3090). Windows and macOS builds are planned but not yet tested.
 
+## Installing
+
+Ready-made builds for x86_64 Linux are on the [releases page](https://github.com/ravelund/rOsmo360/releases/latest). They run on Ubuntu 22.04, Debian 12, Fedora 36 and newer distributions. Install `ffmpeg` from your distribution first; the builds use it, and its GPU decoders, from the system.
+
+- **Install script**: puts `rosmo360` in `~/.local/bin` and adds rOsmo360 to the application menu.
+
+  ```sh
+  curl -fsSL https://github.com/ravelund/rOsmo360/releases/latest/download/install.sh | sh
+  ```
+
+  Or download `rosmo360-x86_64-linux.tar.gz`, unpack it and run `./install.sh` in it. `--prefix /usr/local` (as root) installs for all users, and `--uninstall` removes it again.
+- **AppImage**: download `rOsmo360-x86_64.AppImage`, make it executable (`chmod +x`) and run it. Without arguments, or given clips or a project, it opens the player. Commands work as with `rosmo360`: `./rOsmo360-x86_64.AppImage export clip.OSV -o out.mp4`.
+
 ## Building
 
 ```sh
 cargo build --release
 ```
 
-The program is `target/release/rosmo360`.
+The program is `target/release/rosmo360`. `packaging/build-release.sh` builds the release files into `dist/`, inside an Ubuntu 22.04 container (docker), so they run on older distributions too.
 
 ## Usage
 
