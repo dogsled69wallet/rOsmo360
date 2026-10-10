@@ -189,6 +189,8 @@ How it was found:
 - Convert to NV12 and scale on the CPU. GPU filters are not portable: on NVIDIA, `scale_vaapi` (nvidia-vaapi-driver) and `scale_vulkan` to NV12 fail, and `scale_cuda` was slower. The cost is decode plus download, not conversion.
 - RTX 3090: Vulkan decodes one lens at 3.2× real time (CUDA 3.7×). Both lenses at full 3840² run at about 1.1× (Vulkan) to 1.3× (CUDA) real time, which is enough for full-res playback.
 
+- Starting an ffmpeg decode costs ~1 s for Vulkan setup and ~0.5 s for CUDA, before any frame. For one proxy (H.264) frame, software takes 0.15 s, so the proxy always decodes in software: 4× real time on one thread, 8× on four. That made scrubbing responsive. One OSV (HEVC 10-bit 3840²) frame still needs the GPU: 1.5 s on Vulkan, 8 s in software.
+
 ### Decode performance on the dev laptop (Intel UHD 620)
 
 - VA-API HEVC decode alone runs at about 3× real time per lens.

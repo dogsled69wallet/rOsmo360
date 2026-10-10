@@ -23,10 +23,14 @@ pub struct Playback {
     pending: Option<Frame>,
     /// While paused, a stream is only kept for its first frame.
     preview_only: bool,
-    still: Option<(f64, Receiver<Result<Frame>>)>,
-    showing_full: bool,
-    /// Swap in a full-resolution frame when paused. Off, a paused frame
-    /// stays the stream's quality, so stopping doesn't change the picture.
+    /// A sharper frame for while paused, being decoded: its time and size
+    /// (`None` for full resolution).
+    still: Option<(f64, Option<u32>, Receiver<Result<Frame>>)>,
+    /// The frame on screen is such a still, at this size.
+    showing_still: Option<Option<u32>>,
+    /// Swap in a full-resolution frame when paused. Off, a paused frame is
+    /// at the playback source's quality, so stopping doesn't change the
+    /// picture.
     full_on_pause: bool,
     /// While the seek bar is dragged: whether to resume playing on release,
     /// and the latest position asked for while a preview was still decoding.
@@ -56,7 +60,7 @@ impl Playback {
             pending: None,
             preview_only: false,
             still: None,
-            showing_full: false,
+            showing_still: None,
             full_on_pause,
             scrub: None,
             fix: SeamFix::default(),
@@ -79,9 +83,7 @@ impl Playback {
     /// Streams at this OSV size, or from the proxy if `None`.
     pub fn set_osv_size(&mut self, size: Option<u32>) {
         self.media.osv_size = size;
-        if self.playing {
-            self.seek(self.shown_pts);
-        }
+        self.seek(self.shown_pts);
     }
 
     fn snap(&self, t: f64) -> f64 {
@@ -204,8 +206,8 @@ impl Playback {
             self.still = None;
         }
         self.anchor_pts = t;
-        // The full-resolution frame on screen is of another time now.
-        self.showing_full = false;
+        // The still on screen is of another time now.
+        self.showing_still = None;
         if self.stream.is_some() && self.preview_only {
             self.scrub = self.scrub.map(|(resume, _)| (resume, Some(t)));
         } else {
@@ -234,29 +236,28 @@ impl Playback {
     pub fn set_full_on_pause(&mut self, on: bool) {
         self.full_on_pause = on;
         if !self.playing && self.scrub.is_none() {
-            if on {
-                self.request_still(self.shown_pts);
-            } else {
-                self.still = None;
-                if self.showing_full {
-                    self.showing_full = false;
-                    self.preview_only = true;
-                    self.start_stream(self.shown_pts);
-                }
-            }
+            self.seek(self.shown_pts);
         }
     }
 
+    /// Decodes the paused frame at `t` sharper than the proxy preview: at
+    /// full resolution, or else at the OSV size being played (none when
+    /// playing the proxy, whose preview is already that quality).
     fn request_still(&mut self, t: f64) {
-        if !self.full_on_pause {
-            return;
-        }
+        let size = match (self.full_on_pause, self.media.osv_size) {
+            (true, _) => None,
+            (false, Some(s)) => Some(s),
+            (false, None) => {
+                self.still = None;
+                return;
+            }
+        };
         let (tx, rx) = channel();
         let (path, tracks, hw) = (self.media.input.clone(), self.media.rig.tracks.clone(), self.media.hw);
         std::thread::spawn(move || {
-            let _ = tx.send(source::still(&path, &tracks, t, hw));
+            let _ = tx.send(source::still(&path, &tracks, t, size, hw));
         });
-        self.still = Some((t, rx));
+        self.still = Some((t, size, rx));
     }
 
     /// Whether the clock or a decode needs polling every display frame.
@@ -307,8 +308,8 @@ impl Playback {
                     self.start_audio(f.pts);
                 }
                 // A paused preview never replaces the full-resolution still.
-                if !(self.preview_only && self.showing_full && self.still.is_none()) {
-                    show = Some((f, false));
+                if !(self.preview_only && self.showing_still.is_some() && self.still.is_none()) {
+                    show = Some((f, None));
                 }
                 if self.preview_only {
                     self.stream = None;
@@ -327,13 +328,14 @@ impl Playback {
                 self.pause();
             }
         }
-        if let Some((t, rx)) = &self.still {
+        if let Some((t, size, rx)) = &self.still {
             match rx.try_recv() {
                 Ok(Ok(frame)) => {
                     let current = !self.playing && (*t - self.anchor_pts).abs() < 0.5 / self.media.fps;
+                    let size = *size;
                     self.still = None;
                     if current {
-                        show = Some((frame, true));
+                        show = Some((frame, Some(size)));
                     }
                 }
                 Ok(Err(e)) => {
@@ -344,11 +346,11 @@ impl Playback {
                 Err(TryRecvError::Disconnected) => self.still = None,
             }
         }
-        let (frame, full) = show?;
+        let (frame, still) = show?;
         // Playing frames follow on from each other; anything else is a jump.
-        let continuous = self.playing && !full && (frame.pts - self.shown_pts).abs() < 2.0 / self.media.fps;
+        let continuous = self.playing && still.is_none() && (frame.pts - self.shown_pts).abs() < 2.0 / self.media.fps;
         self.shown_pts = frame.pts;
-        self.showing_full = full;
+        self.showing_still = still;
         let rig = &self.media.rig;
         let rgb = |i: usize, u: f64, v: f64| frame.rgb_at(&rig.lenses[i], rig.tracks[rig.lenses[i].input], u, v);
         if let Some(seam) = &rig.seam {
@@ -379,17 +381,17 @@ impl Playback {
         }
     }
 
-    /// What is on screen: full resolution, the stream, or a pending still.
+    /// What is on screen: a still, the stream, or a still on its way.
     pub fn quality(&self) -> String {
-        if self.showing_full {
-            "full res".to_owned()
-        } else if self.still.is_some() {
-            "loading full res…".to_owned()
-        } else {
-            match self.kind() {
+        let osv = |size: Option<u32>| size.map_or_else(|| "full res".to_owned(), |s| format!("OSV {s} px"));
+        match (self.showing_still, &self.still) {
+            (Some(size), _) => osv(size),
+            (None, Some((_, size, _))) => format!("loading {}…", osv(*size)),
+            (None, None) if !self.playing && self.media.proxy.is_some() => "proxy".to_owned(),
+            (None, None) => match self.kind() {
                 Kind::Lrf(_) => "proxy".to_owned(),
-                Kind::Osv { size, .. } => format!("OSV {size} px"),
-            }
+                Kind::Osv { size, .. } => osv(Some(size)),
+            },
         }
     }
 }

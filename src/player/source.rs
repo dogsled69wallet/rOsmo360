@@ -83,8 +83,11 @@ pub fn spawn(kind: Kind, hw: Hwaccel, start: f64, fps: f64) -> Result<Stream> {
     let (tx, rx) = sync_channel(3);
     let procs: Vec<(Child, u32, u32)> = match &kind {
         Kind::Lrf(path) => {
+            // The proxy is small H.264: software decodes it at 4-8x real time
+            // on one to four threads, and starts in 0.15 s where setting up
+            // Vulkan or CUDA takes 0.5-1 s, which made every scrub lag.
             let (w, h) = dims(path, 0)?;
-            vec![(decode(path, 0, start, None, hw)?, w, h)]
+            vec![(decode(path, 0, start, None, Hwaccel::Software)?, w, h)]
         }
         Kind::Osv { path, tracks, size } => {
             tracks.iter().map(|&t| Ok((decode(path, t, start, Some(*size), hw)?, *size, *size))).collect::<Result<_>>()?
@@ -123,15 +126,16 @@ fn kill(procs: Vec<(Child, u32, u32)>) {
     }
 }
 
-/// Decodes one full-resolution frame of every OSV track, falling back to
-/// software if the hardware decoder fails.
-pub fn still(path: &Path, tracks: &[u32], t: f64, hw: Hwaccel) -> Result<Frame> {
+/// Decodes one frame of every OSV track, at full resolution or scaled to
+/// `size` pixels square, falling back to software if the hardware decoder
+/// fails.
+pub fn still(path: &Path, tracks: &[u32], t: f64, size: Option<u32>, hw: Hwaccel) -> Result<Frame> {
     let pictures = tracks
         .iter()
         .map(|&track| {
-            let (w, h) = dims(path, track)?;
+            let (w, h) = size.map_or_else(|| dims(path, track), |s| Ok((s, s)))?;
             let read = |hw| -> Result<Vec<u8>> {
-                let mut child = decode(path, track, t, None, hw)?;
+                let mut child = decode(path, track, t, size, hw)?;
                 let mut data = vec![0; (w * h * 3 / 2) as usize];
                 child.stdout.take().unwrap().read_exact(&mut data)?;
                 let _ = child.kill();
