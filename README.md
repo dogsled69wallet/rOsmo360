@@ -95,6 +95,10 @@ at your option. Unless you state otherwise, any contribution you submit for incl
 
 The Vibing with Ravelund logo ([`vibewithravelund-lowres-corrected.jpg`](vibewithravelund-lowres-corrected.jpg)) and the screenshot ([`docs/screenshot.png`](docs/screenshot.png)) are not covered by these licences; all rights reserved.
 
+## Support
+
+rOsmo360 is free, and it always will be. If you find it useful and feel like buying me a coffee, you can do that through [PayPal](https://www.paypal.com/donate/?hosted_button_id=78BF2LSB8FGR8). Thank you! ☕
+
 ## Credits
 
 Made by **Vibing with Ravelund**, 2026. rOsmo360 was built through AI-assisted ("vibe") coding with Claude.
