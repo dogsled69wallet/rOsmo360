@@ -23,7 +23,7 @@ Working and verified on real footage:
   - `render`: span to an equirect MP4 with audio.
   - `seam`: seam alignment quality over a span (ghosting left, frame-to-frame wobble).
   - `export`: a framed MP4 with sound, from a fixed `--view` or a keyframed `--reframe` JSON (`view::Reframe`), or a project JSON of cuts from several clips (`project::Project`), joined with their sound. A single clip is exported as a one-cut project. 1080p by default (`-r` 720p–2160p is the short side; `-a` aspect, or the reframe's `"aspect"`). `--draft` stitches from the LRF proxy.
-  - `preview`: a contact sheet of stitched moments labelled with time; equirect tiles marked at yaw −90/0/90° and the horizon, or the reframe's framing.
+  - `preview`: a contact sheet of stitched moments labelled with time; equirect tiles marked at yaw −90/0/90° and the horizon, or the reframe's framing. Given a project, a row per cut (`--columns` tiles spread across it, or `--every N` wrapping rows) framed as the export frames it, labelled `#cut time`; `cut_pipelines` is shared with `export`.
   - `scan`: CSV per second of heading, tilt, turning, shake, loudness and peak.
   - `info`: duration, fps, recording time and contents as JSON.
 - **Real-time player** (`play`), an iced GUI:
@@ -46,9 +46,8 @@ Not done yet, roughly in priority order:
 2. **Native widget shapes.** native-theme-iced's per-widget styles (radii, padding, pressed and focus states); only the colours follow the OS today.
 3. **Windows and macOS groundwork.** Add `d3d11va` and `videotoolbox` to `Hwaccel::pick`, and `cargo check` for both targets. Then hide the console window on Windows (the CLI commands still need one), and bundle ffmpeg or document installing it (mind its GPL builds). A macOS `.app` would need signing and notarisation.
 4. **Seam, what's left.** Patch matching is tuned out, the stick is handled by the cut, and the sky by detail-only matching (see Seam below). Further gains need per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
-5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), stabilisation per cut, thumbnails on the cut blocks, timeline zoom, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
+5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), stabilisation per cut, thumbnails on the cut blocks, timeline zoom, `preview` of projects, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
    - Crossfades between cuts.
-   - `preview` reading projects.
    - GPU export: the CPU export runs ~5 fps at 1080p.
    - Spherical metadata on equirect export.
    - Merging `timeline` into master and releasing (0.2.0?) when the user says so.

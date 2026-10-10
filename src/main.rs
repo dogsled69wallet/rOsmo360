@@ -148,6 +148,10 @@ enum Cmd {
     /// labelled with its time, to skim a clip. Tiles show the whole sphere,
     /// marked at yaw −90/0/90° and the horizon, unless a framing is given.
     ///
+    /// Given a project (.json), one row per cut (more with --every), each
+    /// tile framed as the export frames it and labelled with the cut's
+    /// number and the clip time.
+    ///
     /// Uses the proxy (LRF) unless --full. Stabilisation defaults to horizon.
     Preview {
         input: PathBuf,
@@ -489,24 +493,34 @@ fn span(input: &Path, start: Option<f64>, duration: Option<f64>, reframe: Option
 /// with their sound. Each clip is set up once however many cuts use it.
 /// `progress(done, total)` hears of every frame; an error from it (a
 /// cancel) stops the export and removes the unfinished file.
-fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), draft: bool, output: &Path, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<()> {
+/// Sets up each cut's clip once per clip and stabilisation (the cut's own
+/// wins over the command's): the pipelines, and per cut the index of its own.
+fn cut_pipelines(project: &project::Project, opts: &StitchOpts, proxy: bool) -> Result<(Vec<Pipeline>, Vec<usize>)> {
     let mut pipelines: Vec<Pipeline> = Vec::new();
-    // Per cut: its clip's pipeline, start (on a frame) and frame count.
-    let mut plan = Vec::with_capacity(project.cuts.len());
+    let mut of_cut = Vec::with_capacity(project.cuts.len());
     for cut in &project.cuts {
-        // The cut's own stabilisation wins over the command's.
         let mode = cut.stabilize.or(opts.stabilize).unwrap_or(stab::Mode::Horizon);
         let i = match pipelines.iter().position(|p| p.input == cut.input && p.stab.mode() == mode) {
             Some(i) => i,
             None => {
                 let mut p = Pipeline::new(&cut.input, &StitchOpts { stabilize: Some(mode), ..opts.clone() }, mode)?;
-                if draft {
+                if proxy {
                     p.use_proxy();
                 }
                 pipelines.push(p);
                 pipelines.len() - 1
             }
         };
+        of_cut.push(i);
+    }
+    Ok((pipelines, of_cut))
+}
+
+fn export(project: &project::Project, opts: &StitchOpts, size: (usize, usize), draft: bool, output: &Path, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<()> {
+    let (pipelines, of_cut) = cut_pipelines(project, opts, draft)?;
+    // Per cut: its clip's pipeline, start (on a frame) and frame count.
+    let mut plan = Vec::with_capacity(project.cuts.len());
+    for (cut, &i) in project.cuts.iter().zip(&of_cut) {
         let p = &pipelines[i];
         let start = p.snap(cut.start);
         let end = cut.end.min(ffmpeg::duration(&cut.input)?);
@@ -613,7 +627,7 @@ fn main() -> Result<()> {
             eprintln!("wrote {}", output.display());
         }
         Cmd::Export { input, framing, start, duration, resolution, aspect, size, output, draft, opts } => {
-            let project = if input.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) {
+            let project = if is_project(&input) {
                 if framing.reframe.is_some() || framing.view.is_some() || start.is_some() || duration.is_some() {
                     bail!("a project sets its own cuts and views; leave out --reframe, --view, -s and -d");
                 }
@@ -628,6 +642,15 @@ fn main() -> Result<()> {
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
             export(&project, &opts, (w, h), draft, &output, &mut print_progress())?;
             eprintln!("wrote {} ({w}×{h}, {:.2} s)", output.display(), project.duration());
+        }
+        Cmd::Preview { input, framing, start, duration, every, tile, columns, output, full, opts } if is_project(&input) => {
+            if framing.reframe.is_some() || framing.view.is_some() || start.is_some() || duration.is_some() {
+                bail!("a project sets its own cuts and views; leave out --reframe, --view, -s and -d");
+            }
+            let project = project::Project::load(&input)?;
+            let (sheet, tiles) = preview_project(&project, &opts, every, tile, columns.max(1), !full)?;
+            save_png(&output, &sheet)?;
+            eprintln!("wrote {}: {tiles} tiles of {} cuts", output.display(), project.cuts.len());
         }
         Cmd::Preview { input, framing, start, duration, every, tile, columns, output, full, opts } => {
             let reframe = framing.reframe()?;
@@ -671,6 +694,43 @@ fn main() -> Result<()> {
         Cmd::Scan { input, every } => scan(&input, every)?,
     }
     Ok(())
+}
+
+fn is_project(input: &Path) -> bool {
+    input.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))
+}
+
+/// A contact sheet of a project: per cut, `columns` moments spread across
+/// it (or one every `every` seconds), framed as `export` frames them. Each
+/// cut starts a row; blank tiles fill out the last. Returns the sheet and
+/// how many tiles it shows.
+fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<f64>, tile: usize, columns: usize, proxy: bool) -> Result<(stitch::Frame, usize)> {
+    let (pipelines, of_cut) = cut_pipelines(project, opts, proxy)?;
+    let view::Aspect(w, h) = project.aspect.unwrap_or(view::Aspect(16, 9));
+    let size = (tile, ((tile * h as usize / w as usize) / 2).max(8) * 2);
+    let mut shots = Vec::new();
+    for (n, (cut, &i)) in project.cuts.iter().zip(&of_cut).enumerate() {
+        let p = &pipelines[i];
+        let len = cut.end - cut.start;
+        let times: Vec<f64> = match every {
+            Some(every) => (0..).map(|k| cut.start + k as f64 * every.max(1.0 / p.fps)).take_while(|&t| t < cut.end).collect(),
+            None => (0..columns).map(|k| cut.start + (k as f64 + 0.5) * len / columns as f64).collect(),
+        };
+        let row_end = times.len().div_ceil(columns) * columns;
+        shots.extend(times.iter().map(|&t| Some((n, i, p.snap(t).clamp(cut.start, cut.end)))));
+        shots.extend((times.len()..row_end).map(|_| None));
+    }
+    let tiles = shots
+        .par_iter()
+        .map(|shot| {
+            let Some((n, i, t)) = *shot else { return Ok(stitch::Frame { width: size.0, height: size.1, rgb: vec![0; size.0 * size.1 * 3] }) };
+            let p = &pipelines[i];
+            let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &Shot::View { camera: project.cuts[n].camera_at(t), size });
+            sheet::label(&mut f, 4, 4, &format!("#{} {t:.1}s", n + 1));
+            Ok(f)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((sheet::compose(&tiles, columns), shots.iter().flatten().count()))
 }
 
 /// Stitches `total` frames (or to the end) from `start` into `encoder`,

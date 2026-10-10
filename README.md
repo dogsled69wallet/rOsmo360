@@ -145,6 +145,7 @@ Skimming a clip:
 rosmo360 info clip.OSV                      # length, frame rate, recording time, as JSON
 rosmo360 preview clip.OSV -o sheet.png      # 24 moments on one contact sheet, marked with time and yaw
 rosmo360 preview clip.OSV --reframe moves.json -o check.png   # the framing at each keyframe
+rosmo360 preview edit.json -o check.png      # a project: a row per cut, framed as the export (--every N for more)
 rosmo360 scan clip.OSV > scan.csv           # per second: heading, tilt, turning, shake, loudness
 ```
 
