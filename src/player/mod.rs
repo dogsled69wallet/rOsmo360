@@ -3,6 +3,7 @@
 //! and rolling-shutter correction run in the view's shader.
 
 mod audio;
+mod export;
 mod gpu;
 mod playback;
 mod source;
@@ -16,7 +17,7 @@ use iced::keyboard::{self, Key, key::Named};
 use iced::mouse;
 use iced::widget::{button, center, column, container, pick_list, row, shader, slider, space, svg, text, toggler, tooltip};
 use iced::window;
-use iced::{Alignment, Element, Length, Point, Rectangle, Subscription, Task, Theme};
+use iced::{Alignment, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme};
 use playback::Playback;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -136,6 +137,18 @@ impl fmt::Display for Projection {
     }
 }
 
+/// What "save" writes: the view as framed, or the whole sphere.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Saving {
+    View,
+    Sphere,
+}
+
+/// Longest side of a saved view, and width of a saved sphere: the lenses'
+/// full resolution holds about this much detail.
+const SAVE_VIEW_PX: f32 = 3840.0;
+const SAVE_SPHERE_PX: usize = 7680;
+
 /// What the player streams while playing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Source {
@@ -232,6 +245,11 @@ enum Message {
     RollingShutter(bool),
     Mute,
     Volume(f32),
+    /// The 360 view's size on screen, so a saved view keeps its shape.
+    ViewSize(Size),
+    Save(Saving),
+    SaveTo(Saving, Option<PathBuf>),
+    Saved(Result<PathBuf, String>),
     ResetView,
     Fullscreen,
 }
@@ -246,6 +264,9 @@ struct App {
     fullscreen: bool,
     volume: f32,
     muted: bool,
+    view_size: Size,
+    /// What the last save did, or that one is running.
+    save_status: Option<String>,
 }
 
 impl App {
@@ -260,6 +281,8 @@ impl App {
             fullscreen: false,
             volume: 1.0,
             muted: false,
+            view_size: Size::new(16.0, 9.0),
+            save_status: None,
         }
     }
 
@@ -353,6 +376,63 @@ impl App {
                 self.with_playback(|p| p.set_osv_size(size));
             }
             Message::RollingShutter(on) => self.rolling_shutter = on,
+            Message::ViewSize(size) => self.view_size = size,
+            Message::Save(what) => {
+                let Some(c) = &self.clip else { return Task::none() };
+                let media = &c.playback.media;
+                let stem = media.input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = format!("{stem}_{:.2}s_{}.png", c.playback.shown_pts, if what == Saving::View { "view" } else { "360" });
+                let dir = media.input.parent().map(Path::to_owned);
+                return Task::perform(
+                    async move {
+                        let mut dialog = rfd::AsyncFileDialog::new().set_title("Save photo").add_filter("PNG image", &["png"]).set_file_name(name);
+                        if let Some(dir) = dir {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog.save_file().await.map(|f| f.path().to_owned())
+                    },
+                    move |path| Message::SaveTo(what, path),
+                );
+            }
+            Message::SaveTo(_, None) => {}
+            Message::SaveTo(what, Some(path)) => {
+                let Some(c) = &self.clip else { return Task::none() };
+                let media = &c.playback.media;
+                let shot = match what {
+                    Saving::Sphere => export::Shot::Sphere { width: SAVE_SPHERE_PX },
+                    Saving::View => {
+                        let k = SAVE_VIEW_PX / self.view_size.width.max(self.view_size.height).max(1.0);
+                        // Even sizes keep image tools that halve chroma happy.
+                        let px = |v: f32| ((v * k / 2.0).round() as usize).max(1) * 2;
+                        export::Shot::View {
+                            user: self.look.matrix(),
+                            zoom: self.look.zoom() as f64,
+                            projection: self.look.projection as u32,
+                            size: (px(self.view_size.width), px(self.view_size.height)),
+                        }
+                    }
+                };
+                let request = export::Request {
+                    input: media.input.clone(),
+                    hw: media.hw,
+                    rig: media.rig.clone(),
+                    stab: media.stab.clone(),
+                    readout_ms: media.readout_ms,
+                    t: c.playback.shown_pts,
+                    rolling_shutter: self.rolling_shutter,
+                    shot,
+                    path,
+                };
+                self.save_status = Some("Saving photo…".to_owned());
+                return Task::perform(blocking(move || export::save(request).map_err(|e| format!("{e:#}"))), Message::Saved);
+            }
+            Message::Saved(result) => match result {
+                Ok(path) => self.save_status = Some(format!("Saved {}", path.display())),
+                Err(e) => {
+                    self.save_status = None;
+                    self.error = Some(format!("Saving failed: {e}"));
+                }
+            },
             Message::Mute => {
                 self.muted = !self.muted;
                 let v = self.volume();
@@ -445,9 +525,10 @@ impl App {
         let p = &clip.playback;
         let media = &p.media;
 
-        let status = match &self.loading {
-            Some(path) => format!("Loading {}…", path.display()),
-            None => format!("{} · {:?} decode", p.quality(), media.hw),
+        let status = match (&self.loading, &self.save_status) {
+            (Some(path), _) => format!("Loading {}…", path.display()),
+            (None, Some(s)) => format!("{s} · {} · {:?} decode", p.quality(), media.hw),
+            (None, None) => format!("{} · {:?} decode", p.quality(), media.hw),
         };
         let top = row![open, text(media.input.display().to_string()), space().width(Length::Fill), text(status)]
             .spacing(12)
@@ -474,6 +555,16 @@ impl App {
         let last = (media.duration - 1.0 / media.fps).max(0.0);
         let transport = row![
             button(text(if p.playing { "Pause" } else { "Play" }).width(48).align_x(Alignment::Center)).on_press(Message::Toggle),
+            tooltip(
+                button("Save view…").on_press_maybe((!p.playing).then_some(Message::Save(Saving::View))),
+                text("Save what you see as a PNG (pause first)"),
+                tooltip::Position::Top,
+            ),
+            tooltip(
+                button("Save 360°…").on_press_maybe((!p.playing).then_some(Message::Save(Saving::Sphere))),
+                text("Save the whole sphere as an equirect PNG (pause first)"),
+                tooltip::Position::Top,
+            ),
             text(format!("{} / {}", clock(p.position()), clock(media.duration))),
             slider(0.0..=last, p.position().min(last), Message::Scrub).step(1.0 / media.fps).on_release(Message::ScrubDone),
             tooltip(
@@ -557,13 +648,13 @@ struct Sphere {
 struct Drag {
     button: Option<mouse::Button>,
     last: Option<Point>,
+    /// The size last reported to the app.
+    size: Option<Size>,
 }
 
-impl shader::Program<Message> for Sphere {
-    type State = Drag;
-    type Primitive = gpu::Primitive;
-
-    fn update(&self, drag: &mut Drag, event: &iced::Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<shader::Action<Message>> {
+impl Sphere {
+    /// Drags look around, the wheel zooms.
+    fn input(&self, drag: &mut Drag, event: &iced::Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<shader::Action<Message>> {
         match event {
             iced::Event::Mouse(mouse::Event::ButtonPressed(b @ (mouse::Button::Left | mouse::Button::Right))) => {
                 drag.last = Some(cursor.position_over(bounds)?);
@@ -596,6 +687,20 @@ impl shader::Program<Message> for Sphere {
             }
             _ => None,
         }
+    }
+}
+
+impl shader::Program<Message> for Sphere {
+    type State = Drag;
+    type Primitive = gpu::Primitive;
+
+    fn update(&self, drag: &mut Drag, event: &iced::Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<shader::Action<Message>> {
+        let action = self.input(drag, event, bounds, cursor);
+        if action.is_none() && drag.size != Some(bounds.size()) {
+            drag.size = Some(bounds.size());
+            return Some(shader::Action::publish(Message::ViewSize(bounds.size())));
+        }
+        action
     }
 
     fn draw(&self, _: &Drag, _: mouse::Cursor, _: Rectangle) -> gpu::Primitive {

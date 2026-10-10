@@ -103,8 +103,32 @@ pub fn nv12(input: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel
     Ok(cmd)
 }
 
+/// One RGB24 frame of a video track at `t`, decoded on `hw` when it can be.
+/// Asking for exactly one frame lets ffmpeg finish cleanly instead of
+/// complaining about a closed pipe.
+pub fn still(input: &Path, track: u32, t: f64, hw: Hwaccel) -> Result<Frame> {
+    let (width, height) = dimensions(input, track)?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-nostdin"]);
+    if let Some(name) = hw.name() {
+        cmd.args(["-hwaccel", name]);
+    }
+    let out = cmd
+        .args(["-ss", &t.to_string(), "-i"])
+        .arg(input)
+        .args(["-map", &format!("0:v:{track}"), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .stderr(Stdio::inherit())
+        .output()
+        .context("running ffmpeg")?;
+    if out.stdout.len() != width * height * 3 {
+        bail!("no frame at {t:.2} s");
+    }
+    Ok(Frame { width, height, rgb: out.stdout })
+}
+
 /// Streams RGB24 frames of one video track, starting at the first frame at or
-/// after `start` seconds.
+/// after `start` seconds. Decodes on `hw` when it can (3.5× faster for a
+/// 3840² HEVC still on Vulkan) and quietly in software when it can't.
 pub struct Decoder {
     child: Child,
     stdout: ChildStdout,
@@ -113,10 +137,15 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub fn new(input: &Path, track: u32, start: f64) -> Result<Self> {
+    pub fn new(input: &Path, track: u32, start: f64, hw: Hwaccel) -> Result<Self> {
         let (width, height) = dimensions(input, track)?;
-        let mut child = Command::new("ffmpeg")
-            .args(["-v", "error", "-ss", &start.to_string(), "-i"])
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-v", "error"]);
+        if let Some(name) = hw.name() {
+            cmd.args(["-hwaccel", name]);
+        }
+        let mut child = cmd
+            .args(["-ss", &start.to_string(), "-i"])
             .arg(input)
             .args(["-map", &format!("0:v:{track}"), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
             .stdout(Stdio::piped())

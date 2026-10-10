@@ -109,12 +109,29 @@ pub struct Seam<'a> {
 pub fn equirect(lenses: &[Lens], frames: &[Frame], out_w: usize, only: Option<usize>, views: &[M3], seam: &Seam<'_>) -> Frame {
     use std::f64::consts::PI;
     let out_h = out_w / 2;
+    let ray = |x: f64, y: f64| {
+        let lat = PI / 2.0 - y / out_h as f64 * PI;
+        let lon = x / out_w as f64 * 2.0 * PI - PI;
+        [lat.cos() * lon.sin(), -lat.sin(), lat.cos() * lon.cos()]
+    };
+    render(lenses, frames, (out_w, out_h), ray, only, views, seam)
+}
+
+/// Stitches any picture: `ray(x, y)` gives the view-space direction through
+/// pixel centre (x, y), which `views` then turn into the rig.
+pub fn render(
+    lenses: &[Lens],
+    frames: &[Frame],
+    (out_w, out_h): (usize, usize),
+    ray: impl Fn(f64, f64) -> [f64; 3] + Sync,
+    only: Option<usize>,
+    views: &[M3],
+    seam: &Seam<'_>,
+) -> Frame {
     let mut rgb = vec![0u8; out_w * out_h * 3];
     rgb.par_chunks_mut(out_w * 3).enumerate().for_each(|(y, row)| {
-        let lat = PI / 2.0 - (y as f64 + 0.5) / out_h as f64 * PI;
         for x in 0..out_w {
-            let lon = (x as f64 + 0.5) / out_w as f64 * 2.0 * PI - PI;
-            let d = [lat.cos() * lon.sin(), -lat.sin(), lat.cos() * lon.cos()];
+            let d = ray(x as f64 + 0.5, y as f64 + 0.5);
             let mid = apply(views[views.len() / 2], d);
             let mut acc = [0f64; 3];
             let mut wsum = 0.0;
@@ -216,6 +233,8 @@ pub(crate) fn sample(f: &Frame, u: f64, v: f64) -> [f64; 3] {
 
 pub type M3 = [[f64; 3]; 3];
 
+pub const IDENTITY: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
 pub fn mat_mul(a: M3, b: M3) -> M3 {
     std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
 }
@@ -233,6 +252,6 @@ pub fn transpose(m: M3) -> M3 {
     std::array::from_fn(|i| std::array::from_fn(|j| m[j][i]))
 }
 
-fn apply(m: M3, v: [f64; 3]) -> [f64; 3] {
+pub(crate) fn apply(m: M3, v: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2])
 }

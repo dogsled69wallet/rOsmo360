@@ -27,6 +27,7 @@ Working and verified on real footage:
   - Perspective, little-planet and flat equirect projections.
   - Plays the LRF proxy (or the OSV at 1920 px or full size) and swaps in a full-res frame on pause.
   - Sound through cpal, with a mute icon and volume slider. While sound plays it is the playback clock.
+  - Save the paused frame as PNG: the view as framed (3840 px on the long side) or the whole sphere (7680 × 3840). The CPU stitcher renders it from freshly decoded full-res frames in about 4 s.
 - **Hardware decode on any GPU vendor:** the first of Vulkan Video, VA-API and CUDA that decodes a test frame, else software. `--hwaccel` forces one.
 
 Not done yet, roughly in priority order:
@@ -80,7 +81,7 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
 - `src/align.rs`: per-frame seam alignment (`Aligner::measure`, `Aligner::warp`).
 - The shader's `exposure_gain` and `align_warp` mirror `Seam::gain` and `Aligner::warp`; change them together.
 - `src/imu.rs`: reads telemetry-parser's Quaternion/Gyro/Accel tags.
-- `src/ffmpeg.rs`: RGB decode/encode through the ffmpeg CLI (used by `stitch`/`render`), plus `Hwaccel` probing and the player's NV12 decode command.
+- `src/ffmpeg.rs`: RGB decode/encode through the ffmpeg CLI (used by `stitch`/`render`/photo save, hardware-decoded when possible), plus `Hwaccel` probing and the player's NV12 decode command.
 - `src/player/`:
   - `mod.rs`: iced app: clip loading, widgets, keys, and the `Sphere` shader widget (drag/scroll to look).
   - `playback.rs`: playback clock, streams and full-res stills.
@@ -88,6 +89,7 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
   - `shader.wgsl`: GPU port of `stitch.rs`.
   - `source.rs`: NV12 decode threads (LRF proxy / OSV) and full-res stills.
   - `audio.rs`: ffmpeg → f32 PCM → cpal output; frames played minus device latency give the clock.
+  - `export.rs`: PNG save of the paused frame. Its `screen_ray` mirrors the shader's; change them together.
 
 ## Hard-won facts (do not re-derive)
 

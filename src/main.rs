@@ -134,6 +134,7 @@ struct Pipeline {
     rs_steps: usize,
     seam: Option<exposure::Seam>,
     aligner: Option<align::Aligner>,
+    hw: ffmpeg::Hwaccel,
 }
 
 /// Seam state carried from frame to frame so it eases instead of flickering.
@@ -171,6 +172,7 @@ impl Pipeline {
         let rs_steps = if opts.no_rs || readout_ms == 0.0 || !stab.has_data() { 1 } else { 33 };
         let seam = if opts.no_exposure || opts.only.is_some() { None } else { exposure::Seam::new(&lenses) };
         let aligner = if opts.no_align || opts.only.is_some() { None } else { align::Aligner::new(&lenses) };
+        let hw = ffmpeg::Hwaccel::pick(input, tracks[0])?;
         Ok(Pipeline {
             lenses,
             tracks,
@@ -182,6 +184,7 @@ impl Pipeline {
             rs_steps,
             seam,
             aligner,
+            hw,
         })
     }
 
@@ -215,7 +218,7 @@ impl Pipeline {
     }
 
     fn decoders(&self, input: &Path, start: f64) -> Result<Vec<ffmpeg::Decoder>> {
-        self.tracks.iter().map(|&n| ffmpeg::Decoder::new(input, n, start)).collect()
+        self.tracks.iter().map(|&n| ffmpeg::Decoder::new(input, n, start, self.hw)).collect()
     }
 }
 
@@ -249,7 +252,7 @@ fn main() -> Result<()> {
         Cmd::Stitch { input, time, output, opts } => {
             let p = Pipeline::new(&input, &opts)?;
             let time = p.snap(time);
-            let frames = next_frames(&mut p.decoders(&input, time)?)?.context("no frame at that time")?;
+            let frames = p.tracks.iter().map(|&n| ffmpeg::still(&input, n, time, p.hw)).collect::<Result<Vec<_>>>()?;
             let out = p.render(&frames, time, &mut Carry::default());
             image::save_buffer(&output, &out.rgb, out.width as u32, out.height as u32, image::ColorType::Rgb8)?;
             eprintln!("wrote {}", output.display());

@@ -56,6 +56,7 @@ impl std::fmt::Display for Mode {
     }
 }
 
+#[derive(Clone)]
 pub struct Stabilizer {
     /// (ms, world_from_imu)
     quats: Vec<(f64, Quat)>,
