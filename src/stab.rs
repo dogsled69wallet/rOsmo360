@@ -116,11 +116,15 @@ impl Stabilizer {
 
     /// `rig_from_view` at `steps` instants spread over the frame's readout,
     /// first row to last. A single step means no rolling-shutter correction.
+    ///
+    /// A frame's timestamp is when its readout starts: centring the readout
+    /// on it instead left distant terrain swimming by ~0.1-0.5° per frame in
+    /// world lock, and the residual is smallest at exactly half the readout.
     pub fn rig_from_view(&self, t_ms: f64, readout_ms: f64, steps: usize) -> Vec<M3> {
-        let view = self.world_from_view(t_ms);
+        let view = self.world_from_view(t_ms + readout_ms / 2.0);
         (0..steps)
             .map(|k| {
-                let s = if steps > 1 { k as f64 / (steps - 1) as f64 - 0.5 } else { 0.0 };
+                let s = if steps > 1 { k as f64 / (steps - 1) as f64 } else { 0.5 };
                 let rig = self.world_from_rig(t_ms + s * readout_ms);
                 mat_mul(transpose(rig), view)
             })
