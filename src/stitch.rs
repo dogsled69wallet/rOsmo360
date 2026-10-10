@@ -98,6 +98,8 @@ impl Lens {
 pub struct Seam<'a> {
     pub exposure: Option<(&'a crate::exposure::Seam, &'a Gains)>,
     pub align: Option<(&'a Aligner, &'a Field)>,
+    /// Cut instead of blending where the lenses disagree.
+    pub cut: bool,
 }
 
 /// Feathered composite: each lens weighted by its own blend ramp, normalised.
@@ -119,6 +121,30 @@ pub fn equirect(lenses: &[Lens], frames: &[Frame], out_w: usize, only: Option<us
 
 /// Stitches any picture: `ray(x, y)` gives the view-space direction through
 /// pixel centre (x, y), which `views` then turn into the rig.
+/// Where the lenses still disagree after alignment (a hand close to the
+/// stick, which one lens sees as an arm running into its mask and the other
+/// as a fist), blending shows both at half strength; cut to whichever lens
+/// owns that side of the seam instead. The cut fades in between these
+/// disagreements (largest RGB difference, 0..1) and sharpens the blend to a
+/// step this wide around the seam's middle. On clip 0043 it turned the
+/// see-through fist on the stick solid and left the sky seam unchanged; it
+/// touched ~1.4% of the sphere. The shader's `cut_share` must match.
+const CUT_FROM: f64 = 0.06;
+const CUT_FULL: f64 = 0.18;
+const CUT_EDGE: f64 = 0.08;
+
+/// Lens 0's share of a two-lens blend once disagreement cuts it.
+pub(crate) fn cut_share(share: f64, a: [f64; 3], b: [f64; 3]) -> f64 {
+    let diff = (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0, f64::max);
+    let cut = smoothstep(0.5 - CUT_EDGE, 0.5 + CUT_EDGE, share);
+    share + (cut - share) * smoothstep(CUT_FROM, CUT_FULL, diff)
+}
+
+fn smoothstep(lo: f64, hi: f64, x: f64) -> f64 {
+    let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 pub fn render(
     lenses: &[Lens],
     frames: &[Frame],
@@ -133,8 +159,7 @@ pub fn render(
         for x in 0..out_w {
             let d = ray(x as f64 + 0.5, y as f64 + 0.5);
             let mid = apply(views[views.len() / 2], d);
-            let mut acc = [0f64; 3];
-            let mut wsum = 0.0;
+            let mut hits: Vec<([f64; 3], f64)> = Vec::with_capacity(2);
             for (i, lens) in lenses.iter().enumerate() {
                 let warp = |d: [f64; 3]| seam.align.map_or(d, |(a, f)| a.warp(f, i, d));
                 let Some(mut hit) = lens.project(warp(mid)) else { continue };
@@ -155,14 +180,17 @@ pub fn render(
                 }
                 let px = sample(&frames[lens.input], u, v);
                 let gain = seam.exposure.map_or([1.0; 3], |(s, g)| s.gain(g, i, mid, theta));
-                for c in 0..3 {
-                    acc[c] += px[c] * gain[c] * w;
-                }
-                wsum += w;
+                hits.push(([0, 1, 2].map(|c| px[c] * gain[c]), w));
             }
+            if let ([(a, wa), (b, wb)], true) = (&hits[..], seam.cut) {
+                let s = cut_share(wa / (wa + wb), a.map(|v| v / 255.0), b.map(|v| v / 255.0));
+                hits = vec![(*a, s), (*b, 1.0 - s)];
+            }
+            let wsum: f64 = hits.iter().map(|h| h.1).sum();
             if wsum > 0.0 {
                 for c in 0..3 {
-                    row[x * 3 + c] = (acc[c] / wsum).round().clamp(0.0, 255.0) as u8;
+                    let v = hits.iter().map(|(px, w)| px[c] * w).sum::<f64>() / wsum;
+                    row[x * 3 + c] = v.round().clamp(0.0, 255.0) as u8;
                 }
             }
         }

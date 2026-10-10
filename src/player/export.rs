@@ -47,6 +47,7 @@ pub fn save(r: Request) -> Result<PathBuf> {
     let seam = stitch::Seam {
         exposure: r.rig.seam.as_ref().zip(gains.as_ref()),
         align: r.rig.aligner.as_ref().zip(field.as_ref()),
+        cut: true,
     };
 
     let out = match r.shot {

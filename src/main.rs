@@ -70,6 +70,10 @@ enum Cmd {
         /// Duration in seconds.
         #[arg(short, long, default_value_t = 5.0)]
         duration: f64,
+        /// Write the first frame's seam strips, differences and shift field
+        /// as images into this directory.
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
     /// Stitch a span of the clip to an equirectangular MP4.
     Render {
@@ -119,6 +123,9 @@ struct RenderOpts {
     /// Skip shifting the lenses to line up close subjects at the seam.
     #[arg(long)]
     no_align: bool,
+    /// Blend everywhere instead of cutting where the lenses disagree.
+    #[arg(long)]
+    no_cut: bool,
 }
 
 /// Everything needed to turn decoded lens frames at a given time into an
@@ -134,6 +141,7 @@ struct Pipeline {
     rs_steps: usize,
     seam: Option<exposure::Seam>,
     aligner: Option<align::Aligner>,
+    cut: bool,
     hw: ffmpeg::Hwaccel,
 }
 
@@ -184,6 +192,7 @@ impl Pipeline {
             rs_steps,
             seam,
             aligner,
+            cut: !opts.no_cut && opts.only.is_none(),
             hw,
         })
     }
@@ -213,7 +222,7 @@ impl Pipeline {
             f.ease(&now, align::EASE);
             (aligner, f.clone())
         });
-        let seam = stitch::Seam { exposure: exposure.as_ref().map(|(s, g)| (*s, g)), align: align.as_ref().map(|(a, f)| (*a, f)) };
+        let seam = stitch::Seam { exposure: exposure.as_ref().map(|(s, g)| (*s, g)), align: align.as_ref().map(|(a, f)| (*a, f)), cut: self.cut };
         stitch::equirect(&self.lenses, frames, self.width, self.only, &views, &seam)
     }
 
@@ -248,7 +257,7 @@ fn main() -> Result<()> {
         Cmd::Play { input, osv_size, hwaccel, stabilize, imu_axes, world_z_down } => {
             player::run(input, player::Options { osv_size, hw: hwaccel, stabilize, imu_axes, world_z_down })?;
         }
-        Cmd::Seam { input, start, duration } => seam_report(&input, start, duration)?,
+        Cmd::Seam { input, start, duration, dump } => seam_report(&input, start, duration, dump.as_deref())?,
         Cmd::Stitch { input, time, output, opts } => {
             let p = Pipeline::new(&input, &opts)?;
             let time = p.snap(time);
@@ -281,7 +290,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn seam_report(input: &Path, start: f64, duration: f64) -> Result<()> {
+fn seam_report(input: &Path, start: f64, duration: f64, dump: Option<&Path>) -> Result<()> {
     let opts = RenderOpts {
         width: 0,
         variant: None,
@@ -293,16 +302,19 @@ fn seam_report(input: &Path, start: f64, duration: f64) -> Result<()> {
         no_rs: true,
         no_exposure: true,
         no_align: false,
+        no_cut: false,
     };
     let p = Pipeline::new(input, &opts)?;
     let aligner = p.aligner.as_ref().context("not a two-lens rig")?;
     let start = p.snap(start);
     let mut decoders = p.decoders(input, start)?;
     let (mut eased, mut prev_raw): (Option<align::Field>, Option<align::Field>) = (None, None);
-    let mut sums = [0.0; 5];
+    let mut sums = [0.0; 7];
+    // The selfie stick runs down the rig's y axis.
+    let stick = aligner.column([0.0, 1.0, 0.0]);
     let mut n = 0;
     let jitter = |a: &align::Field, b: &align::Field| a.0.iter().zip(&b.0).map(|(x, y)| (x - y).abs() as f64).sum::<f64>() / a.0.len() as f64;
-    println!("t,mismatch_none,mismatch_raw,mismatch_eased,jitter_raw_deg,jitter_eased_deg");
+    println!("t,mismatch_none,mismatch_raw,mismatch_eased,jitter_raw_deg,jitter_eased_deg,stick_none,stick_eased");
     while n < (duration * p.fps).round() as usize {
         let Some(frames) = next_frames(&mut decoders)? else { break };
         let strips = aligner.strips(|i, u, v| Some(stitch::sample(&frames[p.lenses[i].input], u, v).iter().sum::<f64>() / (3.0 * 255.0)));
@@ -311,21 +323,32 @@ fn seam_report(input: &Path, start: f64, duration: f64) -> Result<()> {
         let e = eased.get_or_insert_with(|| raw.clone());
         e.ease(&raw, align::EASE);
         let row = [
-            aligner.mismatch(&strips, &align::Field::default()),
-            aligner.mismatch(&strips, &raw),
-            aligner.mismatch(&strips, e),
+            aligner.mismatch(&strips, &align::Field::default(), None),
+            aligner.mismatch(&strips, &raw, None),
+            aligner.mismatch(&strips, e, None),
             prev_raw.as_ref().map_or(0.0, |r| jitter(r, &raw).to_degrees()),
             before.as_ref().map_or(0.0, |b| jitter(b, e).to_degrees()),
+            aligner.mismatch(&strips, &align::Field::default(), Some(stick)),
+            aligner.mismatch(&strips, e, Some(stick)),
         ];
-        println!("{:.3},{:.5},{:.5},{:.5},{:.4},{:.4}", start + n as f64 / p.fps, row[0], row[1], row[2], row[3], row[4]);
+        println!("{:.3},{:.5},{:.5},{:.5},{:.4},{:.4},{:.5},{:.5}", start + n as f64 / p.fps, row[0], row[1], row[2], row[3], row[4], row[5], row[6]);
         for (s, v) in sums.iter_mut().zip(row) {
             *s += v;
+        }
+        if n == 0
+            && let Some(dir) = dump
+        {
+            aligner.dump(&strips, &raw, dir)?;
+            eprintln!("rig down is strip column {}, rig up column {}", aligner.column([0.0, 1.0, 0.0]), aligner.column([0.0, -1.0, 0.0]));
         }
         prev_raw = Some(raw);
         n += 1;
     }
     let m = sums.map(|s| s / n.max(1) as f64);
-    eprintln!("{n} frames: mismatch none {:.5} raw {:.5} eased {:.5}; jitter raw {:.4}° eased {:.4}°", m[0], m[1], m[2], m[3], m[4]);
+    eprintln!(
+        "{n} frames: mismatch none {:.5} raw {:.5} eased {:.5}; jitter raw {:.4}° eased {:.4}°; stick zone none {:.5} eased {:.5}",
+        m[0], m[1], m[2], m[3], m[4], m[5], m[6]
+    );
     Ok(())
 }
 

@@ -71,6 +71,7 @@ impl Media {
             no_rs: false,
             no_exposure: false,
             no_align: false,
+            no_cut: false,
         };
         let p = crate::Pipeline::new(&input, &render)?;
         let proxy = ["LRF", "lrf"].iter().map(|ext| input.with_extension(ext)).find(|p| p.exists());

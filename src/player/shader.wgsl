@@ -205,6 +205,19 @@ fn align_warp(lens: u32, d: vec3f) -> vec3f {
     return cos(shifted) * axis + sin(shifted) * ring;
 }
 
+// Matches stitch::cut_share: where the lenses still disagree after
+// alignment, cut to the lens that owns that side of the seam.
+const CUT_FROM: f32 = 0.06;
+const CUT_FULL: f32 = 0.18;
+const CUT_EDGE: f32 = 0.08;
+
+fn cut_share(share: f32, a: vec3f, b: vec3f) -> f32 {
+    let d = abs(a - b);
+    let diff = max(d.x, max(d.y, d.z));
+    let cut = smoothstep(0.5 - CUT_EDGE, 0.5 + CUT_EDGE, share);
+    return mix(share, cut, smoothstep(CUT_FROM, CUT_FULL, diff));
+}
+
 // Matches Seam::gain in exposure.rs.
 fn exposure_gain(lens: u32, d: vec3f, theta: f32) -> vec3f {
     let phi = atan2(dot(d, u.seam[2].xyz), dot(d, u.seam[1].xyz));
@@ -223,8 +236,8 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     let v = rows(u.user0, u.user1, u.user2, screen_ray(pos.xy - u.misc.zw));
     let steps = u32(u.misc.x);
     let mid = view_at(steps / 2u, v);
-    var acc = vec3f(0.0);
-    var wsum = 0.0;
+    var col = array<vec3f, 2>(vec3f(0.0), vec3f(0.0));
+    var wt = array<f32, 2>(0.0, 0.0);
     for (var i = 0u; i < 2u; i++) {
         var h = project(i, align_warp(i, mid));
         if !h.ok {
@@ -242,13 +255,18 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         if w <= 0.0 {
             continue;
         }
-        acc += nv12(l.a1.w, h.uv) * exposure_gain(i, mid, h.theta) * w;
-        wsum += w;
+        col[i] = nv12(l.a1.w, h.uv) * exposure_gain(i, mid, h.theta);
+        wt[i] = w;
     }
+    let wsum = wt[0] + wt[1];
     if wsum <= 0.0 {
         return vec4f(0.0, 0.0, 0.0, 1.0);
     }
-    var rgb = acc / wsum;
+    var share = wt[0] / wsum;
+    if wt[0] > 0.0 && wt[1] > 0.0 {
+        share = cut_share(share, col[0], col[1]);
+    }
+    var rgb = col[0] * share + col[1] * (1.0 - share);
     if u.misc.y > 0.5 {
         // The surface will sRGB-encode; hand it linear light.
         rgb = select(pow((rgb + 0.055) / 1.055, vec3f(2.4)), rgb / 12.92, rgb <= vec3f(0.04045));

@@ -11,6 +11,7 @@ Working and verified on real footage:
 - **Stitching** with DJI Studio's own default calibration, masks and blend ramps (via telemetry-parser), plus two per-frame seam corrections:
   - Exposure matching: evens out the lenses' brightness and colour along the seam.
   - Seam alignment: shifts each lens half-way across the seam where close subjects (legs, the hand on the selfie stick) would otherwise ghost.
+  - Disagreement cut: where the lenses still disagree after alignment, cut to the lens owning that side of the seam instead of blending, so what can't be aligned (the hand on the stick) is solid rather than see-through.
 - **Stabilisation** from the camera's ~1 kHz fused attitude:
   - `horizon`: level horizon, heading follows smoothed camera heading.
   - `lock`: world-locked to the clip's starting orientation.
@@ -53,6 +54,7 @@ $B stitch clip.OSV -t 10 -w 2048 --stabilize horizon -o f.png
 $B render clip.OSV -s 48 -d 12 -w 1280 --stabilize horizon -o out.mp4
 $B rig clip.OSV > rig.json;  $B imu clip.OSV > imu.csv
 $B seam clip.OSV -s 10 -d 3 > seam.csv                 # seam alignment quality (summary on stderr)
+$B seam clip.OSV -s 7.37 -d 0.1 --dump DIR             # strips, differences and shift field as images
 ```
 
 Debug flags on `stitch`/`render`:
@@ -60,7 +62,7 @@ Debug flags on `stitch`/`render`:
 - `--only 0|1`: render a single lens, to check overlap.
 - `--variant N`: use an alternative calibration.
 - `--no-rs`: disable rolling-shutter correction.
-- `--no-exposure`, `--no-align`: disable the seam corrections, to compare.
+- `--no-exposure`, `--no-align`, `--no-cut`: disable the seam corrections, to compare.
 - `--imu-axes`, `--world-z-down`: override the IMU mapping (only for other bodies).
 
 Player keys:
@@ -160,6 +162,8 @@ How it was found:
   - A temporal term (cost per degree from last frame's shift, 0.1) plus a stronger distance prior (0.06) cut eased jitter ~4× (0037: 0.224° → 0.054°/frame) with equal or lower mismatch.
   - Bigger patches lower mismatch slightly but double jitter. Finer cells (256 × 13) change mismatch < 0.5%.
   - A constant shift along the seam (φ) only makes mismatch worse, so the calibration lines up along the seam; the search stays 1-D.
+- The selfie stick runs down rig +y (strip column 511 in `seam --dump`). There DJI's masks cut a hump out of each lens, so the overlap shrinks to ~86–94°. Lens 0 sees the arm running into its mask while lens 1 sees only the fist: different content, not a shift, so no alignment setting helps. The `seam` report's stick-zone score (±17° around the stick) showed it. A wider search (±9°), a capped distance prior, and shorter, wider or less complete patches all left it flat or worse.
+- The disagreement cut (`stitch::cut_share`, shader `cut_share`) handles it instead: from a 0.06 to 0.18 RGB difference it sharpens the blend to a ±0.08 step at the seam's middle. On 0043 it made the see-through fist solid, sharpened close rock and left the sky seam unchanged (exposure matching is why: the first try, before it, drew lines in the sky). It changes ~1.4% of the sphere.
 
 ### Hardware decode through the ffmpeg CLI
 

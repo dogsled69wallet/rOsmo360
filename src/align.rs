@@ -13,6 +13,7 @@
 use crate::ring::Ring;
 use crate::stitch::Lens;
 use rayon::prelude::*;
+use std::path::Path;
 use std::f64::consts::TAU;
 
 /// Field cells around the ring and across the seam.
@@ -85,6 +86,13 @@ impl Field {
 pub struct Strips([Vec<f32>; 2]);
 
 impl Strips {
+    /// |lens 0 − lens 1| at strip pixel (x, y) once `field` is applied.
+    fn disagreement(&self, field: &Field, x: usize, y: usize) -> f64 {
+        let a = STRIP_ALPHA_LO + y as f64 * STRIP_STEP;
+        let half = 0.5 * field.at((x as f64 + 0.5) / STRIP_W as f64 * TAU, a).to_degrees() / STRIP_STEP;
+        (self.at(0, x, y as f64 - half) - self.at(1, x, y as f64 + half)).abs()
+    }
+
     /// Linear in α between strip rows.
     fn at(&self, lens: usize, x: usize, y: f64) -> f64 {
         let y0 = y.floor();
@@ -132,9 +140,44 @@ impl Aligner {
         Field(cells)
     }
 
+    /// Writes the frame's strips as images for inspection: each lens, their
+    /// difference before and after `field`, and the field itself (red is
+    /// lens 1 further from lens 0's axis, blue nearer; full colour at 6°).
+    pub fn dump(&self, strips: &Strips, field: &Field, dir: &Path) -> anyhow::Result<()> {
+        let gray = |name: &str, f: &dyn Fn(usize, usize) -> f64| -> anyhow::Result<()> {
+            let px: Vec<u8> = (0..STRIP_W * STRIP_H).map(|i| f(i % STRIP_W, i / STRIP_W)).map(|v| if v.is_nan() { 0 } else { (v * 255.0).clamp(0.0, 255.0) as u8 }).collect();
+            image::save_buffer(dir.join(name), &px, STRIP_W as u32, STRIP_H as u32, image::ColorType::L8)?;
+            Ok(())
+        };
+        gray("lens0.png", &|x, y| strips.at(0, x, y as f64))?;
+        gray("lens1.png", &|x, y| strips.at(1, x, y as f64))?;
+        let none = Field::default();
+        gray("diff_none.png", &|x, y| 4.0 * strips.disagreement(&none, x, y))?;
+        gray("diff_aligned.png", &|x, y| 4.0 * strips.disagreement(field, x, y))?;
+        let k = 8;
+        let rgb: Vec<u8> = (0..CELLS_ALPHA * k)
+            .flat_map(|y| (0..CELLS_PHI * k).map(move |x| (x / k, y / k)))
+            .flat_map(|(cx, cy)| {
+                let d = (field.0[cy * CELLS_PHI + cx] as f64).to_degrees() / 6.0;
+                let v = (d.abs().min(1.0) * 255.0) as u8;
+                if d > 0.0 { [v, 0, 0] } else { [0, 0, v] }
+            })
+            .collect();
+        image::save_buffer(dir.join("field.png"), &rgb, (CELLS_PHI * k) as u32, (CELLS_ALPHA * k) as u32, image::ColorType::Rgb8)?;
+        Ok(())
+    }
+
+    /// The strip column a rig direction falls in, if it is on the strip.
+    pub fn column(&self, d: [f64; 3]) -> usize {
+        let (phi, _) = self.ring.coords(d);
+        ((phi / TAU * STRIP_W as f64) as usize).min(STRIP_W - 1)
+    }
+
     /// Mean absolute luma difference between the lenses across the blend
     /// band once `field` is applied: what ghosting is left.
-    pub fn mismatch(&self, strips: &Strips, field: &Field) -> f64 {
+    /// `around` limits it to the strip columns within ±17° of that column
+    /// (the stick zone, say), where the global average hides what happens.
+    pub fn mismatch(&self, strips: &Strips, field: &Field, around: Option<usize>) -> f64 {
         let (mut sum, mut n) = (0.0, 0usize);
         for y in 0..STRIP_H {
             let a = STRIP_ALPHA_LO + y as f64 * STRIP_STEP;
@@ -142,11 +185,15 @@ impl Aligner {
                 continue;
             }
             for x in 0..STRIP_W {
-                let phi = (x as f64 + 0.5) / STRIP_W as f64 * TAU;
-                let half = 0.5 * field.at(phi, a).to_degrees() / STRIP_STEP;
-                let (va, vb) = (strips.at(0, x, y as f64 - half), strips.at(1, x, y as f64 + half));
-                if !va.is_nan() && !vb.is_nan() {
-                    sum += (va - vb).abs();
+                if let Some(c) = around {
+                    let d = (x as isize - c as isize).rem_euclid(STRIP_W as isize);
+                    if d.min(STRIP_W as isize - d) > 48 {
+                        continue;
+                    }
+                }
+                let v = strips.disagreement(field, x, y);
+                if !v.is_nan() {
+                    sum += v;
                     n += 1;
                 }
             }
