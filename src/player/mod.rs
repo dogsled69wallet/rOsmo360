@@ -274,6 +274,11 @@ struct App {
     /// A trim or keyframe drag has saved the edit for undo already.
     dragging: bool,
     clip: Option<Clip>,
+    /// The picture as it was drawn when the playhead crossed into another
+    /// cut, kept until that cut's first frame arrives. Drawing the old frame
+    /// with the new cut's stabilisation and keyframes showed it at a wrong
+    /// angle for a moment, like a ghost of the previous clip.
+    held: Option<Sphere>,
     loading: Option<PathBuf>,
     error: Option<String>,
     /// The free-look view: what is shown unless following keyframes.
@@ -311,6 +316,7 @@ impl App {
             resolution: crate::Resolution::P1080,
             exporting: None,
             clip: None,
+            held: None,
             loading: None,
             error: None,
             look: View::default(),
@@ -881,6 +887,18 @@ impl App {
         }
     }
 
+    /// The 360 view as it should be drawn now, once a frame is decoded.
+    fn sphere(&self) -> Option<Sphere> {
+        let c = self.clip.as_ref()?;
+        Some(Sphere {
+            rig: c.playback.media.rig.clone(),
+            shown: c.shown.clone()?,
+            camera: self.camera(),
+            rig_from_view: c.playback.rig_from_view(self.rolling_shutter),
+            fov_deg: self.shown_view().fov,
+        })
+    }
+
     /// Adds the whole clip as a cut at the end of the edit and selects it.
     /// The first clip starts playing, as opening a clip always did; later
     /// ones leave playback where it is.
@@ -901,8 +919,12 @@ impl App {
     fn goto(&mut self, i: usize, t: f64, play: bool) {
         let Some(cut) = self.edit.cuts.get(i) else { return };
         let t = t.clamp(cut.start, cut.end);
+        let other_clip = self.clip.as_ref().is_none_or(|c| c.playback.media.input != cut.input);
+        if (i != self.current || other_clip) && self.held.is_none() {
+            self.held = self.sphere();
+        }
         match &mut self.clip {
-            Some(c) if c.playback.media.input == cut.input => c.playback.jump(t, play),
+            Some(c) if !other_clip => c.playback.jump(t, play),
             _ => {
                 let Some(media) = self.library.iter().find(|m| m.input == cut.input) else { return };
                 let mut media = media.clone();
@@ -910,8 +932,7 @@ impl App {
                 media.stab.set_mode(self.opts.stabilize);
                 let mut playback = Playback::new(media, self.volume(), self.full_on_pause);
                 playback.jump(t, play);
-                let shown = self.clip.take().and_then(|c| c.shown);
-                self.clip = Some(Clip { playback, shown });
+                self.clip = Some(Clip { playback, shown: None });
             }
         }
         self.current = i;
@@ -988,6 +1009,7 @@ impl App {
         let Some(c) = &mut self.clip else { return };
         if let Some((frame, fix)) = c.playback.tick() {
             c.shown = Some(Arc::new(Shown::new(frame, fix)));
+            self.held = None;
         }
         self.error = c.playback.error.clone();
         // At a cut's out point (or the clip's end), play on into the next cut.
@@ -1120,15 +1142,8 @@ impl App {
             .align_y(Alignment::Center);
 
         let shown_view = self.shown_view();
-        let view: Element<'_, Message> = match &clip.shown {
-            Some(shown) => {
-                let sphere = Sphere {
-                    rig: media.rig.clone(),
-                    shown: shown.clone(),
-                    camera: self.camera(),
-                    rig_from_view: p.rig_from_view(self.rolling_shutter),
-                    fov_deg: shown_view.fov,
-                };
+        let view: Element<'_, Message> = match self.held.clone().or_else(|| self.sphere()) {
+            Some(sphere) => {
                 let aspect = self.aspect;
                 // A locked aspect is the largest box of that shape that fits.
                 responsive(move |room| {
