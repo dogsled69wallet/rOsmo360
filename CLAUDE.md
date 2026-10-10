@@ -46,10 +46,10 @@ Not done yet, roughly in priority order:
 2. **Native widget shapes.** native-theme-iced's per-widget styles (radii, padding, pressed and focus states); only the colours follow the OS today.
 3. **Windows and macOS groundwork.** Add `d3d11va` and `videotoolbox` to `Hwaccel::pick`, and `cargo check` for both targets. Then hide the console window on Windows (the CLI commands still need one), and bundle ffmpeg or document installing it (mind its GPL builds). A macOS `.app` would need signing and notarisation.
 4. **Seam, what's left.** Patch matching is tuned out, the stick is handled by the cut, and the sky by detail-only matching (see Seam below). Further gains need per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
-5. **Timeline polish (branch `timeline`).** Done there: keyframes, cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
+5. **Timeline polish (branch `timeline`).** Done there: keyframes (with their ease), cuts (split, trim, move, delete, undo), project save/open and export from the player. Left:
    - Thumbnails on the cut blocks.
    - Crossfades between cuts.
-   - Stabilisation mode per cut, and choosing a keyframe's ease (smooth, linear or hold) in the GUI.
+   - Stabilisation mode per cut.
    - `preview` reading projects.
    - GPU export: the CPU export runs ~5 fps at 1080p.
    - Spherical metadata on equirect export.
@@ -91,7 +91,7 @@ Player keys:
 - Ctrl+O: open. Seek bar: drag to scrub.
 - 0: reset view. F: fullscreen.
 - Ctrl+O / Add clip…: append clips (several at once) as cuts. C: split the cut at the playhead. Drag a cut's edge to trim it, drag the cut to move it. Shift+Del: delete the selected cut. Ctrl+Z / Ctrl+Shift+Z: undo / redo. Ctrl+S / Ctrl+Shift+S / Ctrl+Shift+O: save / save as / open a project (`project::Project` JSON, the file `export` reads; clips under the project's folder are stored relative). `play edit.json` opens one. Closing the window or opening another project with unsaved changes asks Save / Don't save / Cancel (rfd message dialog; `exit_on_close_request` is off and `window::close_requests` drives it). Export… renders the edit with the CLI's `export` on a thread (progress and Cancel in the top bar), at the picked resolution, in the aspect lock's shape (16:9 when free), with the player's stabilisation and rolling-shutter settings.
-- K: keyframe the view at the playhead (updates one there). `[` `]`: previous/next keyframe. Del: delete it. On the timeline: click a diamond to jump, drag it to retime.
+- K: keyframe the view at the playhead (updates one there). `[` `]`: previous/next keyframe. Del: delete it. J or the Ease picker: how it moves on to the next (smooth ◆, linear ●, hold ■; the timeline draws that shape). On the timeline: click a diamond to jump, drag it to retime.
 - While following keyframes (after play, seek or a keyframe edit) the view comes from them; looking around by hand takes over from that view until the next play or seek.
 
 Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for sound on Linux; PipeWire and PulseAudio serve it through their ALSA plugins.

@@ -190,6 +190,20 @@ pub enum Ease {
     Hold,
 }
 
+impl Ease {
+    pub const ALL: [Ease; 3] = [Ease::Smooth, Ease::Linear, Ease::Hold];
+}
+
+impl fmt::Display for Ease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Ease::Smooth => "Smooth",
+            Ease::Linear => "Linear",
+            Ease::Hold => "Hold",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Keyframe {
     /// Clip time in seconds.
@@ -298,6 +312,11 @@ impl Keyframes {
 
     pub fn remove(&mut self, i: usize) {
         self.0.remove(i);
+    }
+
+    /// Sets how keyframe `i` moves on to the next.
+    pub fn set_ease(&mut self, i: usize, ease: Ease) {
+        self.0[i].ease = ease;
     }
 
     /// Moves keyframe `i` to time `t`, kept between its neighbours (`gap`

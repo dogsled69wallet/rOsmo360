@@ -256,6 +256,12 @@ impl Playback {
         }
     }
 
+    /// Where playback is headed: the frame on screen while playing, else
+    /// the last seek's time, whose frame may still be decoding.
+    pub fn target(&self) -> f64 {
+        if self.playing { self.shown_pts } else { self.anchor_pts }
+    }
+
     /// Where the seek bar should sit: under the pointer while dragging.
     pub fn position(&self) -> f64 {
         if self.scrub.is_some() { self.anchor_pts } else { self.shown_pts }

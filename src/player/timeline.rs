@@ -1,10 +1,11 @@
 //! The timeline under the view. The top row holds the edit's cuts as
 //! blocks: click one to select it, drag it to move it, drag its edges to
 //! trim it. The bottom row is the seek bar with each cut's keyframes as
-//! diamonds: click the bar to seek, click a diamond to jump to it, drag one
+//! diamonds (shaped by their ease): click the bar to seek, click a diamond to jump to it, drag one
 //! to retime it.
 
 use super::Message;
+use crate::view::Ease;
 use iced::alignment::Vertical;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Text};
@@ -30,9 +31,9 @@ pub struct Block {
     pub len: f64,
     /// Its in point in clip time.
     pub start: f64,
-    /// Its keyframes within the cut: index into the cut's keyframes, and
-    /// clip time.
-    pub keys: Vec<(usize, f64)>,
+    /// Its keyframes within the cut: index into the cut's keyframes, clip
+    /// time, and how it moves on to the next (drawn as its shape).
+    pub keys: Vec<(usize, f64, Ease)>,
 }
 
 pub struct Timeline {
@@ -80,7 +81,7 @@ impl Timeline {
     fn key_at(&self, x: f32, b: Rectangle) -> Option<(usize, usize)> {
         let mut best = None;
         for (ci, c) in self.blocks.iter().enumerate() {
-            for &(ki, t) in &c.keys {
+            for &(ki, t, _) in &c.keys {
                 let d = (self.x(c.from + t - c.start, b) - x).abs();
                 if d <= PICK && best.is_none_or(|(bd, _)| d < bd) {
                     best = Some((d, (ci, ki)));
@@ -217,18 +218,23 @@ impl canvas::Program<Message> for Timeline {
             frame.fill(&Path::rectangle(Point::new(x - 1.0, mid - BAR), Size::new(2.0, 2.0 * BAR)), palette.background.base.color);
         }
         for (ci, c) in self.blocks.iter().enumerate() {
-            for &(ki, t) in &c.keys {
+            for &(ki, t, ease) in &c.keys {
                 let x = self.x(c.from + t - c.start, bounds);
-                let diamond = Path::new(|p| {
-                    p.move_to(Point::new(x, mid - DIAMOND));
-                    p.line_to(Point::new(x + DIAMOND, mid));
-                    p.line_to(Point::new(x, mid + DIAMOND));
-                    p.line_to(Point::new(x - DIAMOND, mid));
-                    p.close();
-                });
+                // Smooth is a diamond, linear a circle, hold a square.
+                let mark = match ease {
+                    Ease::Smooth => Path::new(|p| {
+                        p.move_to(Point::new(x, mid - DIAMOND));
+                        p.line_to(Point::new(x + DIAMOND, mid));
+                        p.line_to(Point::new(x, mid + DIAMOND));
+                        p.line_to(Point::new(x - DIAMOND, mid));
+                        p.close();
+                    }),
+                    Ease::Linear => Path::circle(Point::new(x, mid), DIAMOND * 0.8),
+                    Ease::Hold => Path::rectangle(Point::new(x - DIAMOND * 0.7, mid - DIAMOND * 0.7), Size::new(DIAMOND * 1.4, DIAMOND * 1.4)),
+                };
                 let fill = if Some((ci, ki)) == self.current { palette.primary.strong.color } else { palette.background.base.text };
-                frame.fill(&diamond, fill);
-                frame.stroke(&diamond, Stroke::default().with_width(1.5).with_color(palette.background.base.color));
+                frame.fill(&mark, fill);
+                frame.stroke(&mark, Stroke::default().with_width(1.5).with_color(palette.background.base.color));
             }
         }
         frame.fill(&Path::rectangle(Point::new(at - 1.0, 0.0), Size::new(2.0, CUTS)), palette.primary.strong.color);

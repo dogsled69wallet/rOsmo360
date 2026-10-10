@@ -76,6 +76,7 @@ In the player:
 | Keyframe the current view | K, or the ◆+ button (on a keyframe, it updates it) |
 | Jump to the previous / next keyframe | `[` / `]`, or click a ◆ on the timeline |
 | Move / delete a keyframe | Drag its ◆ / Delete |
+| How a keyframe moves on to the next | J cycles, or the Ease picker: smooth (◆), linear (●) or hold (■, stays put then cuts) |
 | Add clips to the edit | Add clip… (Ctrl+O); several at once is fine |
 | Split the cut at the playhead | C, or ✂ |
 | Trim / move a cut | Drag its edge / drag the cut on the timeline |

@@ -53,7 +53,7 @@ enum Cmd {
     /// Drag: look around · right-drag or Q/E: roll · arrows: pitch, seek (shift: yaw) ·
     /// scroll: zoom · space: play/pause · , .: frame step · S: stabilisation ·
     /// R: rolling shutter · P: projection · M: mute · 0: reset view · F: fullscreen · Ctrl+O: open ·
-    /// K: keyframe the view here · [ ]: previous/next keyframe · Del: delete keyframe ·
+    /// K: keyframe the view here · [ ]: previous/next keyframe · Del: delete keyframe · J: its ease ·
     /// C: split the cut · Shift+Del: delete the selected cut · Ctrl+Z / Ctrl+Shift+Z: undo / redo
     Play {
         /// Clips to open at start, one cut each in this order, or a saved

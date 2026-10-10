@@ -15,7 +15,7 @@ use crate::ffmpeg::{self, Hwaccel};
 use crate::stab::{ImuAxes, Mode, Stabilizer};
 use crate::project::{Cut, Project};
 use crate::stitch::M3;
-use crate::view::{Camera, Projection, View};
+use crate::view::{Camera, Ease, Projection, View};
 use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
@@ -251,6 +251,8 @@ enum Message {
     KeyAdd,
     /// Delete the keyframe at the playhead.
     KeyDelete,
+    /// How the keyframe at the playhead moves on to the next.
+    KeyEase(Ease),
     /// Jump to keyframe `.1` of cut `.0`.
     KeyJump(usize, usize),
     /// Drag keyframe `.1` of cut `.0` to clip time `.2`.
@@ -803,8 +805,8 @@ impl App {
                 }
             }
             Message::Split => {
-                let Some(c) = &self.clip else { return Task::none() };
-                let (i, t) = (self.current, c.playback.shown_pts);
+                let Some((_, t)) = self.playing_cut() else { return Task::none() };
+                let i = self.current;
                 self.edit.checkpoint();
                 if self.edit.split(i, t) {
                     // The playhead is now at the start of the second half.
@@ -832,7 +834,7 @@ impl App {
             }
             Message::KeyAdd => {
                 let (view, tolerance) = (self.shown_view(), self.tolerance());
-                let Some(t) = self.clip.as_ref().map(|c| c.playback.shown_pts) else { return Task::none() };
+                let Some((_, t)) = self.playing_cut() else { return Task::none() };
                 self.edit.checkpoint();
                 if let Some(cut) = self.edit.cuts.get_mut(self.current) {
                     cut.keyframes.set(t, view, tolerance);
@@ -843,6 +845,15 @@ impl App {
                 if let Some(k) = self.current_key() {
                     self.edit.checkpoint();
                     self.edit.cuts[self.current].keyframes.remove(k);
+                }
+            }
+            Message::KeyEase(ease) => {
+                if let Some(k) = self.current_key()
+                    && self.edit.cuts[self.current].keyframes[k].ease != ease
+                {
+                    self.edit.checkpoint();
+                    self.edit.cuts[self.current].keyframes.set_ease(k, ease);
+                    self.follow = true;
                 }
             }
             Message::KeyJump(i, k) => {
@@ -973,9 +984,13 @@ impl App {
         self.clip.as_ref().map_or(0.0, |c| 0.5 / c.playback.media.fps)
     }
 
-    /// The playing cut, and the clip time on screen.
+    /// The playing cut, and the playhead's clip time. That is where a seek
+    /// went even before its frame has decoded, and within the cut: in points
+    /// fall between frames, so the frame shown can be a hair before it, and a
+    /// keyframe there would be outside the cut, never drawn.
     fn playing_cut(&self) -> Option<(&Cut, f64)> {
-        Some((self.edit.cuts.get(self.current)?, self.clip.as_ref()?.playback.shown_pts))
+        let cut = self.edit.cuts.get(self.current)?;
+        Some((cut, self.clip.as_ref()?.playback.target().clamp(cut.start, cut.end)))
     }
 
     fn fps(&self) -> f64 {
@@ -1189,6 +1204,13 @@ impl App {
                 "e" | "E" => self.free_look().roll += step,
                 "0" => self.free_look().reset(),
                 "k" | "K" => return self.update(Message::KeyAdd),
+                "j" | "J" => {
+                    if let Some(k) = self.current_key() {
+                        let ease = self.edit.cuts[self.current].keyframes[k].ease;
+                        let i = Ease::ALL.iter().position(|&e| e == ease).unwrap_or(0);
+                        return self.update(Message::KeyEase(Ease::ALL[(i + 1) % Ease::ALL.len()]));
+                    }
+                }
                 "[" => return self.key_step(-1.0),
                 "]" => return self.key_step(1.0),
                 "," | "." => {
@@ -1298,7 +1320,7 @@ impl App {
             .cuts
             .iter()
             .map(|c| {
-                let keys = c.keyframes.iter().enumerate().filter(|(_, k)| k.t >= c.start - tolerance && k.t <= c.end + tolerance).map(|(i, k)| (i, k.t)).collect();
+                let keys = c.keyframes.iter().enumerate().filter(|(_, k)| k.t >= c.start - tolerance && k.t <= c.end + tolerance).map(|(i, k)| (i, k.t, k.ease)).collect();
                 let block = timeline::Block { label: format!("{} · {:.1} s", clip_name(&c.input), c.end - c.start), from, len: c.end - c.start, start: c.start, keys };
                 from += c.end - c.start;
                 block
@@ -1313,7 +1335,7 @@ impl App {
         })
         .width(Length::Fill)
         .height(timeline::HEIGHT);
-        let can_split = self.edit.cuts.get(self.current).is_some_and(|c| p.shown_pts > c.start + edit::MIN_CUT && p.shown_pts < c.end - edit::MIN_CUT);
+        let can_split = self.edit.cuts.get(self.current).is_some_and(|c| p.target() > c.start + edit::MIN_CUT && p.target() < c.end - edit::MIN_CUT);
         let transport = row![
             button(text(if p.playing { "Pause" } else { "Play" }).width(48).align_x(Alignment::Center)).on_press(Message::Toggle),
             tooltip(
@@ -1333,6 +1355,11 @@ impl App {
                 tooltip::Position::Top,
             ),
             tooltip(icon_button(KEY_DELETE, current.map(|_| Message::KeyDelete)), text("Delete this keyframe (Del)"), tooltip::Position::Top),
+            tooltip(
+                pick_list(&Ease::ALL[..], current.map(|k| self.edit.cuts[self.current].keyframes[k].ease), Message::KeyEase).placeholder("Ease").width(96),
+                text("How this keyframe moves on to the next (J cycles)"),
+                tooltip::Position::Top,
+            ),
             tooltip(icon_button(SPLIT, can_split.then_some(Message::Split)), text("Split the cut at the playhead (C)"), tooltip::Position::Top),
             tooltip(
                 icon_button(DELETE_CUT, self.selected.map(|_| Message::DeleteCut)),
