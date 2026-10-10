@@ -1,16 +1,18 @@
 # rOsmo360
 
-A 360° video player for **DJI Osmo 360** footage, written in Rust. It plays the camera's `.OSV` files directly: it stitches the two fisheye lenses, stabilises with the camera's gyro data and lets you look around freely, without going through DJI Studio.
+A 360° video player and editor for **DJI Osmo 360** footage, written in Rust. It plays the camera's `.OSV` files directly: it stitches the two fisheye lenses, stabilises with the camera's gyro data and lets you look around freely, without going through DJI Studio. Then you can cut clips together on a timeline, keyframe the camera's view, and export a framed video.
 
-![rOsmo360 playing a clip from a mountain hike, looking out over a lake and glaciers](docs/screenshot.png)
+![rOsmo360 editing a mountain hike: the view over a lake and glaciers, with cuts from three clips on the timeline below, their thumbnails and keyframes](docs/screenshot.png)
 
 Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 
 ## Why
 
-I vibed this tool primarily for Linux, since I couldn't find anything close to DJI Studio there. The goal of rOsmo360 is to bring most of DJI Studio's playback and some limited editing functionality to Linux users. It isn't Linux-exclusive, though: Windows and macOS support is in the pipeline.
+I vibed this tool primarily for Linux, since I couldn't find anything close to DJI Studio there. The goal of rOsmo360 is to bring most of DJI Studio's playback and editing to Linux users. It isn't Linux-exclusive, though: Windows and macOS support is in the pipeline.
 
 ## Features
+
+### Playing
 
 - **Stitching** with DJI's own calibration, read from each clip. Per frame it also:
   - evens out the two lenses' exposure along the seam;
@@ -24,20 +26,28 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Hardware decoding** on any GPU vendor: Vulkan Video, VA-API or CUDA, with a software fallback.
 - **Sound**, in sync with the picture, with mute and volume.
 - **Save photos** of a paused frame: the view as framed, at 3840 px on the long side, or the whole 360° sphere at 7680 × 3840.
-- **Aspect lock** (16:9, 9:16, 4:3, 1:1, 2:1) for framing shots; saved views take the same shape.
-- **Looks native**: follows your desktop's colour theme (KDE, GNOME, Windows, macOS), including live changes.
+- **Aspect lock** (16:9, 9:16, 4:3, 1:1, 2:1) for framing shots; saved views and exports take the same shape.
+- **Looks native**: follows your desktop's colour theme (KDE, GNOME, Windows, macOS), including live changes. Your settings are remembered between runs.
 
-Command-line tools can also:
+### Editing
 
-- **Export framed video**: a fixed view or keyframed camera moves (pans, zooms, a morph into little planet), in any shape such as 9:16, with sound.
-- **Skim clips**: contact sheets of stitched frames, and a per-second summary of the camera's motion and the sound level.
+- **Timeline** of cuts from one or more clips: split, trim, move and delete them, with undo and redo. Each cut shows thumbnails of its footage, and the timeline zooms in for fine work.
+- **Keyframes** for the view: where it looks (yaw, pitch, roll), the zoom, and the projection, so a shot can pan, zoom or morph into a little planet. Each keyframe eases into the next smoothly, at a steady speed, or holds and then cuts.
+- **Stabilisation per cut**: one cut world-locked, the next following the horizon.
+- **Projects**: save the edit and open it again later.
+- **Export** the edit to MP4 with its sound, from 720p to 4K, in the aspect lock's shape. It renders on the GPU, about four times faster than the CPU (21 frames a second at 1080p on an RTX 3090).
+
+### Command line
+
+- **Export** a clip with a fixed view or keyframed camera moves, or a whole project, in any shape such as 9:16.
+- **Skim clips**: contact sheets of stitched frames (of a clip, or of a project with a row per cut), and a per-second summary of the camera's motion and the sound level.
 - Stitch single frames or whole clips to equirectangular images and MP4 video.
 
 ## Requirements
 
 - A DJI Osmo 360 clip (`.OSV`). Keep the `.LRF` proxy file next to it for the smoothest playback.
 - `ffmpeg` and `ffprobe` on your `PATH`.
-- A GPU with Vulkan support (Linux) and up-to-date drivers.
+- A GPU with Vulkan support (Linux) and up-to-date drivers. It plays, decodes and exports.
 - On Linux, ALSA for sound (`alsa-lib`, or `libasound2-dev` on Debian/Ubuntu). PipeWire and PulseAudio work through it.
 - To build: Rust 1.88 or newer.
 
@@ -155,9 +165,10 @@ rosmo360 scan clip.OSV > scan.csv           # per second: heading, tilt, turning
 
 ## Roadmap
 
+- Crossfades between cuts.
+- 360° metadata on equirectangular exports, so YouTube and VR players show them as 360° video.
 - Smooth full-resolution playback on modest hardware (zero-copy decoding).
 - Windows and macOS builds.
-- Keyframing in the player, sharing the reframe files the command line uses.
 - D-Log M colour support.
 
 ## License
