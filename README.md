@@ -27,7 +27,11 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Aspect lock** (16:9, 9:16, 4:3, 1:1, 2:1) for framing shots; saved views take the same shape.
 - **Looks native**: follows your desktop's colour theme (KDE, GNOME, Windows, macOS), including live changes.
 
-Command-line tools can also stitch single frames or whole clips to equirectangular images and MP4 video.
+Command-line tools can also:
+
+- **Export framed video**: a fixed view or keyframed camera moves (pans, zooms, a morph into little planet), in any shape such as 9:16, with sound.
+- **Skim clips**: contact sheets of stitched frames, and a per-second summary of the camera's motion and the sound level.
+- Stitch single frames or whole clips to equirectangular images and MP4 video.
 
 ## Requirements
 
@@ -75,13 +79,48 @@ rosmo360 stitch clip.OSV -t 10 -w 4096 --stabilize horizon -o frame.png   # one 
 rosmo360 render clip.OSV -s 48 -d 12 -w 3840 --stabilize horizon -o out.mp4   # a span to an equirect MP4
 ```
 
+Framed video:
+
+```sh
+rosmo360 export clip.OSV -s 30 -d 8 --view 40,-10 -a 9:16 -o reel.mp4   # a fixed view: yaw 40°, pitch −10°, vertical
+rosmo360 export clip.OSV --reframe moves.json -o reel.mp4                         # keyframed camera moves
+rosmo360 export clip.OSV --reframe moves.json --draft -o draft.mp4                # quick, soft draft from the proxy
+```
+
+Angles are in degrees: yaw turns right, pitch looks up. With stabilisation on (horizon, the default), yaw 0 is straight ahead. A reframe file lists keyframes; each may leave out what stays the same:
+
+```json
+{
+  "aspect": "9:16",
+  "keyframes": [
+    {"t": 28, "yaw": -20, "pitch": -5, "fov": 80},
+    {"t": 32, "yaw": 100, "pitch": -15, "fov": 70},
+    {"t": 34},
+    {"t": 37, "projection": "little-planet", "pitch": -90, "fov": 130}
+  ]
+}
+```
+
+Exports are 1080p by default (1920 × 1080, or 1080 × 1920 for 9:16), a good quality for sharing online. `-r` picks `720p`, `1080p`, `1440p` or `2160p` (`4k`), meaning the short side in pixels. `-a` sets the shape (`16:9`, `9:16`, `1:1`, `4:5`, …) when the reframe file doesn't, and `--size 1234x567` gives an exact size.
+
+`t` is the clip time in seconds; `projection` is `perspective`, `little-planet` or `equirect`; `ease` (how a keyframe moves on to the next) is `smooth` (the default), `linear` or `hold`. Perspective and little planet morph smoothly into each other.
+
+Skimming a clip:
+
+```sh
+rosmo360 info clip.OSV                      # length, frame rate, recording time, as JSON
+rosmo360 preview clip.OSV -o sheet.png      # 24 moments on one contact sheet, marked with time and yaw
+rosmo360 preview clip.OSV --reframe moves.json -o check.png   # the framing at each keyframe
+rosmo360 scan clip.OSV > scan.csv           # per second: heading, tilt, turning, shake, loudness
+```
+
 `rosmo360 --help` lists everything, including `rig` (calibration as JSON), `imu` (motion data as CSV) and `seam` (seam quality report).
 
 ## Roadmap
 
 - Smooth full-resolution playback on modest hardware (zero-copy decoding).
 - Windows and macOS builds.
-- Video export of a framed view.
+- Keyframing in the player, sharing the reframe files the command line uses.
 - D-Log M colour support.
 
 ## License

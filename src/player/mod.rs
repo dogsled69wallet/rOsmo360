@@ -10,7 +10,8 @@ mod source;
 
 use crate::ffmpeg::{self, Hwaccel};
 use crate::stab::{ImuAxes, Mode, Stabilizer};
-use crate::stitch::{M3, mat_mul};
+use crate::stitch::M3;
+use crate::view::{Camera, Projection, View};
 use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
@@ -60,21 +61,9 @@ pub struct Options {
 
 impl Media {
     fn load(input: PathBuf, opts: &Options) -> Result<Media> {
-        let render = crate::RenderOpts {
-            width: 0,
-            variant: None,
-            only: None,
-            stabilize: opts.stabilize,
-            smooth: 500.0,
-            imu_axes: opts.imu_axes,
-            world_z_down: opts.world_z_down,
-            no_rs: false,
-            no_exposure: false,
-            no_align: false,
-            no_cut: false,
-        };
-        let p = crate::Pipeline::new(&input, &render)?;
-        let proxy = ["LRF", "lrf"].iter().map(|ext| input.with_extension(ext)).find(|p| p.exists());
+        let stitch = crate::StitchOpts { stabilize: Some(opts.stabilize), imu_axes: opts.imu_axes, world_z_down: opts.world_z_down, ..Default::default() };
+        let p = crate::Pipeline::new(&input, &stitch, opts.stabilize)?;
+        let proxy = ffmpeg::proxy(&input);
         let hw = match opts.hw {
             Some(hw) => hw,
             None => Hwaccel::pick(&input, p.tracks[0])?,
@@ -120,27 +109,6 @@ pub fn run(input: Option<PathBuf>, opts: Options) -> Result<()> {
     })
     .run()
     .context("running the player window")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Projection {
-    Perspective,
-    LittlePlanet,
-    Equirect,
-}
-
-impl Projection {
-    const ALL: [Projection; 3] = [Projection::Perspective, Projection::LittlePlanet, Projection::Equirect];
-}
-
-impl fmt::Display for Projection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Projection::Perspective => "Perspective",
-            Projection::LittlePlanet => "Little planet",
-            Projection::Equirect => "Equirect",
-        })
-    }
 }
 
 /// What "save" writes: the view as framed, or the whole sphere.
@@ -199,59 +167,6 @@ impl fmt::Display for Source {
     }
 }
 
-struct Look {
-    yaw: f64,
-    pitch: f64,
-    roll: f64,
-    fov_deg: f64,
-    projection: Projection,
-}
-
-impl Look {
-    fn reset(&mut self) {
-        *self = match self.projection {
-            Projection::LittlePlanet => Look::default(),
-            projection => Look { yaw: 0.0, pitch: 0.0, roll: 0.0, fov_deg: 90.0, projection },
-        };
-    }
-
-    /// view_from_screen-ray: yaw about +y, then pitch about +x, then roll.
-    fn matrix(&self) -> M3 {
-        let (sy, cy) = self.yaw.sin_cos();
-        let (sp, cp) = self.pitch.sin_cos();
-        let (sr, cr) = self.roll.sin_cos();
-        let ry = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]];
-        let rx = [[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]];
-        let rz = [[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]];
-        mat_mul(ry, mat_mul(rx, rz))
-    }
-
-    fn zoom(&self) -> f32 {
-        (self.fov_deg.to_radians() / 2.0).tan() as f32
-    }
-
-    /// The planet zooms out until the whole sphere is a small disc, the way
-    /// DJI Studio's tiny planet does.
-    fn fov_range(&self) -> (f64, f64) {
-        if self.projection == Projection::LittlePlanet { (10.0, 179.5) } else { (20.0, 150.0) }
-    }
-
-    /// Zooms by `steps` scroll notches, each scaling the picture by 10%:
-    /// near the planet's limit a fixed step in degrees would barely move.
-    fn zoom_by(&mut self, steps: f64) {
-        let (lo, hi) = self.fov_range();
-        let half = ((self.fov_deg.to_radians() / 2.0).tan() * 1.1f64.powf(steps)).atan();
-        self.fov_deg = (2.0 * half.to_degrees()).clamp(lo, hi);
-    }
-}
-
-/// Opens on the little planet, as DJI Studio does.
-impl Default for Look {
-    fn default() -> Self {
-        Look { yaw: 0.0, pitch: -90f64.to_radians(), roll: 0.0, fov_deg: 120.0, projection: Projection::LittlePlanet }
-    }
-}
-
 /// An open clip: its playback plus the frame the view draws.
 struct Clip {
     playback: Playback,
@@ -298,7 +213,7 @@ struct App {
     clip: Option<Clip>,
     loading: Option<PathBuf>,
     error: Option<String>,
-    look: Look,
+    look: View,
     rolling_shutter: bool,
     fullscreen: bool,
     volume: f32,
@@ -318,7 +233,7 @@ impl App {
             clip: None,
             loading: None,
             error: None,
-            look: Look::default(),
+            look: View::default(),
             rolling_shutter: true,
             fullscreen: false,
             volume: 1.0,
@@ -397,12 +312,12 @@ impl App {
             Message::Scrub(t) => self.with_playback(|p| p.scrub(t)),
             Message::ScrubDone => self.with_playback(Playback::scrub_end),
             Message::Look { yaw, pitch, roll } => {
-                self.look.yaw += yaw;
-                self.look.pitch += pitch;
-                self.look.roll += roll;
+                self.look.yaw += yaw.to_degrees();
+                self.look.pitch += pitch.to_degrees();
+                self.look.roll += roll.to_degrees();
             }
             Message::Zoom(deg) => self.look.zoom_by(deg),
-            Message::Fov(deg) => self.look.fov_deg = deg,
+            Message::Fov(deg) => self.look.fov = deg,
             Message::Stab(mode) => {
                 self.opts.stabilize = mode;
                 self.with_playback(|p| p.media.stab.set_mode(mode));
@@ -451,9 +366,7 @@ impl App {
                         // Even sizes keep image tools that halve chroma happy.
                         let px = |v: f32| ((v * k / 2.0).round() as usize).max(1) * 2;
                         export::Shot::View {
-                            user: self.look.matrix(),
-                            zoom: self.look.zoom() as f64,
-                            projection: self.look.projection as u32,
+                            camera: self.look.camera(),
                             size: (px(self.view_size.width), px(self.view_size.height)),
                         }
                     }
@@ -515,7 +428,7 @@ impl App {
     }
 
     fn key(&mut self, key: Key, mods: keyboard::Modifiers) -> Task<Message> {
-        let step = 5f64.to_radians();
+        let step = 5.0;
         match key.as_ref() {
             Key::Named(Named::Escape) if self.fullscreen => return self.update(Message::Fullscreen),
             Key::Named(Named::Space) => self.with_playback(Playback::toggle),
@@ -596,11 +509,9 @@ impl App {
                 let sphere = Sphere {
                     rig: media.rig.clone(),
                     shown: shown.clone(),
-                    user: self.look.matrix(),
-                    zoom: self.look.zoom(),
-                    projection: self.look.projection as u32,
+                    camera: self.look.camera(),
                     rig_from_view: p.rig_from_view(self.rolling_shutter),
-                    fov_deg: self.look.fov_deg,
+                    fov_deg: self.look.fov,
                 };
                 let aspect = self.aspect;
                 // A locked aspect is the largest box of that shape that fits.
@@ -667,7 +578,7 @@ impl App {
             labelled("Projection", pick_list(&Projection::ALL[..], Some(self.look.projection), Message::Projection)),
             labelled("Playback source", pick_list(sources, Some(source), Message::Source)),
             labelled("Aspect", pick_list(&Aspect::ALL[..], Some(self.aspect), Message::Aspect)),
-            labelled("FOV", slider(lo..=hi, self.look.fov_deg, Message::Fov).width(120)),
+            labelled("FOV", slider(lo..=hi, self.look.fov, Message::Fov).width(120)),
             toggler(self.rolling_shutter).label("Rolling shutter").on_toggle(Message::RollingShutter),
             button("Reset view").on_press(Message::ResetView),
             button(if self.fullscreen { "Exit fullscreen" } else { "Fullscreen" }).on_press(Message::Fullscreen),
@@ -753,9 +664,7 @@ fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl F
 struct Sphere {
     rig: Arc<Rig>,
     shown: Arc<Shown>,
-    user: M3,
-    zoom: f32,
-    projection: u32,
+    camera: Camera,
     rig_from_view: Vec<M3>,
     fov_deg: f64,
 }
@@ -823,9 +732,7 @@ impl shader::Program<Message> for Sphere {
         gpu::Primitive {
             rig: self.rig.clone(),
             shown: self.shown.clone(),
-            user: self.user,
-            zoom: self.zoom,
-            projection: self.projection,
+            camera: self.camera,
             rig_from_view: self.rig_from_view.clone(),
         }
     }

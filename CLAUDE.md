@@ -22,6 +22,10 @@ Working and verified on real footage:
   - `stitch`: one frame to an equirect PNG.
   - `render`: span to an equirect MP4 with audio.
   - `seam`: seam alignment quality over a span (ghosting left, frame-to-frame wobble).
+  - `export`: a framed MP4 with sound, from a fixed `--view` or a keyframed `--reframe` JSON (`view::Reframe`). 1080p by default (`-r` 720p–2160p is the short side; `-a` aspect, or the reframe's `"aspect"`). `--draft` stitches from the LRF proxy.
+  - `preview`: a contact sheet of stitched moments labelled with time; equirect tiles marked at yaw −90/0/90° and the horizon, or the reframe's framing.
+  - `scan`: CSV per second of heading, tilt, turning, shake, loudness and peak.
+  - `info`: duration, fps, recording time and contents as JSON.
 - **Real-time player** (`play`), an iced GUI:
   - Open dialog (Ctrl+O), seek bar, and pickers for stabilisation, projection, playback source, FOV and rolling shutter.
   - wgpu shader stitch, drawn as an iced shader widget.
@@ -41,7 +45,7 @@ Not done yet, roughly in priority order:
 2. **Native widget shapes.** native-theme-iced's per-widget styles (radii, padding, pressed and focus states); only the colours follow the OS today.
 3. **Windows and macOS groundwork.** Add `d3d11va` and `videotoolbox` to `Hwaccel::pick`, and `cargo check` for both targets. Then hide the console window on Windows (the CLI commands still need one), and bundle ffmpeg or document installing it (mind its GPL builds). A macOS `.app` would need signing and notarisation.
 4. **Seam, what's left.** Patch matching is tuned out, the stick is handled by the cut, and the sky by detail-only matching (see Seam below). Further gains need per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
-5. **Export from the player (deferred: it stays a player for now).** The current view or keyframed reframing to a flat MP4, and spherical metadata on equirect export. Photo save (PNG) is done.
+5. **Keyframing in the player.** The CLI `export` renders `view::Reframe` keyframes; the player should record and edit the same `Reframe` (set a keyframe at the current time and view, scrub to preview via `Reframe::camera_at`, save and load the JSON), and maybe export through the CLI's pipeline. Also: GPU export (CPU export runs ~5 fps at 1080×1920), and spherical metadata on equirect export.
 6. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
    - Needs a D-Log M sample clip first: all 35 Kyrkja clips are normal colour, tagged BT.709 10-bit, as DJI may also tag D-Log.
    - DJI records the profile in `StreamMeta.color_mode` (`ColorModeType`: D_LOG = 2, HLG = 9, …). telemetry-parser's Metadata tag only serialises the clip meta, so reading it means decoding StreamMeta ourselves.
@@ -57,9 +61,12 @@ $B render clip.OSV -s 48 -d 12 -w 1280 --stabilize horizon -o out.mp4
 $B rig clip.OSV > rig.json;  $B imu clip.OSV > imu.csv
 $B seam clip.OSV -s 10 -d 3 > seam.csv                 # seam alignment quality (summary on stderr)
 $B seam clip.OSV -s 7.37 -d 0.1 --dump DIR             # strips, differences and shift field as images
+$B export clip.OSV --reframe r.json -o hl.mp4          # keyframed framing (--view Y,P[,R[,FOV]] for a fixed one; --draft from the proxy)
+$B preview clip.OSV -o sheet.png                       # 24 stitched moments on one image (--every N, --reframe r.json)
+$B scan clip.OSV > scan.csv;  $B info clip.OSV
 ```
 
-Debug flags on `stitch`/`render`:
+Debug flags on `stitch`/`render`/`export`/`preview`:
 
 - `--only 0|1`: render a single lens, to check overlap.
 - `--variant N`: use an alternative calibration.
@@ -86,7 +93,9 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
   - Rasterised validity masks.
   - Blend weights.
   - Rolling-shutter re-aim.
-- `src/stab.rs`: `Stabilizer::rig_from_view(t_ms, readout_ms, steps)`. Defines the `Mode` and `ImuAxes` enums.
+- `src/stab.rs`: `Stabilizer::rig_from_view(t_ms, readout_ms, steps)`, and `pose` (heading, tilt) for `scan`. Defines the `Mode` and `ImuAxes` enums.
+- `src/view.rs`: `View` (yaw/pitch/roll/fov in degrees, projection), `Reframe` (keyframes, JSON with carry-over of missing fields) and `Camera` (what gets drawn). Shared by the player and `export`/`preview`. `Camera::ray` mirrors the shader's `screen_ray`; change them together.
+- `src/sheet.rs`: contact sheets for `preview`, with a tiny built-in bitmap font for the time labels.
 - `src/ring.rs`: the seam ring: azimuth φ around lens 0's axis and angle α from it.
 - `src/exposure.rs`: per-frame exposure matching (`Seam::measure`, `Seam::gain`).
 - `src/align.rs`: per-frame seam alignment (`Aligner::measure`, `Aligner::warp`).
@@ -100,7 +109,7 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for soun
   - `shader.wgsl`: GPU port of `stitch.rs`.
   - `source.rs`: NV12 decode threads (LRF proxy / OSV) and full-res stills.
   - `audio.rs`: ffmpeg → f32 PCM → cpal output; frames played minus device latency give the clock.
-  - `export.rs`: PNG save of the paused frame. Its `screen_ray` mirrors the shader's; change them together.
+  - `export.rs`: PNG save of the paused frame.
 
 ## Hard-won facts (do not re-derive)
 
@@ -180,6 +189,14 @@ How it was found:
 - VA-API HEVC decode alone runs at about 3× real time per lens.
 - The bottleneck is `scale_vaapi` + `hwdownload` + pipe of two 3840² tracks: 0.55× real time at full res, and only about 1.07× at 1920².
 - So playback uses the proxy, and real full-res playback needs zero-copy.
+
+### Framing and export
+
+- Perspective and little planet are one azimuthal family: the ray is at θ from the view axis where s = sin θ / (d + cos θ), s being the distance from centre in units of tan(fov/2). d = 0 is perspective and d = 1 stereographic (the player's original planet exactly), so keyframes morph between them by blending d. The shader gets d in `screen.w` (negative = equirect).
+- In horizon mode, equirect longitude/latitude = view yaw/pitch, which is why preview tiles map directly to `--view` angles. Lock mode holds the clip's first orientation including its tilt (0037 starts tilted ~49°), so it is level only if the clip started level.
+- The Osmo 360 records only the fused attitude (no raw gyro or accelerometer tags), so `scan` derives turning and shake from attitude differences every 20 ms. On 0037 it shows the known 87° pan at 15–18 s.
+- The stitcher reads the LRF proxy by splitting it into per-lens 1024² frames; `Lens::sample` scales picture coordinates to whatever frame size it gets.
+- Speed on the RTX 3090 desktop: full-quality export ~5 fps at 1080×1920, `--draft` ~8 fps (CPU-bound stitch and seam measure); a 24-tile preview from the proxy ~15 s.
 
 ### iced and wgpu
 

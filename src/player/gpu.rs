@@ -5,6 +5,7 @@ use super::source::{Frame, Layout};
 use crate::align::{Aligner, CELLS_ALPHA, CELLS_PHI, Field};
 use crate::exposure::{BINS, FADE_FROM, FADE_TO, Gains, Seam};
 use crate::stitch::{Lens, M3};
+use crate::view::Camera;
 use bytemuck::{Pod, Zeroable};
 use iced::wgpu;
 use iced::widget::shader::{self, Viewport};
@@ -86,11 +87,8 @@ impl Shown {
 pub struct Primitive {
     pub rig: Arc<Rig>,
     pub shown: Arc<Shown>,
-    /// view_from_screen-ray rotation of the user's free look.
-    pub user: M3,
-    /// Tangent of half the vertical field of view (or the planet zoom).
-    pub zoom: f32,
-    pub projection: u32,
+    /// The user's free look.
+    pub camera: Camera,
     /// rig_from_view at instants spread over the readout.
     pub rig_from_view: Vec<M3>,
 }
@@ -285,8 +283,9 @@ impl shader::Primitive for Primitive {
         }
         let px = *bounds * viewport.scale_factor();
         let mut u = Uniforms::zeroed();
-        u.user = rows(self.user);
-        u.screen = [px.width, px.height, self.zoom, self.projection as f32];
+        u.user = rows(self.camera.user);
+        // A negative mapping means equirect; see the shader's `screen_ray`.
+        u.screen = [px.width, px.height, self.camera.zoom as f32, self.camera.planet.map_or(-1.0, |d| d as f32)];
         let steps = self.rig_from_view.len().min(RS_STEPS_MAX);
         u.misc = [steps as f32, p.srgb as u8 as f32, px.x, px.y];
         u.lenses = p.lens_u;

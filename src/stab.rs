@@ -145,6 +145,41 @@ impl Stabilizer {
             })
             .collect()
     }
+
+    /// The camera's pose at `t_ms`: its heading in degrees, turning the same
+    /// way as the view's yaw and 0 where it pointed when the clip began (so
+    /// in `lock` mode yaw = heading looks where it pointed), and how far the
+    /// stick axis leans from vertical.
+    pub fn pose(&self, t_ms: f64) -> Pose {
+        let down = [0.0, 0.0, self.world_down];
+        let column = |m: M3, j: usize| [m[0][j], m[1][j], m[2][j]];
+        let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let start = column(self.world_from_rig(self.quats[0].0), 2);
+        let f0 = normalise([start[0], start[1], 0.0]);
+        let r0 = cross(down, f0);
+        let rig = self.world_from_rig(t_ms);
+        let f = column(rig, 2);
+        Pose {
+            heading: dot(f, r0).atan2(dot(f, f0)).to_degrees(),
+            tilt: dot(column(rig, 1), down).clamp(-1.0, 1.0).acos().to_degrees(),
+            rig,
+        }
+    }
+}
+
+pub struct Pose {
+    pub heading: f64,
+    pub tilt: f64,
+    /// world_from_rig.
+    pub rig: M3,
+}
+
+impl Pose {
+    /// The angle in degrees the camera turned through from `self` to `next`.
+    pub fn turn_to(&self, next: &Pose) -> f64 {
+        let r = mat_mul(transpose(self.rig), next.rig);
+        ((r[0][0] + r[1][1] + r[2][2] - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
+    }
 }
 
 fn slerp(a: Quat, mut b: Quat, t: f64) -> Quat {

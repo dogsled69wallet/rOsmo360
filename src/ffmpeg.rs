@@ -4,7 +4,7 @@
 use crate::stitch::Frame;
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 fn probe(input: &Path, stream: &str, entries: &str) -> Result<String> {
@@ -29,6 +29,58 @@ pub fn duration(input: &Path) -> Result<f64> {
         .output()
         .context("running ffprobe")?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().parse()?)
+}
+
+/// The clip's recording time as the camera tagged it, if it did.
+pub fn creation_time(input: &Path) -> Result<Option<String>> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format_tags=creation_time", "-of", "csv=p=0"])
+        .arg(input)
+        .output()
+        .context("running ffprobe")?;
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    Ok((!t.is_empty()).then_some(t))
+}
+
+/// The low-resolution proxy DJI records next to the clip, if it is there:
+/// the lens tracks side by side, each the full circle scaled down.
+pub fn proxy(input: &Path) -> Option<PathBuf> {
+    ["LRF", "lrf"].iter().map(|ext| input.with_extension(ext)).find(|p| p.exists())
+}
+
+/// Cuts a side-by-side proxy frame into one square picture per track.
+pub fn split_proxy(frame: &Frame, tracks: &[u32]) -> Vec<Frame> {
+    let side = frame.height;
+    tracks
+        .iter()
+        .map(|&t| {
+            let x0 = t as usize * side;
+            let rgb = (0..side).flat_map(|y| &frame.rgb[(y * frame.width + x0) * 3..(y * frame.width + x0 + side) * 3]).copied().collect();
+            Frame { width: side, height: side, rgb }
+        })
+        .collect()
+}
+
+/// RMS and peak level in dBFS of the first audio stream, per `window`
+/// seconds from the start.
+pub fn audio_levels(input: &Path, window: f64) -> Result<Vec<(f64, f64)>> {
+    const RATE: f64 = 16000.0;
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(input)
+        .args(["-map", "0:a:0", "-ac", "1", "-ar", &RATE.to_string(), "-f", "f32le", "-"])
+        .stderr(Stdio::inherit())
+        .output()
+        .context("running ffmpeg")?;
+    let samples: Vec<f32> = out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let db = |v: f64| 20.0 * v.max(1e-6).log10();
+    Ok(samples
+        .chunks(((window * RATE).round() as usize).max(1))
+        .map(|w| {
+            let rms = (w.iter().map(|&s| s as f64 * s as f64).sum::<f64>() / w.len() as f64).sqrt();
+            (db(rms), db(w.iter().fold(0.0f64, |m, &s| m.max(s.abs() as f64))))
+        })
+        .collect())
 }
 
 pub fn has_audio(input: &Path) -> Result<bool> {
@@ -180,11 +232,18 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio_from: &Path, start: f64) -> Result<Self> {
-        let mut child = Command::new("ffmpeg")
-            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+    /// `duration` bounds the audio, so it ends with the picture even when
+    /// the encoder is fed fewer frames than the source has.
+    pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio_from: &Path, start: f64, duration: Option<f64>) -> Result<Self> {
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24"])
             .args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"])
-            .args(["-ss", &start.to_string(), "-i"])
+            .args(["-ss", &start.to_string()]);
+        if let Some(d) = duration {
+            cmd.args(["-t", &d.to_string()]);
+        }
+        let mut child = cmd
+            .arg("-i")
             .arg(audio_from)
             .args(["-map", "0:v", "-map", "1:a:0?", "-shortest"])
             .args(["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac"])

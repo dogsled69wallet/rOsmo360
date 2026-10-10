@@ -4,14 +4,18 @@ mod ffmpeg;
 mod imu;
 mod player;
 mod ring;
+mod sheet;
 mod stab;
 mod stitch;
+mod view;
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use clap::{Args, Parser, Subcommand};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use view::{Projection, Reframe, View};
 use telemetry_parser::rig::{RigPicture, geometry::ProjectionKind};
 
 #[derive(Parser)]
@@ -27,6 +31,8 @@ enum Cmd {
     Rig { input: PathBuf },
     /// Dump orientation (q), gyro (g) and accelerometer (a) samples as CSV.
     Imu { input: PathBuf },
+    /// The clip's length, frame rate, recording time and what it holds, as JSON.
+    Info { input: PathBuf },
     /// Stitch one frame to an equirectangular PNG.
     Stitch {
         input: PathBuf,
@@ -35,8 +41,11 @@ enum Cmd {
         time: f64,
         #[arg(short, long, default_value = "equirect.png")]
         output: PathBuf,
+        /// Output width; height is width / 2.
+        #[arg(short, long, default_value_t = 4096)]
+        width: usize,
         #[command(flatten)]
-        opts: RenderOpts,
+        opts: StitchOpts,
     },
     /// Play clips in a window with free look, stabilisation and rolling-shutter correction.
     ///
@@ -86,25 +95,175 @@ enum Cmd {
         duration: Option<f64>,
         #[arg(short, long, default_value = "equirect.mp4")]
         output: PathBuf,
+        /// Output width; height is width / 2.
+        #[arg(short, long, default_value_t = 4096)]
+        width: usize,
         #[command(flatten)]
-        opts: RenderOpts,
+        opts: StitchOpts,
+    },
+    /// Render a framed (reframed) video: a fixed view or keyframed views
+    /// from a JSON file, with the clip's sound.
+    ///
+    /// Without -s/-d the keyframes' span is rendered. Stabilisation defaults
+    /// to horizon.
+    Export {
+        input: PathBuf,
+        #[command(flatten)]
+        framing: Framing,
+        /// Start time in seconds.
+        #[arg(short, long)]
+        start: Option<f64>,
+        /// Duration in seconds.
+        #[arg(short, long)]
+        duration: Option<f64>,
+        /// Picture height for landscape, width for portrait: 1080p is
+        /// 1920×1080 at 16:9 and 1080×1920 at 9:16.
+        #[arg(short, long, value_enum, default_value_t = Resolution::P1080)]
+        resolution: Resolution,
+        /// Shape, W:H (16:9, 9:16, 1:1, 4:5, ...); else the reframe's, else 16:9.
+        #[arg(short, long)]
+        aspect: Option<view::Aspect>,
+        /// Exact size, WIDTHxHEIGHT, instead of a resolution and aspect.
+        #[arg(long, value_parser = parse_size, conflicts_with_all = ["resolution", "aspect"])]
+        size: Option<[u32; 2]>,
+        #[arg(short, long, default_value = "clip.mp4")]
+        output: PathBuf,
+        /// Stitch from the low-resolution proxy (LRF): a quick, soft draft.
+        #[arg(long)]
+        draft: bool,
+        #[command(flatten)]
+        opts: StitchOpts,
+    },
+    /// Stitch evenly spaced moments onto one contact-sheet PNG, each tile
+    /// labelled with its time, to skim a clip. Tiles show the whole sphere,
+    /// marked at yaw −90/0/90° and the horizon, unless a framing is given.
+    ///
+    /// Uses the proxy (LRF) unless --full. Stabilisation defaults to horizon.
+    Preview {
+        input: PathBuf,
+        #[command(flatten)]
+        framing: Framing,
+        /// Start time in seconds.
+        #[arg(short, long)]
+        start: Option<f64>,
+        /// Duration in seconds.
+        #[arg(short, long)]
+        duration: Option<f64>,
+        /// Seconds between tiles; else 24 tiles, or the keyframes' times.
+        #[arg(long)]
+        every: Option<f64>,
+        /// Tile width in pixels.
+        #[arg(long, default_value_t = 640)]
+        tile: usize,
+        #[arg(long, default_value_t = 4)]
+        columns: usize,
+        #[arg(short, long, default_value = "preview.png")]
+        output: PathBuf,
+        /// Stitch from the full-resolution lens tracks instead of the proxy.
+        #[arg(long)]
+        full: bool,
+        #[command(flatten)]
+        opts: StitchOpts,
+    },
+    /// Summarise the clip over time as CSV, to find moments worth a look:
+    /// the camera's heading and tilt, how fast it turns or shakes, and how
+    /// loud it is.
+    Scan {
+        input: PathBuf,
+        /// Seconds per row.
+        #[arg(long, default_value_t = 1.0)]
+        every: f64,
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Resolution {
+    #[value(name = "720p")]
+    P720,
+    #[value(name = "1080p")]
+    P1080,
+    #[value(name = "1440p")]
+    P1440,
+    #[value(name = "2160p", alias = "4k")]
+    P2160,
+}
+
+impl Resolution {
+    /// Pixels on the picture's short side.
+    fn short_side(self) -> u32 {
+        match self {
+            Resolution::P720 => 720,
+            Resolution::P1080 => 1080,
+            Resolution::P1440 => 1440,
+            Resolution::P2160 => 2160,
+        }
+    }
+}
+
+/// How `export` and `preview` frame the sphere: keyframes from a file or a
+/// fixed view.
 #[derive(Args)]
-struct RenderOpts {
-    /// Output width; height is width / 2.
-    #[arg(short, long, default_value_t = 4096)]
-    width: usize,
+struct Framing {
+    /// Keyframed views as JSON: {"aspect": "9:16", "keyframes": [{"t": 12,
+    /// "yaw": 40, "pitch": -5, "fov": 80, "projection": "perspective", "ease":
+    /// "smooth"}, ...]}. Keyframes may leave out what doesn't change.
+    #[arg(long, conflicts_with = "view")]
+    reframe: Option<PathBuf>,
+    /// A fixed view: YAW,PITCH[,ROLL[,FOV]] in degrees.
+    #[arg(long, value_parser = parse_view, allow_hyphen_values = true)]
+    view: Option<Angles>,
+    /// Projection for --view.
+    #[arg(long, value_enum, default_value_t = Projection::Perspective, requires = "view")]
+    projection: Projection,
+}
+
+impl Framing {
+    fn reframe(&self) -> Result<Option<Reframe>> {
+        if let Some(path) = &self.reframe {
+            let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+            return Ok(Some(serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?));
+        }
+        Ok(self.view.as_ref().map(|Angles(v)| {
+            let home = View::home(self.projection);
+            Reframe::fixed(View { yaw: v[0], pitch: v[1], roll: v.get(2).copied().unwrap_or(home.roll), fov: v.get(3).copied().unwrap_or(home.fov), ..home })
+        }))
+    }
+}
+
+/// --view's YAW,PITCH[,ROLL[,FOV]]. A newtype, since clap takes a bare
+/// `Vec` for a flag given several times.
+#[derive(Clone)]
+struct Angles(Vec<f64>);
+
+fn parse_view(s: &str) -> Result<Angles, String> {
+    let v = s.split(',').map(|x| x.trim().parse::<f64>().map_err(|e| format!("{x:?}: {e}"))).collect::<Result<Vec<_>, _>>()?;
+    if !(2..=4).contains(&v.len()) {
+        return Err("expected YAW,PITCH[,ROLL[,FOV]]".into());
+    }
+    Ok(Angles(v))
+}
+
+fn parse_size(s: &str) -> Result<[u32; 2], String> {
+    let (w, h) = s.split_once(['x', 'X']).ok_or("expected WIDTHxHEIGHT")?;
+    let (w, h): (u32, u32) = (w.parse().map_err(|e| format!("{e}"))?, h.parse().map_err(|e| format!("{e}"))?);
+    if w < 16 || h < 16 || w % 2 == 1 || h % 2 == 1 {
+        return Err("width and height must be even and at least 16".into());
+    }
+    Ok([w, h])
+}
+
+#[derive(Args)]
+struct StitchOpts {
     /// Use this alternative calibration (see `rig`'s `variants`) instead of the default.
     #[arg(long)]
     variant: Option<usize>,
     /// Render only this lens (0 or 1), for checking overlap alignment.
     #[arg(long)]
     only: Option<usize>,
-    /// Stabilisation mode, from the camera's attitude data.
-    #[arg(long, value_enum, default_value_t = stab::Mode::Off)]
-    stabilize: stab::Mode,
+    /// Stabilisation mode, from the camera's attitude data [default: off
+    /// for stitch and render, horizon for export and preview].
+    #[arg(long, value_enum)]
+    stabilize: Option<stab::Mode>,
     /// Heading smoothing window for `horizon`, in ms either side.
     #[arg(long, default_value_t = 500.0)]
     smooth: f64,
@@ -128,21 +287,47 @@ struct RenderOpts {
     no_cut: bool,
 }
 
-/// Everything needed to turn decoded lens frames at a given time into an
-/// equirect frame.
+impl Default for StitchOpts {
+    fn default() -> Self {
+        StitchOpts {
+            variant: None,
+            only: None,
+            stabilize: None,
+            smooth: 500.0,
+            imu_axes: stab::ImuAxes::X180,
+            world_z_down: false,
+            no_rs: false,
+            no_exposure: false,
+            no_align: false,
+            no_cut: false,
+        }
+    }
+}
+
+/// What to draw from the stitched sphere.
+enum Shot {
+    /// The whole sphere, this wide.
+    Equirect(usize),
+    View { camera: view::Camera, size: (usize, usize) },
+}
+
+/// Everything needed to turn decoded lens frames at a given time into a
+/// stitched picture.
 struct Pipeline {
+    input: PathBuf,
     lenses: Vec<stitch::Lens>,
     tracks: Vec<u32>,
     stab: stab::Stabilizer,
     readout_ms: f64,
     fps: f64,
-    width: usize,
     only: Option<usize>,
     rs_steps: usize,
     seam: Option<exposure::Seam>,
     aligner: Option<align::Aligner>,
     cut: bool,
     hw: ffmpeg::Hwaccel,
+    /// Decode this side-by-side proxy instead of the lens tracks.
+    proxy: Option<PathBuf>,
 }
 
 /// Seam state carried from frame to frame so it eases instead of flickering.
@@ -153,7 +338,8 @@ struct Carry {
 }
 
 impl Pipeline {
-    fn new(input: &Path, opts: &RenderOpts) -> Result<Self> {
+    /// `stabilize` is the mode when the options don't name one.
+    fn new(input: &Path, opts: &StitchOpts, stabilize: stab::Mode) -> Result<Self> {
         let parsed = load_input(input)?;
         let rig = telemetry_parser::util::camera_rig(&parsed).context("no camera rig in file")?;
         let projection = match opts.variant {
@@ -172,8 +358,9 @@ impl Pipeline {
                 RigPicture::Sibling { .. } => bail!("multi-file rigs are not supported"),
             })
             .collect::<Result<Vec<_>>>()?;
-        let stab = stab::Stabilizer::new(&imu::read(&parsed).quats, opts.stabilize, opts.imu_axes, if opts.world_z_down { 1.0 } else { -1.0 }, opts.smooth);
-        if !stab.has_data() && opts.stabilize != stab::Mode::Off {
+        let mode = opts.stabilize.unwrap_or(stabilize);
+        let stab = stab::Stabilizer::new(&imu::read(&parsed).quats, mode, opts.imu_axes, if opts.world_z_down { 1.0 } else { -1.0 }, opts.smooth);
+        if !stab.has_data() && mode != stab::Mode::Off {
             bail!("no attitude data to stabilise with");
         }
         let readout_ms = cameras[0].readout.map_or(0.0, |r| r.time_us / 1000.0);
@@ -182,19 +369,28 @@ impl Pipeline {
         let aligner = if opts.no_align || opts.only.is_some() { None } else { align::Aligner::new(&lenses) };
         let hw = ffmpeg::Hwaccel::pick(input, tracks[0])?;
         Ok(Pipeline {
+            input: input.to_owned(),
             lenses,
             tracks,
             stab,
             readout_ms,
             fps: ffmpeg::frame_rate(input)?,
-            width: opts.width,
             only: opts.only,
             rs_steps,
             seam,
             aligner,
             cut: !opts.no_cut && opts.only.is_none(),
             hw,
+            proxy: None,
         })
+    }
+
+    /// Decode from the clip's proxy from now on, if it has one.
+    fn use_proxy(&mut self) {
+        self.proxy = ffmpeg::proxy(&self.input);
+        if self.proxy.is_none() {
+            eprintln!("no proxy (LRF) next to the clip; using the full-resolution tracks");
+        }
     }
 
     /// Rounds to the nearest frame so attitude lookups match decoded pictures.
@@ -203,13 +399,9 @@ impl Pipeline {
     }
 
     /// Stitches one frame, measuring the seam afresh and easing towards it.
-    fn render(&self, frames: &[stitch::Frame], t: f64, carry: &mut Carry) -> stitch::Frame {
-        let views = if self.stab.has_data() {
-            self.stab.rig_from_view(t * 1000.0, self.readout_ms, self.rs_steps)
-        } else {
-            vec![[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]]
-        };
-        let rgb = |i: usize, u: f64, v: f64| stitch::sample(&frames[self.lenses[i].input], u, v).map(|c| c / 255.0);
+    fn render(&self, frames: &[stitch::Frame], t: f64, carry: &mut Carry, shot: &Shot) -> stitch::Frame {
+        let views = if self.stab.has_data() { self.stab.rig_from_view(t * 1000.0, self.readout_ms, self.rs_steps) } else { vec![stitch::IDENTITY] };
+        let rgb = |i: usize, u: f64, v: f64| self.lenses[i].sample(frames, u, v).map(|c| c / 255.0);
         let exposure = self.seam.as_ref().map(|seam| {
             let now = seam.measure(|i, u, v| Some(rgb(i, u, v)));
             let g = carry.gains.get_or_insert(now);
@@ -223,17 +415,61 @@ impl Pipeline {
             (aligner, f.clone())
         });
         let seam = stitch::Seam { exposure: exposure.as_ref().map(|(s, g)| (*s, g)), align: align.as_ref().map(|(a, f)| (*a, f)), cut: self.cut };
-        stitch::equirect(&self.lenses, frames, self.width, self.only, &views, &seam)
+        match *shot {
+            Shot::Equirect(width) => stitch::equirect(&self.lenses, frames, width, self.only, &views, &seam),
+            Shot::View { camera, size: (w, h) } => {
+                let ray = |x: f64, y: f64| stitch::apply(camera.user, camera.ray(w as f64 / h as f64, [x / w as f64 * 2.0 - 1.0, y / h as f64 * 2.0 - 1.0]));
+                stitch::render(&self.lenses, frames, (w, h), ray, self.only, &views, &seam)
+            }
+        }
     }
 
-    fn decoders(&self, input: &Path, start: f64) -> Result<Vec<ffmpeg::Decoder>> {
-        self.tracks.iter().map(|&n| ffmpeg::Decoder::new(input, n, start, self.hw)).collect()
+    /// Every lens's frame at `t`.
+    fn stills(&self, t: f64) -> Result<Vec<stitch::Frame>> {
+        match &self.proxy {
+            Some(proxy) => Ok(ffmpeg::split_proxy(&ffmpeg::still(proxy, 0, t, self.hw)?, &self.tracks)),
+            None => self.tracks.iter().map(|&n| ffmpeg::still(&self.input, n, t, self.hw)).collect(),
+        }
+    }
+
+    fn stream(&self, start: f64) -> Result<Stream> {
+        Ok(match &self.proxy {
+            Some(proxy) => Stream::Proxy(ffmpeg::Decoder::new(proxy, 0, start, self.hw)?, self.tracks.clone()),
+            None => Stream::Tracks(self.tracks.iter().map(|&n| ffmpeg::Decoder::new(&self.input, n, start, self.hw)).collect::<Result<_>>()?),
+        })
+    }
+
+    /// The span to render: `start`/`duration` if given, else the keyframes'
+    /// span, else from `start` to the end of the clip.
+    fn span(&self, start: Option<f64>, duration: Option<f64>, reframe: Option<&Reframe>) -> Result<(f64, f64)> {
+        let keyed = reframe.and_then(Reframe::span);
+        let start = start.or(keyed.map(|k| k.0)).unwrap_or(0.0);
+        let end = match (duration, keyed) {
+            (Some(d), _) => start + d,
+            (None, Some((_, end))) if end > start => end,
+            _ => ffmpeg::duration(&self.input)?,
+        };
+        if end <= start {
+            bail!("nothing to render between {start} and {end} s");
+        }
+        Ok((self.snap(start), end))
     }
 }
 
-/// Pulls one frame from every decoder; `None` once any of them ends.
-fn next_frames(decoders: &mut [ffmpeg::Decoder]) -> Result<Option<Vec<stitch::Frame>>> {
-    decoders.iter_mut().map(|d| d.next()).collect::<Result<Option<Vec<_>>>>()
+/// Decoded lens frames in order, from the lens tracks or the proxy.
+enum Stream {
+    Tracks(Vec<ffmpeg::Decoder>),
+    Proxy(ffmpeg::Decoder, Vec<u32>),
+}
+
+impl Stream {
+    /// One frame per lens; `None` once the clip ends.
+    fn next(&mut self) -> Result<Option<Vec<stitch::Frame>>> {
+        match self {
+            Stream::Tracks(decoders) => decoders.iter_mut().map(|d| d.next()).collect::<Result<Option<Vec<_>>>>(),
+            Stream::Proxy(decoder, tracks) => Ok(decoder.next()?.map(|f| ffmpeg::split_proxy(&f, tracks))),
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -254,60 +490,168 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Info { input } => info(&input)?,
         Cmd::Play { input, osv_size, hwaccel, stabilize, imu_axes, world_z_down } => {
             player::run(input, player::Options { osv_size, hw: hwaccel, stabilize, imu_axes, world_z_down })?;
         }
         Cmd::Seam { input, start, duration, dump } => seam_report(&input, start, duration, dump.as_deref())?,
-        Cmd::Stitch { input, time, output, opts } => {
-            let p = Pipeline::new(&input, &opts)?;
+        Cmd::Stitch { input, time, output, width, opts } => {
+            let p = Pipeline::new(&input, &opts, stab::Mode::Off)?;
             let time = p.snap(time);
-            let frames = p.tracks.iter().map(|&n| ffmpeg::still(&input, n, time, p.hw)).collect::<Result<Vec<_>>>()?;
-            let out = p.render(&frames, time, &mut Carry::default());
-            image::save_buffer(&output, &out.rgb, out.width as u32, out.height as u32, image::ColorType::Rgb8)?;
+            let out = p.render(&p.stills(time)?, time, &mut Carry::default(), &Shot::Equirect(width));
+            save_png(&output, &out)?;
             eprintln!("wrote {}", output.display());
         }
-        Cmd::Render { input, start, duration, output, opts } => {
-            let p = Pipeline::new(&input, &opts)?;
+        Cmd::Render { input, start, duration, output, width, opts } => {
+            let p = Pipeline::new(&input, &opts, stab::Mode::Off)?;
             let start = p.snap(start);
-            let mut decoders = p.decoders(&input, start)?;
-            let mut encoder = ffmpeg::Encoder::new(&output, (p.width, p.width / 2), p.fps, &input, start)?;
             let total = duration.map(|d| (d * p.fps).round() as usize);
-            let began = Instant::now();
-            let mut carry = Carry::default();
-            let mut n = 0;
-            while total.is_none_or(|total| n < total) {
-                let Some(frames) = next_frames(&mut decoders)? else { break };
-                encoder.write(&p.render(&frames, start + n as f64 / p.fps, &mut carry))?;
-                n += 1;
-                if n % 10 == 0 {
-                    eprint!("\rframe {n}{}  {:.2} fps", total.map_or(String::new(), |t| format!("/{t}")), n as f64 / began.elapsed().as_secs_f64());
-                }
-            }
-            encoder.finish()?;
-            eprintln!("\nwrote {} ({n} frames)", output.display());
+            let encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &input, start, duration)?;
+            encode(&p, start, total, encoder, |_| Shot::Equirect(width))?;
+            eprintln!("wrote {}", output.display());
         }
+        Cmd::Export { input, framing, start, duration, resolution, aspect, size, output, draft, opts } => {
+            let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
+            let aspect = aspect.or(reframe.aspect).unwrap_or(view::Aspect(16, 9));
+            let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
+            let mut p = Pipeline::new(&input, &opts, stab::Mode::Horizon)?;
+            if draft {
+                p.use_proxy();
+            }
+            let (start, end) = p.span(start, duration, Some(&reframe))?;
+            let total = ((end - start) * p.fps).round().max(1.0) as usize;
+            let encoder = ffmpeg::Encoder::new(&output, (w, h), p.fps, &input, start, Some(end - start))?;
+            encode(&p, start, Some(total), encoder, |t| Shot::View { camera: reframe.camera_at(t), size: (w, h) })?;
+            eprintln!("wrote {} ({w}×{h}, {:.2}–{:.2} s)", output.display(), start, end);
+        }
+        Cmd::Preview { input, framing, start, duration, every, tile, columns, output, full, opts } => {
+            let reframe = framing.reframe()?;
+            let mut p = Pipeline::new(&input, &opts, stab::Mode::Horizon)?;
+            if !full {
+                p.use_proxy();
+            }
+            let times = match (every, &reframe) {
+                (Some(every), _) => {
+                    let (a, b) = p.span(start, duration, reframe.as_ref())?;
+                    (0..).map(|n| a + n as f64 * every.max(1.0 / p.fps)).take_while(|&t| t < b).collect()
+                }
+                (None, Some(r)) if start.is_none() && duration.is_none() && r.keyframes.len() > 1 => r.keyframes.iter().map(|k| k.t).collect(),
+                _ => {
+                    let (a, b) = p.span(start, duration, None)?;
+                    (0..24).map(|n| a + (n as f64 + 0.5) * (b - a) / 24.0).collect::<Vec<_>>()
+                }
+            };
+            let shot = |t: f64| match &reframe {
+                None => Shot::Equirect(tile),
+                Some(r) => {
+                    let view::Aspect(w, h) = r.aspect.unwrap_or(view::Aspect(16, 9));
+                    Shot::View { camera: r.camera_at(t), size: (tile, ((tile * h as usize / w as usize) / 2).max(8) * 2) }
+                }
+            };
+            let tiles = times
+                .par_iter()
+                .map(|&t| {
+                    let t = p.snap(t);
+                    let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &shot(t));
+                    if reframe.is_none() {
+                        sheet::equirect_grid(&mut f);
+                    }
+                    sheet::label(&mut f, 4, 4, &format!("{t:.1}s"));
+                    Ok(f)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            save_png(&output, &sheet::compose(&tiles, columns))?;
+            eprintln!("wrote {}: {} tiles at {}", output.display(), tiles.len(), times.iter().map(|t| format!("{:.1}", p.snap(*t))).collect::<Vec<_>>().join(" "));
+        }
+        Cmd::Scan { input, every } => scan(&input, every)?,
+    }
+    Ok(())
+}
+
+/// Stitches `total` frames (or to the end) from `start` into `encoder`,
+/// framing each as `shot` says for its time.
+fn encode(p: &Pipeline, start: f64, total: Option<usize>, mut encoder: ffmpeg::Encoder, shot: impl Fn(f64) -> Shot) -> Result<()> {
+    let mut stream = p.stream(start)?;
+    let began = Instant::now();
+    let mut carry = Carry::default();
+    let mut n = 0;
+    while total.is_none_or(|total| n < total) {
+        let Some(frames) = stream.next()? else { break };
+        let t = start + n as f64 / p.fps;
+        encoder.write(&p.render(&frames, t, &mut carry, &shot(t)))?;
+        n += 1;
+        if n % 10 == 0 {
+            eprint!("\rframe {n}{}  {:.2} fps", total.map_or(String::new(), |t| format!("/{t}")), n as f64 / began.elapsed().as_secs_f64());
+        }
+    }
+    encoder.finish()?;
+    eprintln!("\r{n} frames in {:.0} s", began.elapsed().as_secs_f64());
+    Ok(())
+}
+
+fn save_png(path: &Path, f: &stitch::Frame) -> Result<()> {
+    image::save_buffer(path, &f.rgb, f.width as u32, f.height as u32, image::ColorType::Rgb8).with_context(|| format!("writing {}", path.display()))
+}
+
+fn info(input: &Path) -> Result<()> {
+    let parsed = load_input(input)?;
+    let info = serde_json::json!({
+        "input": input,
+        "proxy": ffmpeg::proxy(input),
+        "duration": ffmpeg::duration(input)?,
+        "fps": ffmpeg::frame_rate(input)?,
+        "lens_size": ffmpeg::dimensions(input, 0)?,
+        "recorded": ffmpeg::creation_time(input)?,
+        "audio": ffmpeg::has_audio(input)?,
+        "attitude": !imu::read(&parsed).quats.is_empty(),
+    });
+    println!("{}", serde_json::to_string_pretty(&info)?);
+    Ok(())
+}
+
+/// One CSV row per `every` seconds; see `Cmd::Scan` and the header.
+fn scan(input: &Path, every: f64) -> Result<()> {
+    let parsed = load_input(input)?;
+    let quats = imu::read(&parsed).quats;
+    let duration = ffmpeg::duration(input)?;
+    let levels = if ffmpeg::has_audio(input)? { ffmpeg::audio_levels(input, every)? } else { Vec::new() };
+    let stab = (!quats.is_empty()).then(|| stab::Stabilizer::new(&quats, stab::Mode::Off, stab::ImuAxes::X180, -1.0, 0.0));
+    // Turning is sampled every 20 ms: fine enough for hand shake, coarse
+    // enough that the attitude's held-then-jumping samples average out.
+    const STEP: f64 = 0.02;
+    println!("t,heading,tilt,turn,rotation,shake,loudness,peak");
+    let mut heading = None::<f64>;
+    let rows = (duration / every).ceil() as usize;
+    for n in 0..rows {
+        let t = n as f64 * every;
+        let level = levels.get(n).map_or(String::from(","), |(rms, peak)| format!("{rms:.1},{peak:.1}"));
+        let Some(stab) = &stab else {
+            println!("{t:.2},,,,,,{level}");
+            continue;
+        };
+        let poses: Vec<_> = (0..=(every / STEP).round() as usize).map(|k| stab.pose((t + k as f64 * STEP) * 1000.0)).collect();
+        let (first, last) = (&poses[0], &poses[poses.len() - 1]);
+        let path: f64 = poses.windows(2).map(|w| w[0].turn_to(&w[1])).sum();
+        // Unwrapped, so a full turn reads 360 rather than jumping back.
+        let mut h = first.heading;
+        if let Some(prev) = heading {
+            h = prev + (h - prev + 540.0).rem_euclid(360.0) - 180.0;
+        }
+        heading = Some(h);
+        let turn = (last.heading - first.heading + 540.0).rem_euclid(360.0) - 180.0;
+        let rotation = path / every;
+        let shake = (path - first.turn_to(last)) / every;
+        println!("{t:.2},{h:.1},{:.1},{:.1},{rotation:.1},{shake:.1},{level}", first.tilt, turn / every);
     }
     Ok(())
 }
 
 fn seam_report(input: &Path, start: f64, duration: f64, dump: Option<&Path>) -> Result<()> {
-    let opts = RenderOpts {
-        width: 0,
-        variant: None,
-        only: None,
-        stabilize: stab::Mode::Off,
-        smooth: 500.0,
-        imu_axes: stab::ImuAxes::X180,
-        world_z_down: false,
-        no_rs: true,
-        no_exposure: true,
-        no_align: false,
-        no_cut: false,
-    };
-    let p = Pipeline::new(input, &opts)?;
+    let opts = StitchOpts { no_rs: true, no_exposure: true, ..StitchOpts::default() };
+    let p = Pipeline::new(input, &opts, stab::Mode::Off)?;
     let aligner = p.aligner.as_ref().context("not a two-lens rig")?;
     let start = p.snap(start);
-    let mut decoders = p.decoders(input, start)?;
+    let mut stream = p.stream(start)?;
     let (mut eased, mut prev_raw): (Option<align::Field>, Option<align::Field>) = (None, None);
     let mut sums = [0.0; 7];
     // The selfie stick runs down the rig's y axis.
@@ -316,8 +660,8 @@ fn seam_report(input: &Path, start: f64, duration: f64, dump: Option<&Path>) -> 
     let jitter = |a: &align::Field, b: &align::Field| a.0.iter().zip(&b.0).map(|(x, y)| (x - y).abs() as f64).sum::<f64>() / a.0.len() as f64;
     println!("t,mismatch_none,mismatch_raw,mismatch_eased,jitter_raw_deg,jitter_eased_deg,stick_none,stick_eased");
     while n < (duration * p.fps).round() as usize {
-        let Some(frames) = next_frames(&mut decoders)? else { break };
-        let strips = aligner.strips(|i, u, v| Some(stitch::sample(&frames[p.lenses[i].input], u, v).iter().sum::<f64>() / (3.0 * 255.0)));
+        let Some(frames) = stream.next()? else { break };
+        let strips = aligner.strips(|i, u, v| Some(p.lenses[i].sample(&frames, u, v).iter().sum::<f64>() / (3.0 * 255.0)));
         let raw = aligner.measure(&strips, eased.as_ref());
         let before = eased.clone();
         let e = eased.get_or_insert_with(|| raw.clone());

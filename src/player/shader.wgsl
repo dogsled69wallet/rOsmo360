@@ -27,7 +27,8 @@ struct Uniforms {
     user0: vec4f,
     user1: vec4f,
     user2: vec4f,
-    // width, height, zoom (tan of half the vertical FOV), projection mode.
+    // width, height, zoom (tan of half the vertical FOV), then the mapping:
+    // 0 perspective to 1 little planet, negative for equirect.
     screen: vec4f,
     // rolling-shutter steps, 1 if the surface re-encodes to sRGB, then the
     // view's top-left corner in framebuffer pixels.
@@ -152,24 +153,23 @@ fn nv12(slot: f32, uv: vec2f) -> vec3f {
     return clamp(vec3f(Y + 1.5748 * V, Y - 0.1873 * U - 0.4681 * V, Y + 1.8556 * U), vec3f(0.0), vec3f(1.0));
 }
 
+// Matches Camera::ray in view.rs. The azimuthal mappings put the ray at θ
+// from the view axis where s = sin θ / (d + cos θ): d = 0 is perspective,
+// d = 1 the little planet (stereographic), and between them a morph.
 fn screen_ray(pos: vec2f) -> vec3f {
     let aspect = u.screen.x / u.screen.y;
     let ndc = vec2f(pos.x / u.screen.x * 2.0 - 1.0, pos.y / u.screen.y * 2.0 - 1.0);
-    let mode = u32(u.screen.w);
-    if mode == 1u {
-        // Little planet: stereographic around the view axis.
-        let p = vec2f(ndc.x * aspect, ndc.y) * u.screen.z * 2.0;
-        let r = max(length(p), 1e-9);
-        let th = 2.0 * atan(r / 2.0);
-        return vec3f(sin(th) * p / r, cos(th));
-    }
-    if mode == 2u {
+    let d = u.screen.w;
+    if d < 0.0 {
         // The whole sphere, flat.
         let lon = ndc.x * PI;
         let lat = -ndc.y * PI / 2.0;
         return vec3f(cos(lat) * sin(lon), -sin(lat), cos(lat) * cos(lon));
     }
-    return normalize(vec3f(ndc.x * aspect * u.screen.z, ndc.y * u.screen.z, 1.0));
+    let q = vec2f(ndc.x * aspect, ndc.y) * u.screen.z;
+    let s = max(length(q), 1e-9);
+    let th = atan(s) + asin(clamp(s * d / sqrt(1.0 + s * s), -1.0, 1.0));
+    return vec3f(sin(th) * q / s, cos(th));
 }
 
 fn field_cell(x: i32, y: u32) -> f32 {

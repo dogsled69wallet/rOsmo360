@@ -91,6 +91,14 @@ impl Lens {
         let pv = a.a[1][0] * u + a.a[1][1] * v + a.t[1];
         Some((pu, pv, theta))
     }
+
+    /// RGB (0..255) at picture pixel (u, v) of this lens's frame, which may
+    /// be a scaled-down copy (the LRF proxy) of the full-size picture.
+    pub(crate) fn sample(&self, frames: &[Frame], u: f64, v: f64) -> [f64; 3] {
+        let f = &frames[self.input];
+        let s = f.width as f64 / self.calib_dim[0] as f64;
+        sample(f, u * s, v * s)
+    }
 }
 
 /// Per-frame seam corrections: exposure matching and close-subject alignment.
@@ -164,7 +172,7 @@ pub fn render(
                 let warp = |d: [f64; 3]| seam.align.map_or(d, |(a, f)| a.warp(f, i, d));
                 let Some(mut hit) = lens.project(warp(mid)) else { continue };
                 if views.len() > 1 {
-                    let row = (hit.1 / frames[lens.input].height as f64).clamp(0.0, 1.0);
+                    let row = (hit.1 / lens.calib_dim[1] as f64).clamp(0.0, 1.0);
                     let at = views[(row * (views.len() - 1) as f64).round() as usize];
                     let Some(h) = lens.project(warp(apply(at, d))) else { continue };
                     hit = h;
@@ -178,7 +186,7 @@ pub fn render(
                 if w <= 0.0 {
                     continue;
                 }
-                let px = sample(&frames[lens.input], u, v);
+                let px = lens.sample(frames, u, v);
                 let gain = seam.exposure.map_or([1.0; 3], |(s, g)| s.gain(g, i, mid, theta));
                 hits.push(([0, 1, 2].map(|c| px[c] * gain[c]), w));
             }
@@ -241,7 +249,7 @@ fn fill_row(row: &mut [bool], pts: &[[f64; 2]], py: f64, value: bool) {
     }
 }
 
-pub(crate) fn sample(f: &Frame, u: f64, v: f64) -> [f64; 3] {
+fn sample(f: &Frame, u: f64, v: f64) -> [f64; 3] {
     let x0 = (u - 0.5).floor();
     let y0 = (v - 0.5).floor();
     let (fx, fy) = (u - 0.5 - x0, v - 0.5 - y0);
