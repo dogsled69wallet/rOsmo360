@@ -53,7 +53,14 @@ Not done yet, roughly in priority order:
    - Music: a track under the edit, with its level.
    - Each cut's volume, and mute.
    - Done: export as separate clips (`--clips`, `--handles`; the player's Clips checkbox) and the DaVinci Resolve format (`--format resolve`; the Resolve checkbox). Maybe later: an EDL/FCPXML beside the clips so an editor rebuilds the cut order, and handles in the player.
-7. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
+7. **Framing automation (a future release, agreed with the user 2026-10-10).** Asked for by the claudeVideoEdit editor; in this order:
+   1. Preview bugs: `preview 0036 -s 440 -d 30 --every 0.5` fails while `-d 29.9` works (likely the tile count at the end boundary: 61 with both ends; get the exact error first), and "Broken pipe" from ffmpeg when we stop reading early (stop it cleanly or silence that).
+   2. `yaw_world` on keyframes (the tool subtracts the smoothed heading in horizon mode, so a view stays on a landmark while the camera turns), and a **level** stabilisation mode: level horizon with the heading fixed in the world (unlike `lock`, which also keeps the starting tilt).
+   3. Follow mode in keyframes, e.g. `{"t": 30, "follow": "stick", "offset_pitch": 30, "fov": 110}`, blending with fixed keyframes, plus a Follow picker in the player. The first source is `stick`: the operator is down the stick (rig +y) from the IMU attitude alone, so the third-person shot needs no vision and works straight below the camera.
+   4. A `track` command for a colour, as a second follow source (`"follow": "track.csv"`). Track on sphere directions or in a perspective view around the last position, not on the equirect (it stretches at the poles).
+   5. `scan --image`: opt-in columns from a low-res proxy stitch (open-sky fraction, horizon openness; maybe a "drop below" estimate). Opt-in because it decodes (~2 min on 0036) while plain `scan` reads only telemetry.
+   Not chosen: person detection (needs an ONNX model; heavy dependency, YOLO is AGPL). Update the highlights skill with each step.
+8. **Colour (deferred to a later release).** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
    - Needs a D-Log M sample clip first: all 35 Kyrkja clips are normal colour, tagged BT.709 10-bit, as DJI may also tag D-Log.
    - DJI records the profile in `StreamMeta.color_mode` (`ColorModeType`: D_LOG = 2, HLG = 9, …). telemetry-parser's Metadata tag only serialises the clip meta, so reading it means decoding StreamMeta ourselves.
 
