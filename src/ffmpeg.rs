@@ -31,6 +31,10 @@ pub fn duration(input: &Path) -> Result<f64> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().parse()?)
 }
 
+pub fn has_audio(input: &Path) -> Result<bool> {
+    Ok(!probe(input, "a", "stream=index")?.is_empty())
+}
+
 pub fn dimensions(input: &Path, track: u32) -> Result<(usize, usize)> {
     let dims = probe(input, &format!("v:{track}"), "stream=width,height")?;
     let (w, h) = dims.split_once(',').context("ffprobe gave no dimensions")?;

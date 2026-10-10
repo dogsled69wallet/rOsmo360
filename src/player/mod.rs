@@ -2,6 +2,7 @@
 //! dialog and playback controls. Free look on all three axes, stabilisation
 //! and rolling-shutter correction run in the view's shader.
 
+mod audio;
 mod gpu;
 mod playback;
 mod source;
@@ -13,7 +14,7 @@ use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
 use iced::mouse;
-use iced::widget::{button, center, column, container, pick_list, row, shader, slider, space, text, toggler};
+use iced::widget::{button, center, column, container, pick_list, row, shader, slider, space, svg, text, toggler, tooltip};
 use iced::window;
 use iced::{Alignment, Element, Length, Point, Rectangle, Subscription, Task, Theme};
 use playback::Playback;
@@ -30,6 +31,7 @@ pub struct Media {
     /// Pixels square of the OSV's lens tracks.
     pub osv_full: u32,
     pub hw: Hwaccel,
+    pub has_audio: bool,
     pub rig: Arc<Rig>,
     pub stab: Stabilizer,
     pub readout_ms: f64,
@@ -79,6 +81,7 @@ impl Media {
         Ok(Media {
             duration: ffmpeg::duration(&input)?,
             osv_full: ffmpeg::dimensions(&input, p.tracks[0])?.0 as u32,
+            has_audio: ffmpeg::has_audio(&input)?,
             proxy,
             osv_size: opts.osv_size,
             hw,
@@ -227,6 +230,8 @@ enum Message {
     Projection(Projection),
     Source(Source),
     RollingShutter(bool),
+    Mute,
+    Volume(f32),
     ResetView,
     Fullscreen,
 }
@@ -239,6 +244,8 @@ struct App {
     look: Look,
     rolling_shutter: bool,
     fullscreen: bool,
+    volume: f32,
+    muted: bool,
 }
 
 impl App {
@@ -251,7 +258,15 @@ impl App {
             look: Look::default(),
             rolling_shutter: true,
             fullscreen: false,
+            volume: 1.0,
+            muted: false,
         }
+    }
+
+    /// What the speakers get: nothing while muted, so unmuting restores
+    /// the level that was set.
+    fn volume(&self) -> f32 {
+        if self.muted { 0.0 } else { self.volume }
     }
 
     /// Parses the clip and probes the decoder off the UI thread.
@@ -302,7 +317,7 @@ impl App {
                 match Arc::into_inner(result).expect("loaded clip is not shared") {
                     Ok(media) => {
                         self.opts.hw = Some(media.hw);
-                        let playback = Playback::new(media);
+                        let playback = Playback::new(media, self.volume());
                         self.error = playback.error.clone();
                         self.clip = Some(Clip { playback, shown: None });
                     }
@@ -338,6 +353,16 @@ impl App {
                 self.with_playback(|p| p.set_osv_size(size));
             }
             Message::RollingShutter(on) => self.rolling_shutter = on,
+            Message::Mute => {
+                self.muted = !self.muted;
+                let v = self.volume();
+                self.with_playback(|p| p.set_volume(v));
+            }
+            Message::Volume(v) => {
+                self.volume = v;
+                self.muted = false;
+                self.with_playback(|p| p.set_volume(v));
+            }
             Message::ResetView => self.look.reset(),
             Message::Fullscreen => {
                 self.fullscreen = !self.fullscreen;
@@ -394,6 +419,7 @@ impl App {
                     return self.update(Message::Stab(next));
                 }
                 "r" | "R" => self.rolling_shutter = !self.rolling_shutter,
+                "m" | "M" => return self.update(Message::Mute),
                 "p" | "P" => {
                     let i = Projection::ALL.iter().position(|&p| p == self.look.projection).unwrap_or(0);
                     return self.update(Message::Projection(Projection::ALL[(i + 1) % Projection::ALL.len()]));
@@ -450,6 +476,14 @@ impl App {
             button(text(if p.playing { "Pause" } else { "Play" }).width(48).align_x(Alignment::Center)).on_press(Message::Toggle),
             text(format!("{} / {}", clock(p.position()), clock(media.duration))),
             slider(0.0..=last, p.position().min(last), Message::Scrub).step(1.0 / media.fps).on_release(Message::ScrubDone),
+            tooltip(
+                button(svg(svg::Handle::from_memory(if self.muted { SPEAKER_MUTED } else { SPEAKER })).width(20).height(20))
+                    .padding(5)
+                    .on_press(Message::Mute),
+                text(if self.muted { "Unmute (M)" } else { "Mute (M)" }),
+                tooltip::Position::Top,
+            ),
+            slider(0.0..=1.0, self.volume(), Message::Volume).step(0.01f32).width(90),
         ]
         .spacing(12)
         .padding([4, 10])
@@ -484,6 +518,10 @@ impl App {
         column![top, view, transport, controls].push(error.map(|e| container(e).padding([0, 10]))).into()
     }
 }
+
+/// Speaker icons for the mute button, drawn in the button's text colour.
+const SPEAKER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z" fill="white"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/></svg>"#;
+const SPEAKER_MUTED: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z" fill="white"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></svg>"#;
 
 fn labelled<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     row![text(label), widget.into()].spacing(6).align_y(Alignment::Center).into()

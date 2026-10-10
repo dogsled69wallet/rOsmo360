@@ -42,7 +42,7 @@ enum Cmd {
     ///
     /// Drag: look around · right-drag or Q/E: roll · arrows: pitch, seek (shift: yaw) ·
     /// scroll: zoom · space: play/pause · , .: frame step · S: stabilisation ·
-    /// R: rolling shutter · P: projection · 0: reset view · F: fullscreen · Ctrl+O: open
+    /// R: rolling shutter · P: projection · M: mute · 0: reset view · F: fullscreen · Ctrl+O: open
     Play {
         /// Clip to open at start; otherwise use the Open button.
         input: Option<PathBuf>,

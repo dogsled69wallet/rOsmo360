@@ -26,17 +26,15 @@ Working and verified on real footage:
   - Free look on yaw, pitch and roll.
   - Perspective, little-planet and flat equirect projections.
   - Plays the LRF proxy (or the OSV at 1920 px or full size) and swaps in a full-res frame on pause.
+  - Sound through cpal, with a mute icon and volume slider. While sound plays it is the playback clock.
 - **Hardware decode on any GPU vendor:** the first of Vulkan Video, VA-API and CUDA that decodes a test frame, else software. `--hwaccel` forces one.
 
 Not done yet, roughly in priority order:
 
 1. **Zero-copy decode.** Hand Vulkan Video frames to wgpu without the CPU round trip. This would allow full-res playback on the dev laptop.
-2. **Audio in the player.**
-3. **Selfie-stick / body masks.** telemetry-parser has `DjiMaskProfile` and stick masks; they are not wired in yet.
-4. **Seam alignment, next steps.** Alignment searches only across the seam (α); add a small φ search if lateral misalignment shows up. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
-5. **Export from the player** with the current view or keyframed reframing to a flat MP4. Also write spherical metadata on equirect export.
-6. **Colour.** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
-7. **Untested input.** The iced GUI's mouse drag, keys, pause/full-res still and Open dialog have not been driven interactively (no key-injection tool on the KDE machine).
+2. **Seam ghosting, next step.** Patch matching is tuned out (see Seam below); what ghosting is left needs per-pixel optical flow. Seam analysis runs on the UI thread per frame; move it to the decode threads if it costs frames on slower machines.
+3. **Export from the player** with the current view or keyframed reframing to a flat MP4. Also write spherical metadata on equirect export.
+4. **Colour.** D-Log M / LUT support, and 10-bit (P010) textures instead of NV12.
 
 ## Commands
 
@@ -63,10 +61,10 @@ Player keys:
 - Drag: look. Right-drag or Q/E: roll. ↑/↓: pitch. Shift+←/→: yaw.
 - Scroll: zoom.
 - Space: play/pause. ←/→: seek ±5 s. `,` `.`: frame step.
-- S: stabilisation mode. R: rolling shutter. P: projection.
+- S: stabilisation mode. R: rolling shutter. P: projection. M: mute.
 - 0: reset view. F: fullscreen.
 
-Runtime dependencies: `ffmpeg` and `ffprobe` CLIs (VA-API for hardware decode).
+Runtime dependencies: `ffmpeg` and `ffprobe` CLIs, and ALSA (libasound) for sound on Linux; PipeWire and PulseAudio serve it through their ALSA plugins.
 
 ## Layout
 
@@ -89,6 +87,7 @@ Runtime dependencies: `ffmpeg` and `ffprobe` CLIs (VA-API for hardware decode).
   - `gpu.rs`: iced shader `Primitive`/`Pipeline`: uniforms and NV12 textures, uploaded once per frame id.
   - `shader.wgsl`: GPU port of `stitch.rs`.
   - `source.rs`: NV12 decode threads (LRF proxy / OSV) and full-res stills.
+  - `audio.rs`: ffmpeg → f32 PCM → cpal output; frames played minus device latency give the clock.
 
 ## Hard-won facts (do not re-derive)
 

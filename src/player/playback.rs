@@ -4,6 +4,7 @@
 use super::gpu::RS_STEPS_MAX;
 use super::source::{self, Frame, Kind, Stream};
 use super::Media;
+use super::audio::Audio;
 use super::gpu::SeamFix;
 use crate::{align, exposure};
 use crate::stitch::M3;
@@ -29,11 +30,19 @@ pub struct Playback {
     scrub: Option<(bool, Option<f64>)>,
     /// Seam corrections, eased from frame to frame while playing.
     fix: SeamFix,
+    /// Plays while playing, and is then the clock.
+    audio: Option<Audio>,
+    /// Sound starts with the next frame shown. Sound is ready in
+    /// milliseconds but a fresh HEVC decode takes far longer, so starting both
+    /// together left the picture trailing the sound after every seek or
+    /// source switch.
+    sound_waits: bool,
+    volume: f32,
     pub error: Option<String>,
 }
 
 impl Playback {
-    pub fn new(media: Media) -> Self {
+    pub fn new(media: Media, volume: f32) -> Self {
         let mut p = Playback {
             media,
             playing: false,
@@ -47,6 +56,9 @@ impl Playback {
             showing_full: false,
             scrub: None,
             fix: SeamFix::default(),
+            audio: None,
+            sound_waits: false,
+            volume,
             error: None,
         };
         p.play();
@@ -74,7 +86,41 @@ impl Playback {
     }
 
     fn clock(&self) -> f64 {
-        if self.playing { self.anchor_pts + self.anchor_at.elapsed().as_secs_f64() } else { self.anchor_pts }
+        match (self.playing, &self.audio) {
+            (false, _) => self.anchor_pts,
+            _ if self.sound_waits => self.anchor_pts,
+            (true, Some(audio)) => self.anchor_pts + audio.elapsed(),
+            (true, None) => self.anchor_pts + self.anchor_at.elapsed().as_secs_f64(),
+        }
+    }
+
+    /// Stops the sound until the next frame is shown, and the clock with it.
+    fn hold_sound(&mut self) {
+        self.audio = None;
+        self.sound_waits = self.playing && self.media.has_audio;
+    }
+
+    /// Starts sound at `t`. Without a usable device the clip plays silently
+    /// on the wall clock; that is reported once, not on every play.
+    fn start_audio(&mut self, t: f64) {
+        self.audio = None;
+        if !self.media.has_audio {
+            return;
+        }
+        match Audio::start(&self.media.input, t, self.volume) {
+            Ok(a) => self.audio = Some(a),
+            Err(e) => {
+                eprintln!("no sound: {e:#}");
+                self.media.has_audio = false;
+            }
+        }
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume;
+        if let Some(a) = &self.audio {
+            a.set_volume(volume);
+        }
     }
 
     /// Starts decoding at `t`. A paused preview only needs one frame, so it
@@ -108,10 +154,12 @@ impl Playback {
         self.anchor_pts = self.shown_pts;
         self.anchor_at = Instant::now();
         self.start_stream(self.shown_pts);
+        self.hold_sound();
     }
 
     pub fn pause(&mut self) {
         self.playing = false;
+        self.hold_sound();
         self.anchor_pts = self.shown_pts;
         self.stream = None;
         self.pending = None;
@@ -126,6 +174,7 @@ impl Playback {
         if self.playing {
             self.anchor_at = Instant::now();
             self.start_stream(t);
+            self.hold_sound();
         } else {
             self.preview_only = true;
             self.start_stream(t);
@@ -147,6 +196,7 @@ impl Playback {
         if self.scrub.is_none() {
             self.scrub = Some((self.playing, None));
             self.playing = false;
+            self.hold_sound();
             self.still = None;
         }
         self.anchor_pts = t;
@@ -193,8 +243,14 @@ impl Playback {
     /// returns the frame to show now, if it changed, with its seam corrections.
     pub fn tick(&mut self) -> Option<(Frame, SeamFix)> {
         let mut show = None;
+        // A slow machine at full resolution can fall behind the sound; then
+        // the sound restarts from the picture rather than drifting from it.
+        if self.audio.is_some() && self.clock() - self.shown_pts > 0.5 {
+            self.anchor_pts = self.shown_pts;
+            self.hold_sound();
+        }
         if self.stream.is_some() {
-            let due = if self.playing { self.clock() + 0.5 / self.media.fps } else { f64::INFINITY };
+            let due = if self.playing && !self.sound_waits { self.clock() + 0.5 / self.media.fps } else { f64::INFINITY };
             let mut latest = None;
             let mut ended = false;
             loop {
@@ -211,7 +267,7 @@ impl Playback {
                 };
                 if next.pts <= due {
                     latest = Some(next);
-                    if self.preview_only {
+                    if self.preview_only || self.sound_waits {
                         break;
                     }
                 } else {
@@ -220,6 +276,11 @@ impl Playback {
                 }
             }
             if let Some(f) = latest {
+                if self.sound_waits && self.playing {
+                    self.sound_waits = false;
+                    self.anchor_pts = f.pts;
+                    self.start_audio(f.pts);
+                }
                 // A paused preview never replaces the full-resolution still.
                 if !(self.preview_only && self.showing_full && self.still.is_none()) {
                     show = Some((f, false));
@@ -231,8 +292,9 @@ impl Playback {
                         self.start_stream(t);
                     }
                 }
-            } else if self.playing && self.shown_pts < self.clock() - 0.25 {
-                // Decoding is slower than real time: let the clock wait for it.
+            } else if self.playing && self.audio.is_none() && self.shown_pts < self.clock() - 0.25 {
+                // Decoding is slower than real time: let the clock wait for
+                // it. Sound can't wait, so with sound the picture skips.
                 self.anchor_pts = self.shown_pts;
                 self.anchor_at = Instant::now();
             }
