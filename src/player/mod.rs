@@ -17,7 +17,7 @@ use crate::ffmpeg::{self, Hwaccel};
 use crate::stab::{ImuAxes, Mode, Stabilizer};
 use crate::project::{Cut, Project};
 use crate::stitch::M3;
-use crate::view::{Camera, Ease, Projection, View};
+use crate::view::{Camera, Ease, Keyframes, Projection, View};
 use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
@@ -1118,10 +1118,16 @@ impl App {
         cut.keyframes.near(t, self.tolerance())
     }
 
+    /// The keyframes framing the playing cut at its clip time `t`, as
+    /// `export` frames it: a cut without any holds the edit's last view.
+    fn keyframed(&self, t: f64) -> Option<(&Keyframes, f64)> {
+        crate::project::keyframed(&self.edit.cuts, self.current, t)
+    }
+
     /// The view on screen, as angles.
     fn shown_view(&self) -> View {
         match self.playing_cut() {
-            Some((cut, t)) if self.follow => cut.keyframes.view_at(t).unwrap_or(self.look),
+            Some((_, t)) if self.follow => self.keyframed(t).and_then(|(k, t)| k.view_at(t)).unwrap_or(self.look),
             _ => self.look,
         }
     }
@@ -1130,7 +1136,7 @@ impl App {
     /// little planet when following keyframes.
     fn camera(&self) -> Camera {
         match self.playing_cut() {
-            Some((cut, t)) if self.follow => cut.keyframes.camera_at(t).unwrap_or_else(|| self.look.camera()),
+            Some((_, t)) if self.follow => self.keyframed(t).and_then(|(k, t)| k.camera_at(t)).unwrap_or_else(|| self.look.camera()),
             _ => self.look.camera(),
         }
     }

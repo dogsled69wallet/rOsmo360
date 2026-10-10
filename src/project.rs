@@ -80,11 +80,21 @@ impl Project {
     }
 }
 
-impl Cut {
-    /// The view at clip time `t`: the keyframes', or straight ahead without any.
-    pub fn camera_at(&self, t: f64) -> Camera {
-        self.keyframes.camera_at(t).unwrap_or_else(|| View::home(Projection::Perspective).camera())
+/// The keyframes that frame cut `n` of `cuts` (in edit order) at clip time
+/// `t`, and the time to read them at. A cut without keyframes holds the view
+/// the edit had last: the end of the nearest earlier cut with some, as the
+/// player shows it when playing on. `None` before any keyframe.
+pub fn keyframed(cuts: &[Cut], n: usize, t: f64) -> Option<(&Keyframes, f64)> {
+    if !cuts[n].keyframes.is_empty() {
+        return Some((&cuts[n].keyframes, t));
     }
+    cuts[..n].iter().rev().find(|c| !c.keyframes.is_empty()).map(|c| (&c.keyframes, c.end))
+}
+
+/// The view of cut `n` at clip time `t` (see `keyframed`), or straight ahead
+/// before any keyframe.
+pub fn camera_at(cuts: &[Cut], n: usize, t: f64) -> Camera {
+    keyframed(cuts, n, t).and_then(|(k, t)| k.camera_at(t)).unwrap_or_else(|| View::home(Projection::Perspective).camera())
 }
 
 #[cfg(test)]
@@ -119,5 +129,24 @@ mod tests {
         std::fs::write(&path, r#"{"cuts": [{"input": "a.OSV", "in": 5, "out": 2}]}"#).unwrap();
         assert!(Project::load(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cuts_without_keyframes_hold_the_last_view() {
+        let p: Project = serde_json::from_str(
+            r#"{"cuts": [
+                {"input": "a.OSV", "in": 0, "out": 4},
+                {"input": "a.OSV", "in": 10, "out": 20, "keyframes": [{"t": 10, "yaw": 0}, {"t": 14, "yaw": 40}, {"t": 30, "yaw": 200}]},
+                {"input": "b.OSV", "in": 50, "out": 60},
+                {"input": "b.OSV", "in": 70, "out": 80}
+            ]}"#,
+        )
+        .unwrap();
+        let yaw = |n, t| camera_at(&p.cuts, n, t).user;
+        assert_eq!(yaw(0, 2.0), View::home(Projection::Perspective).camera().user);
+        assert_eq!(keyframed(&p.cuts, 1, 12.0).map(|k| k.1), Some(12.0));
+        // The view at the earlier cut's out point, not at its last keyframe.
+        let held = p.cuts[1].keyframes.camera_at(20.0).unwrap().user;
+        assert_eq!((yaw(2, 55.0), yaw(3, 75.0)), (held, held));
     }
 }
