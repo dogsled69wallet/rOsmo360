@@ -57,7 +57,7 @@ cp -r "$fp/state/downloads/." "$src/" 2>/dev/null || true
 awk '/url: .*\.git$/ {url=$2} /commit:/ {print url, $2}' "packaging/flatpak/$id.yml" | while read -r url commit; do
     name="$(basename "$url" .git)"
     repo="$(find "$fp/state/git" -maxdepth 1 -name "*$name.git" | head -n 1)"
-    git -C "$repo" archive --format=tar.gz --prefix="$name-$commit/" -o "$src/$name-$commit.tar.gz" "$commit"
+    git -C "$repo" archive --format=tar.gz --prefix="$name-$commit/" -o "$PWD/$src/$name-$commit.tar.gz" "$commit"
 done
 tar -cf "$dist/rOsmo360-flatpak-ffmpeg-sources.tar" -C "$dist" "$(basename "$src")"
 rm -rf "$src"
