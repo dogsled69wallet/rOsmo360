@@ -6,6 +6,7 @@ mod player;
 mod project;
 mod ring;
 mod sheet;
+mod sky;
 mod stab;
 mod stitch;
 mod track;
@@ -208,6 +209,13 @@ enum Cmd {
         /// Seconds per row.
         #[arg(long, default_value_t = 1.0)]
         every: f64,
+        /// Add columns from the picture: sky (% of the upper half that is
+        /// sky), skyline (its median elevation, degrees) and open (% of
+        /// directions with a view out to the horizon). Stitches the proxy's
+        /// keyframes small, which takes seconds to a minute where plain scan
+        /// reads only telemetry.
+        #[arg(long)]
+        image: bool,
     },
     /// Track a coloured subject (a jacket, a tent) through a clip, as CSV for
     /// keyframes to follow ("follow": "track.csv"): per sample its direction
@@ -843,7 +851,7 @@ fn main() -> Result<()> {
             save_png(&output, &sheet::compose(&tiles, columns))?;
             eprintln!("wrote {}: {} tiles at {}", output.display(), tiles.len(), times.iter().map(|t| format!("{:.1}", p.snap(*t))).collect::<Vec<_>>().join(" "));
         }
-        Cmd::Scan { input, every } => scan(&input, every)?,
+        Cmd::Scan { input, every, image } => scan(&input, every, image)?,
         Cmd::Track { input, colour, tolerance, near, start, duration, every } => {
             let near = near.map(|(yaw, pitch)| track::Near::Level(yaw, pitch));
             let (found, rows) = track_to(&input, &track::Colour::parse(&colour, tolerance)?, near, start, duration, every, &mut std::io::stdout().lock(), &mut |_, _| Ok(()))?;
@@ -1001,7 +1009,8 @@ pub fn track_to(
 }
 
 /// One CSV row per `every` seconds; see `Cmd::Scan` and the header.
-fn scan(input: &Path, every: f64) -> Result<()> {
+fn scan(input: &Path, every: f64, image: bool) -> Result<()> {
+    let skies = if image { skies(input)? } else { Vec::new() };
     let parsed = load_input(input)?;
     let quats = imu::read(&parsed).quats;
     let duration = ffmpeg::duration(input)?;
@@ -1010,12 +1019,20 @@ fn scan(input: &Path, every: f64) -> Result<()> {
     // Turning is sampled every 20 ms: fine enough for hand shake, coarse
     // enough that the attitude's held-then-jumping samples average out.
     const STEP: f64 = 0.02;
-    println!("t,heading,tilt,turn,rotation,shake,loudness,peak");
+    println!("t,heading,tilt,turn,rotation,shake,loudness,peak{}", if image { ",sky,skyline,open" } else { "" });
     let mut heading = None::<f64>;
     let rows = (duration / every).ceil() as usize;
     for n in 0..rows {
         let t = n as f64 * every;
-        let level = levels.get(n).map_or(String::from(","), |(rms, peak)| format!("{rms:.1},{peak:.1}"));
+        let mut level = levels.get(n).map_or(String::from(","), |(rms, peak)| format!("{rms:.1},{peak:.1}"));
+        if image {
+            // The keyframe nearest the row's middle, if there's one in it.
+            let mid = t + every / 2.0;
+            match skies.iter().filter(|(at, _)| (at - mid).abs() <= every.max(1.0) / 2.0).min_by(|a, b| (a.0 - mid).abs().total_cmp(&(b.0 - mid).abs())) {
+                Some((_, s)) => level += &format!(",{:.1},{:.1},{:.0}", s.sky, s.skyline, s.open),
+                None => level += ",,,",
+            }
+        }
         let Some(stab) = &stab else {
             println!("{t:.2},,,,,,{level}");
             continue;
@@ -1035,6 +1052,26 @@ fn scan(input: &Path, every: f64) -> Result<()> {
         println!("{t:.2},{h:.1},{:.1},{:.1},{rotation:.1},{shake:.1},{level}", first.tilt, turn / every);
     }
     Ok(())
+}
+
+/// The sky around the camera at the proxy's keyframes (about every 0.7 s),
+/// level. Keyframes alone decode fast; the nearest one stands for a row.
+fn skies(input: &Path) -> Result<Vec<(f64, sky::Sky)>> {
+    const WIDTH: usize = 360;
+    const LENS: usize = 256;
+    // The seam corrections measure at full strip size whatever the output's;
+    // at 1° a pixel their few pixels at the seam don't change the sky.
+    let opts = StitchOpts { no_rs: true, no_exposure: true, no_align: true, no_cut: true, ..StitchOpts::default() };
+    let p = Pipeline::new(input, &opts, stab::Mode::Horizon)?;
+    let proxy = ffmpeg::proxy(input).context("scan --image reads the LRF proxy beside the clip, and there is none")?;
+    let mut skies = Vec::new();
+    ffmpeg::key_frames(&proxy, 0, (LENS * p.tracks.len(), LENS), |t, frame| {
+        let frames = ffmpeg::split_proxy(&frame, &p.tracks);
+        let pic = p.render(&frames, t, &mut Carry::default(), &Shot::Equirect(WIDTH));
+        skies.push((t, sky::measure(&pic.rgb, WIDTH)));
+        true
+    })?;
+    Ok(skies)
 }
 
 fn seam_report(input: &Path, start: f64, duration: f64, dump: Option<&Path>) -> Result<()> {

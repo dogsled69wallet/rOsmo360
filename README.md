@@ -202,6 +202,7 @@ rosmo360 preview clip.OSV -o sheet.png      # 24 moments on one contact sheet, m
 rosmo360 preview clip.OSV --reframe moves.json -o check.png   # the framing at each keyframe
 rosmo360 preview edit.json -o check.png      # a project: a row per cut, framed as the export (--every N for more)
 rosmo360 scan clip.OSV > scan.csv           # per second: heading, tilt, turning, shake, loudness
+rosmo360 scan clip.OSV --image > scan.csv   # and open sky, skyline height, views out to the horizon
 ```
 
 `rosmo360 --help` lists everything, including `rig` (calibration as JSON), `imu` (motion data as CSV) and `seam` (seam quality report).
