@@ -38,6 +38,9 @@ pub struct Playback {
     fix: SeamFix,
     /// Plays while playing, and is then the clock.
     audio: Option<Audio>,
+    /// Sound opened and buffered ahead (`primed`), from this time, to play
+    /// once the first frame shows instead of opening the device then.
+    ready: Option<(f64, Audio)>,
     /// Sound starts with the next frame shown. Sound is ready in
     /// milliseconds but a fresh HEVC decode takes far longer, so starting both
     /// together left the picture trailing the sound after every seek or
@@ -50,8 +53,11 @@ pub struct Playback {
 }
 
 impl Playback {
+    /// A playback with nothing decoding yet: `jump` (or `seek`) says where.
+    /// It used to seek to 0 first, which started a preview decode and a
+    /// full-resolution still there only to throw them away.
     pub fn new(media: Media, volume: f32, full_on_pause: bool) -> Self {
-        let mut p = Playback {
+        Playback {
             media,
             playing: false,
             anchor_pts: 0.0,
@@ -66,13 +72,58 @@ impl Playback {
             scrub: None,
             fix: SeamFix::default(),
             audio: None,
+            ready: None,
             sound_waits: false,
             volume,
             error: None,
             ended: false,
-        };
-        p.seek(0.0);
+        }
+    }
+
+    /// A cut's playback made ready ahead of time while another plays: the
+    /// decoder started at `t` (it fills its few frames of buffer and waits)
+    /// and the sound opened and buffered, so `go` shows its first frame and
+    /// starts its sound at once, without the decoder's seek or the device's
+    /// start-up in between.
+    pub fn primed(media: Media, t: f64, volume: f32, full_on_pause: bool) -> Self {
+        let mut p = Playback::new(media, volume, full_on_pause);
+        let t = p.snap(t);
+        (p.anchor_pts, p.shown_pts) = (t, t);
+        p.playing = true;
+        p.start_stream(t);
+        p.playing = false;
+        if p.media.has_audio {
+            p.ready = Audio::prepare(&p.media.input, t, volume).inspect_err(|e| eprintln!("no sound ready: {e:#}")).ok().map(|a| (t, a));
+        }
         p
+    }
+
+    /// How long before `go` its sound should start: the device's latency,
+    /// so the first sample is heard just as the cut before ends. `None`
+    /// without sound ready (or once it's started). The device reports it
+    /// (cpal's callback and playback timestamps; ~50 ms on PipeWire, more on
+    /// Bluetooth); a device reporting none gets the old small gap, and one
+    /// reporting nonsense at most a quarter second of overlap.
+    pub fn sound_lead(&self) -> Option<f64> {
+        self.ready.as_ref().map(|(_, a)| a.latency().min(0.25))
+    }
+
+    /// Starts a `primed` playback's sound ahead of `go` (see `sound_lead`).
+    pub fn start_sound(&mut self) {
+        if let Some((_, ready)) = self.ready.take() {
+            ready.play();
+            self.audio = Some(ready);
+        }
+    }
+
+    /// Starts playing a `primed` playback. With its sound already started
+    /// the picture runs on at once; else the sound starts with the first
+    /// frame, and the picture waits for it to be heard.
+    pub fn go(&mut self) {
+        self.playing = true;
+        self.ended = false;
+        self.anchor_at = Instant::now();
+        self.sound_waits = self.media.has_audio && self.audio.is_none();
     }
 
     fn kind(&self) -> Kind {
@@ -115,6 +166,13 @@ impl Playback {
         if !self.media.has_audio {
             return;
         }
+        if let Some((at, ready)) = self.ready.take()
+            && (at - t).abs() < 0.5 / self.media.fps
+        {
+            ready.play();
+            self.audio = Some(ready);
+            return;
+        }
         match Audio::start(&self.media.input, t, self.volume) {
             Ok(a) => self.audio = Some(a),
             Err(e) => {
@@ -126,7 +184,7 @@ impl Playback {
 
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume;
-        if let Some(a) = &self.audio {
+        for a in self.audio.iter().chain(self.ready.as_ref().map(|(_, a)| a)) {
             a.set_volume(volume);
         }
     }

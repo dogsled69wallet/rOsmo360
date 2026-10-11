@@ -161,7 +161,14 @@ fn decode(path: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel) -
     cmd.spawn().context("running ffmpeg")
 }
 
+/// A track's picture size, asked of ffprobe once a run: each stream start
+/// used to, which cost every cut change and scrub ~50 ms.
 fn dims(path: &Path, track: u32) -> Result<(u32, u32)> {
+    static KNOWN: std::sync::Mutex<Vec<(PathBuf, u32, (u32, u32))>> = std::sync::Mutex::new(Vec::new());
+    if let Some(&(_, _, d)) = KNOWN.lock().unwrap().iter().find(|(p, t, _)| p == path && *t == track) {
+        return Ok(d);
+    }
     let (w, h) = ffmpeg::dimensions(path, track)?;
+    KNOWN.lock().unwrap().push((path.to_owned(), track, (w as u32, h as u32)));
     Ok((w as u32, h as u32))
 }

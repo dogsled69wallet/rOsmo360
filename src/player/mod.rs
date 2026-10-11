@@ -356,6 +356,10 @@ struct App {
     queue: std::collections::VecDeque<(PathBuf, bool)>,
     /// Whether the clip loading now is added as a cut.
     loading_adds: bool,
+    /// The next cut's playback, primed in the last `PREROLL` seconds of the
+    /// one playing, with the cut it was made for: its clip and in point, so
+    /// one made stale by an edit is never used.
+    preroll: Option<(usize, PathBuf, f64, Playback)>,
     /// Clips loaded since the queue was last empty, and how far the one
     /// loading now has got (an f64's bits, set from its loading thread):
     /// together with the queue, a project's loading progress.
@@ -430,6 +434,7 @@ impl App {
             loading_adds: true,
             loaded: 0,
             loading_part: Arc::default(),
+            preroll: None,
             project: None,
             saved_version: 0,
             after_save: None,
@@ -1550,28 +1555,83 @@ impl App {
     }
 
     fn tick(&mut self) {
+        let volume = self.volume();
         let Some(c) = &mut self.clip else { return };
         if let Some((frame, fix)) = c.playback.tick() {
             c.shown = Some(Arc::new(Shown::new(frame, fix)));
             self.held = None;
         }
         self.error = c.playback.error.clone();
-        // At a cut's out point (or the clip's end), play on into the next cut.
         let Some(cut) = self.edit.cuts.get(self.current) else { return };
         let p = &c.playback;
-        if (p.playing && p.now() >= cut.end) || p.ended {
-            let next = self.current + 1;
-            if next < self.edit.cuts.len() && !self.library.iter().any(|m| m.input == self.edit.cuts[next].input) {
-                // Its clip is still loading: wait at the out point.
+        // A cut running to its clip's end has paused there (`ended`), and
+        // still moves on.
+        if !p.playing && !p.ended {
+            self.preroll = None;
+            return;
+        }
+        let next = self.current + 1;
+        let next_cut = self.edit.cuts.get(next);
+        let loaded = |input: &PathBuf| self.library.iter().find(|m| &m.input == input);
+        // A next cut that starts where this one ends in the same clip (after
+        // a split) just plays on: no seek, nothing to prime.
+        let carries_on = next_cut.is_some_and(|n| n.input == cut.input && (n.start - cut.end).abs() < 1.5 / p.media.fps);
+        // In the last `PREROLL` seconds, ready the next cut so the change is
+        // instant.
+        if p.now() >= cut.end - PREROLL
+            && !carries_on
+            && let Some(n) = next_cut
+            && self.preroll.as_ref().is_none_or(|(i, input, start, _)| (*i, input, *start) != (next, &n.input, n.start))
+            && let Some(media) = loaded(&n.input)
+        {
+            let mut media = media.clone();
+            media.osv_size = self.opts.osv_size;
+            media.stab.set_mode(n.stabilize.unwrap_or(self.opts.stabilize));
+            let primed = Playback::primed(media, n.start, volume, self.full_on_pause);
+            self.preroll = Some((next, n.input.clone(), n.start, primed));
+        }
+        // Its sound starts a device latency early, so it's heard from the
+        // moment this cut's ends (that latency is otherwise a gap, and the
+        // picture waits through it to stay in sync).
+        if let Some((i, input, at, primed)) = &mut self.preroll
+            && next_cut.is_some_and(|n| (*i, &*input, *at) == (next, &n.input, n.start))
+            && primed.sound_lead().is_some_and(|lead| p.now() >= cut.end - lead)
+        {
+            primed.start_sound();
+        }
+        // At a cut's out point (or the clip's end), play on into the next cut.
+        if p.now() < cut.end && !p.ended {
+            return;
+        }
+        match next_cut {
+            None if p.playing => c.playback.pause(),
+            None => {}
+            // Its clip is still loading: wait at the out point.
+            Some(n) if loaded(&n.input).is_none() => {
                 if p.playing {
                     c.playback.pause();
                     self.save_status = Some(format!("Cut {} is still loading", next + 1));
                 }
-            } else if next < self.edit.cuts.len() {
-                let start = self.edit.cuts[next].start;
-                self.goto(next, start, true);
-            } else if p.playing {
-                c.playback.pause();
+            }
+            Some(_) if carries_on && !p.ended => {
+                self.current = next;
+                let mode = self.edit.cuts[next].stabilize.unwrap_or(self.opts.stabilize);
+                self.with_playback(|p| p.media.stab.set_mode(mode));
+            }
+            Some(n) => {
+                let start = n.start;
+                match self.preroll.take() {
+                    Some((i, input, at, mut primed)) if (i, &input, at) == (next, &n.input, n.start) => {
+                        // The last frame stays up until the primed one's first.
+                        if self.held.is_none() {
+                            self.held = self.sphere();
+                        }
+                        primed.go();
+                        self.clip = Some(Clip { playback: primed, shown: None });
+                        self.current = next;
+                    }
+                    _ => self.goto(next, start, true),
+                }
             }
         }
     }
@@ -1962,6 +2022,11 @@ fn credit<'a>() -> Element<'a, Message> {
 const SPLIT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.1 15.9M14.5 14.5 20 20M8.1 8.1 12 12"/></svg>"#;
 const DELETE_CUT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/></svg>"#;
 const UNDO: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>"#;
+/// The next cut is primed this many seconds before the playing one ends:
+/// enough for its decoder to open and seek. From a network share that took
+/// 0.2-1.6 s; at 1 s ahead the slower ones still stalled the change.
+const PREROLL: f64 = 3.0;
+
 /// The timeline zooms in until this many seconds fill it.
 const TIMELINE_SPAN: f64 = 2.0;
 

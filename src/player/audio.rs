@@ -29,6 +29,11 @@ struct Shared {
     latency_us: AtomicU64,
     /// f32 bits.
     volume: AtomicU32,
+    /// Until `play`, the device gets silence and the buffer is left alone.
+    /// Pausing the stream instead isn't enough: not every backend can (on
+    /// PipeWire's ALSA plugin a prepared cut's sound played under the cut
+    /// before it, its buffer drained, so its clock ran early).
+    running: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -42,6 +47,15 @@ pub struct Audio {
 impl Audio {
     /// Starts playing `input`'s first audio track from `start` seconds.
     pub fn start(input: &Path, start: f64, volume: f32) -> Result<Audio> {
+        let audio = Audio::prepare(input, start, volume)?;
+        audio.play();
+        Ok(audio)
+    }
+
+    /// Opens the device and starts decoding from `start`, filling the buffer,
+    /// but plays silence until `play`: the next cut's sound, ready ahead, so
+    /// moving on to it needn't wait for the device or ffmpeg.
+    pub fn prepare(input: &Path, start: f64, volume: f32) -> Result<Audio> {
         let device = cpal::default_host().default_output_device().context("no audio output device")?;
         let supported = device.default_output_config().context("querying the audio device")?;
         let format = supported.sample_format();
@@ -62,6 +76,7 @@ impl Audio {
             played: AtomicU64::new(0),
             latency_us: AtomicU64::new(0),
             volume: AtomicU32::new(volume.to_bits()),
+            running: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
 
@@ -109,6 +124,11 @@ impl Audio {
         Ok(Audio { _stream: stream, child, shared, rate })
     }
 
+    /// Lets the sound through: from the next device callback, milliseconds.
+    pub fn play(&self) {
+        self.shared.running.store(true, Ordering::Relaxed);
+    }
+
     /// Seconds of audio heard since `start`.
     pub fn elapsed(&self) -> f64 {
         let played = self.shared.played.load(Ordering::Relaxed) as f64 / self.rate;
@@ -117,6 +137,12 @@ impl Audio {
 
     pub fn set_volume(&self, volume: f32) {
         self.shared.volume.store(volume.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Seconds from handing samples to the device to hearing them, as the
+    /// device last reported (0 before its first callback).
+    pub fn latency(&self) -> f64 {
+        self.shared.latency_us.load(Ordering::Relaxed) as f64 / 1e6
     }
 }
 
@@ -136,6 +162,10 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: &Strea
             let ts = info.timestamp();
             let latency = ts.playback.duration_since(ts.callback);
             shared.latency_us.store(latency.as_micros() as u64, Ordering::Relaxed);
+            if !shared.running.load(Ordering::Relaxed) {
+                data.fill(T::EQUILIBRIUM);
+                return;
+            }
             let volume = f32::from_bits(shared.volume.load(Ordering::Relaxed));
             let mut q = shared.samples.lock().unwrap();
             // Only whole frames count towards the clock; an underrun plays
