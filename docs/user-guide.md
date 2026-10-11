@@ -212,6 +212,8 @@ A keyframe can **follow the selfie stick** instead of looking in a fixed directi
 2. Press **K**, then choose **Stick** in the **Follow** picker. The view stays as it is: the keyframe now keeps it as an offset from the stick. Its mark on the seek bar gets a ring.
 3. Play. Keyframes you add after it follow too, until you set one back to **Fixed**. A move from a following keyframe to a fixed one, or back, eases over as usual.
 
+To follow **someone or something else**, such as a friend in a red jacket, track it by colour on the command line first ([`rosmo360 track`](#12-the-command-line)) and put the track in the project. The Follow picker then lists it next to Stick, and you use it the same way.
+
 ## 8. Framing: the aspect lock
 
 The **Aspect** picker in the top bar sets the shape of the picture: Free, 16:9, 9:16, 4:3, 1:1 or 2:1. The view is letterboxed to that shape, so you frame exactly what will be exported. Use 9:16 for phone video such as Reels, Shorts or TikTok:
@@ -282,6 +284,14 @@ rosmo360 preview clip.OSV -o sheet.png                        # 24 moments of a 
 ```
 
 ![A contact sheet of a four-cut project: rows of small framed views of a ridge, a rock tower, a boulder slope, a lake valley turning into an upward little planet, and a boulder field, each labelled with its cut number and time](guide/contact-sheet.jpg)
+
+**Track a subject by colour**, for keyframes to follow (see [Follow](#follow-a-third-person-shot)):
+
+```sh
+rosmo360 track clip.OSV --colour "#c8302a" -s 40 -d 20 > friend.csv
+```
+
+Then give a keyframe `"follow": "friend.csv"` in the project file. Read the colour off a preview or a saved photo. If something else nearby has the same colour, add `--near YAW,PITCH` with where the subject is at the start, as shown on a `--stabilize level` preview.
 
 **Find good moments**: `rosmo360 scan clip.OSV > scan.csv` gives, per second, where the camera points, how fast it turns or shakes, and how loud it is. `rosmo360 info clip.OSV` prints the clip's length, frame rate and recording time.
 

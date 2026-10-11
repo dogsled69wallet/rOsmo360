@@ -311,6 +311,8 @@ enum Message {
 
 struct App {
     opts: Options,
+    /// Tracks that keyframes follow, read once each (`None`: unreadable).
+    followed: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<Arc<crate::track::Track>>>>,
     theme: Theme,
     logo: image::Handle,
     /// Every clip opened so far, ready for the cuts that use it.
@@ -375,6 +377,7 @@ impl App {
     fn new(opts: Options, saved: settings::Settings) -> Self {
         App {
             opts,
+            followed: Default::default(),
             theme: system_theme(),
             logo: image::Handle::from_bytes(LOGO),
             library: Vec::new(),
@@ -547,23 +550,23 @@ impl App {
             .align_y(Alignment::Center)
             .into(),
             None => row![
-                tooltip(
+                tip(
                     labelled("Aspect", pick_list(&Aspect::ALL[..], Some(self.aspect), Message::Aspect)),
                     text("The shape of the view, of saved views and of the export (16:9 when free)"),
                     tooltip::Position::Bottom,
                 ),
-                tooltip(
+                tip(
                     button("Export…").on_press_maybe((!self.edit.cuts.is_empty()).then_some(Message::Export)),
                     text("Render the edit with sound, at this resolution, in the aspect's shape"),
                     tooltip::Position::Bottom,
                 ),
                 pick_list(&crate::Resolution::ALL[..], Some(self.resolution), Message::Resolution),
-                tooltip(
+                tip(
                     checkbox(self.export_clips).label("Clips").on_toggle(Message::ExportClips),
                     text("Export each cut to its own file, for another editor: \"<project> - 001\" and on, into a folder you pick"),
                     tooltip::Position::Bottom,
                 ),
-                tooltip(
+                tip(
                     checkbox(self.export_format == ffmpeg::Format::Resolve).label("Resolve").on_toggle(Message::ExportResolve),
                     text("For DaVinci Resolve, whose free Linux version can't read MP4's H.264 and AAC: DNxHR HQ with PCM sound in .mov. Large: about 27 MB a second at 1080p"),
                     tooltip::Position::Bottom,
@@ -928,10 +931,10 @@ impl App {
             Message::KeyAdd => {
                 let (view, tolerance) = (self.shown_view(), self.tolerance());
                 let Some((_, t)) = self.playing_cut() else { return Task::none() };
-                let stick = self.aim(Follow::Stick, t);
+                let aims = self.aims(t);
                 self.edit.checkpoint();
                 if let Some(cut) = self.edit.cuts.get_mut(self.current) {
-                    cut.keyframes.set(t, view, tolerance, &|Follow::Stick| stick);
+                    cut.keyframes.set(t, view, tolerance, &|f| aims.iter().find(|a| &a.0 == f).and_then(|a| a.1));
                     self.follow = true;
                 }
             }
@@ -959,9 +962,9 @@ impl App {
                 if let (Some(k), Some((_, t))) = (self.current_key(), self.playing_cut())
                     && self.edit.cuts[self.current].keyframes[k].follow != aiming.follow()
                 {
-                    let stick = self.aim(Follow::Stick, t);
+                    let aims = self.aims(t);
                     self.edit.checkpoint();
-                    self.edit.cuts[self.current].keyframes.set_follow(k, aiming.follow(), &|Follow::Stick| stick);
+                    self.edit.cuts[self.current].keyframes.set_follow(k, aiming.follow(), &|f| aims.iter().find(|a| &a.0 == f).and_then(|a| a.1));
                     self.follow = true;
                 }
             }
@@ -1137,11 +1140,44 @@ impl App {
     }
 
     /// Where `follow` points in the playing clip's view at its time `t`.
-    fn aim(&self, follow: Follow, t: f64) -> Option<(f64, f64)> {
+    fn aim(&self, follow: &Follow, t: f64) -> Option<(f64, f64)> {
         let media = &self.clip.as_ref()?.playback.media;
         match follow {
             Follow::Stick => media.stab.stick(t * 1000.0, media.readout_ms),
+            Follow::Track(path) => {
+                let track = self
+                    .followed
+                    .borrow_mut()
+                    .entry(path.clone())
+                    .or_insert_with(|| crate::track::Track::load(path).inspect_err(|e| eprintln!("{e:#}")).ok().map(Arc::new))
+                    .clone()?;
+                track.aim(&media.stab, t, media.readout_ms)
+            }
         }
+    }
+
+    /// Where everything a keyframe could follow points at clip time `t`, for
+    /// keyframe edits (which can't look while the edit is borrowed).
+    fn aims(&self, t: f64) -> Vec<(Follow, Option<(f64, f64)>)> {
+        self.follow_choices().into_iter().filter_map(|a| a.follow()).map(|f| (f.clone(), self.aim(&f, t))).collect()
+    }
+
+    /// The Follow picker's choices: fixed, the stick, and every track the
+    /// edit already follows (tracks come from `rosmo360 track`).
+    fn follow_choices(&self) -> Vec<Aiming> {
+        let mut choices = vec![Aiming::Fixed, Aiming::Follows(Follow::Stick)];
+        for k in self.edit.cuts.iter().flat_map(|c| c.keyframes.iter()) {
+            if let Some(f @ Follow::Track(_)) = &k.follow
+                && !choices.contains(&Aiming::Follows(f.clone()))
+            {
+                choices.push(Aiming::Follows(f.clone()));
+            }
+        }
+        // With one track its file name says nothing: just "Colour track".
+        if let [_, _, Aiming::Follows(only)] = &choices[..] {
+            choices[2] = Aiming::Track(only.clone());
+        }
+        choices
     }
 
     /// The view on screen, as angles.
@@ -1438,15 +1474,15 @@ impl App {
         };
         let top = row![
             open,
-            tooltip(button("Open project…").on_press(Message::OpenProject), text("Open a saved edit (Ctrl+Shift+O)"), tooltip::Position::Bottom),
-            tooltip(
+            tip(button("Open project…").on_press(Message::OpenProject), text("Open a saved edit (Ctrl+Shift+O)"), tooltip::Position::Bottom),
+            tip(
                 button("Save project").on_press_maybe(self.unsaved().then_some(Message::SaveProject(false))),
                 text("Save the edit: cuts, keyframes and shape (Ctrl+S; Ctrl+Shift+S saves as)"),
                 tooltip::Position::Bottom,
             ),
             self.export_controls(),
             // The file name: the full path is in the tooltip.
-            tooltip(
+            tip(
                 text(media.input.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())),
                 text(media.input.display().to_string()),
                 tooltip::Position::Bottom,
@@ -1477,6 +1513,11 @@ impl App {
         let view = container(view).width(Length::Fill).height(Length::Fill).style(|_| container::background(iced::Color::BLACK));
 
         let current = self.current_key();
+        let choices = self.follow_choices();
+        let selected = current.and_then(|k| {
+            let follow = &self.edit.cuts[self.current].keyframes[k].follow;
+            choices.iter().find(|c| &c.follow() == follow).cloned()
+        });
         let tolerance = self.tolerance();
         let mut from = 0.0;
         let blocks = self
@@ -1510,53 +1551,52 @@ impl App {
         let can_split = self.edit.cuts.get(self.current).is_some_and(|c| p.target() > c.start + edit::MIN_CUT && p.target() < c.end - edit::MIN_CUT);
         let transport = row![
             button(text(if p.playing { "Pause" } else { "Play" }).width(48).align_x(Alignment::Center)).on_press(Message::Toggle),
-            tooltip(
+            tip(
                 button("Save view…").on_press_maybe((!p.playing).then_some(Message::Save(Saving::View))),
                 text("Save what you see as a PNG (pause first)"),
                 tooltip::Position::Top,
             ),
-            tooltip(
+            tip(
                 button("Save 360°…").on_press_maybe((!p.playing).then_some(Message::Save(Saving::Sphere))),
                 text("Save the whole sphere as an equirect PNG (pause first)"),
                 tooltip::Position::Top,
             ),
             text(format!("{} / {}", clock(self.position()), clock(self.edit.duration()))),
-            tooltip(
+            tip(
                 icon_button(KEY_ADD, Some(Message::KeyAdd)),
                 text(if current.is_some() { "Update this keyframe with the view (K)" } else { "Add a keyframe with this view (K)" }),
                 tooltip::Position::Top,
             ),
-            tooltip(icon_button(KEY_DELETE, current.map(|_| Message::KeyDelete)), text("Delete this keyframe (Del)"), tooltip::Position::Top),
-            tooltip(
+            tip(icon_button(KEY_DELETE, current.map(|_| Message::KeyDelete)), text("Delete this keyframe (Del)"), tooltip::Position::Top),
+            tip(
                 pick_list(&Ease::ALL[..], current.map(|k| self.edit.cuts[self.current].keyframes[k].ease), Message::KeyEase).placeholder("Ease").width(96),
                 text("How this keyframe moves on to the next (J cycles)"),
-                tooltip::Position::Top,
+                // Below: the list opens upwards and the hint would cover it.
+                tooltip::Position::Bottom,
             ),
-            tooltip(
-                pick_list(&Aiming::ALL[..], current.map(|k| Aiming::of(self.edit.cuts[self.current].keyframes[k].follow)), Message::KeyFollow)
-                    .placeholder("Follow")
-                    .width(96),
-                text("What this keyframe looks at: fixed angles, or the selfie stick (whoever holds it) with this view's offset from it"),
-                tooltip::Position::Top,
+            tip(
+                pick_list(choices, selected, Message::KeyFollow).placeholder("Follow").width(140),
+                text("What this keyframe looks at: fixed angles, the selfie stick (whoever holds it), or a tracked subject, with this view's offset from it"),
+                tooltip::Position::Bottom,
             ),
-            tooltip(icon_button(SPLIT, can_split.then_some(Message::Split)), text("Split the cut at the playhead (C)"), tooltip::Position::Top),
-            tooltip(
+            tip(icon_button(SPLIT, can_split.then_some(Message::Split)), text("Split the cut at the playhead (C)"), tooltip::Position::Top),
+            tip(
                 icon_button(DELETE_CUT, self.selected.map(|_| Message::DeleteCut)),
                 text("Delete the selected cut (Shift+Del)"),
                 tooltip::Position::Top,
             ),
-            tooltip(icon_button(UNDO, Some(Message::Undo)), text("Undo (Ctrl+Z)"), tooltip::Position::Top),
-            tooltip(icon_button(REDO, Some(Message::Redo)), text("Redo (Ctrl+Shift+Z)"), tooltip::Position::Top),
-            tooltip(icon_button(ZOOM_OUT, Some(Message::TimelineZoom(1.0 / 1.5, None))), text("Zoom the timeline out (Ctrl+−, or scroll on it)"), tooltip::Position::Top),
-            tooltip(
+            tip(icon_button(UNDO, Some(Message::Undo)), text("Undo (Ctrl+Z)"), tooltip::Position::Top),
+            tip(icon_button(REDO, Some(Message::Redo)), text("Redo (Ctrl+Shift+Z)"), tooltip::Position::Top),
+            tip(icon_button(ZOOM_OUT, Some(Message::TimelineZoom(1.0 / 1.5, None))), text("Zoom the timeline out (Ctrl+−, or scroll on it)"), tooltip::Position::Top),
+            tip(
                 slider(0.0..=1.0, self.timeline_zoom.ln() / self.timeline_most_zoom().ln().max(1e-9), Message::TimelineZoomTo).step(0.001).width(90),
                 text("Timeline zoom"),
                 tooltip::Position::Top,
             ),
-            tooltip(icon_button(ZOOM_IN, Some(Message::TimelineZoom(1.5, None))), text("Zoom the timeline in (Ctrl+=, or scroll on it)"), tooltip::Position::Top),
-            tooltip(icon_button(ZOOM_FIT, Some(Message::TimelineZoomTo(0.0))), text("Show the whole edit (Ctrl+0)"), tooltip::Position::Top),
+            tip(icon_button(ZOOM_IN, Some(Message::TimelineZoom(1.5, None))), text("Zoom the timeline in (Ctrl+=, or scroll on it)"), tooltip::Position::Top),
+            tip(icon_button(ZOOM_FIT, Some(Message::TimelineZoomTo(0.0))), text("Show the whole edit (Ctrl+0)"), tooltip::Position::Top),
             space().width(Length::Fill),
-            tooltip(
+            tip(
                 button(svg(svg::Handle::from_memory(if self.muted { SPEAKER_MUTED } else { SPEAKER })).width(20).height(20))
                     .padding(5)
                     .on_press(Message::Mute),
@@ -1587,7 +1627,7 @@ impl App {
             labelled("Playback source", pick_list(sources, Some(source), Message::Source)),
             labelled("FOV", slider(lo..=hi, shown_view.fov, Message::Fov).width(120)),
             toggler(self.rolling_shutter).label("Rolling shutter").on_toggle(Message::RollingShutter),
-            tooltip(
+            tip(
                 toggler(self.full_on_pause).label("Full res when paused").on_toggle(Message::FullOnPause),
                 text("Off: paused frames stay at the playback source's quality"),
                 tooltip::Position::Top,
@@ -1641,6 +1681,11 @@ fn clip_name(path: &Path) -> String {
 const KEY_ADD: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M10 2 18 10 10 18 2 10z" fill="white"/><path d="M19 15v8M15 19h8" stroke-linecap="round"/></svg>"#;
 const KEY_DELETE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M10 2 18 10 10 18 2 10z"/><path d="m16 16 6 6M22 16l-6 6" stroke-linecap="round"/></svg>"#;
 
+/// A hint on hover, on a box of its own so it reads over the picture.
+fn tip<'a>(content: impl Into<Element<'a, Message>>, hint: iced::widget::Text<'a>, position: tooltip::Position) -> Element<'a, Message> {
+    tooltip(content, container(hint).padding([4, 8]).style(container::rounded_box), position).into()
+}
+
 fn icon_button<'a>(icon: &'static [u8], on_press: Option<Message>) -> Element<'a, Message> {
     button(svg(svg::Handle::from_memory(icon)).width(20).height(20)).padding(5).on_press_maybe(on_press).into()
 }
@@ -1687,23 +1732,19 @@ fn labelled<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Elem
 }
 
 /// The Follow picker's choices for a keyframe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Aiming {
     Fixed,
     Follows(Follow),
+    /// The edit's only track, shown without its file name.
+    Track(Follow),
 }
 
 impl Aiming {
-    const ALL: [Aiming; 2] = [Aiming::Fixed, Aiming::Follows(Follow::Stick)];
-
-    fn of(follow: Option<Follow>) -> Aiming {
-        follow.map_or(Aiming::Fixed, Aiming::Follows)
-    }
-
-    fn follow(self) -> Option<Follow> {
+    fn follow(&self) -> Option<Follow> {
         match self {
             Aiming::Fixed => None,
-            Aiming::Follows(f) => Some(f),
+            Aiming::Follows(f) | Aiming::Track(f) => Some(f.clone()),
         }
     }
 }
@@ -1713,6 +1754,7 @@ impl std::fmt::Display for Aiming {
         match self {
             Aiming::Fixed => f.write_str("Fixed"),
             Aiming::Follows(follow) => follow.fmt(f),
+            Aiming::Track(_) => f.write_str("Colour track"),
         }
     }
 }

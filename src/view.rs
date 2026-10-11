@@ -10,7 +10,8 @@
 
 use crate::stitch::{M3, mat_mul};
 use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::path::PathBuf;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
@@ -205,29 +206,49 @@ impl fmt::Display for Ease {
     }
 }
 
-/// What a keyframe can follow instead of looking at fixed angles.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+/// What a keyframe can follow instead of looking at fixed angles. In JSON
+/// it is `"stick"` or a track file's path.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Follow {
     /// The selfie stick, and so whoever holds it: it runs down the rig's
     /// +y, so the camera's attitude says where it points, with no picture
     /// analysis, even straight below the camera.
     Stick,
+    /// A subject tracked by colour (`rosmo360 track`): the CSV it wrote.
+    Track(PathBuf),
+}
+
+impl Serialize for Follow {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Follow::Stick => s.serialize_str("stick"),
+            Follow::Track(path) => path.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Follow {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(if s == "stick" { Follow::Stick } else { Follow::Track(s.into()) })
+    }
 }
 
 impl fmt::Display for Follow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Follow::Stick => "Stick",
-        })
+        match self {
+            Follow::Stick => f.write_str("Stick"),
+            Follow::Track(path) => write!(f, "Colour track {}", path.file_stem().map_or_else(|| path.display().to_string(), |s| s.to_string_lossy().into_owned())),
+        }
     }
 }
 
 /// Where each `Follow` points in the frame being drawn, as view yaw and
-/// pitch in degrees; `None` where the clip has no attitude data.
-pub type Aim<'a> = &'a dyn Fn(Follow) -> Option<(f64, f64)>;
+/// pitch in degrees; `None` where that can't be told (no attitude data, a
+/// track that is missing or lost there).
+pub type Aim<'a> = &'a dyn Fn(&Follow) -> Option<(f64, f64)>;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Keyframe {
     /// Clip time in seconds.
     pub t: f64,
@@ -241,7 +262,7 @@ pub struct Keyframe {
 impl Keyframe {
     /// The view it shows in the frame being drawn.
     fn view_with(&self, aim: Aim) -> View {
-        match self.follow {
+        match &self.follow {
             None => self.view,
             Some(f) => {
                 let (yaw, pitch) = aim(f).unwrap_or((0.0, 0.0));
@@ -252,7 +273,7 @@ impl Keyframe {
 
     /// `view` (as shown) stored the way this keyframe keeps it.
     fn store(&self, view: View, aim: Aim) -> View {
-        match self.follow.and_then(|f| aim(f)) {
+        match self.follow.as_ref().and_then(|f| aim(f)) {
             Some((yaw, pitch)) => View { yaw: view.yaw - yaw, pitch: view.pitch - pitch, ..view },
             None => view,
         }
@@ -287,7 +308,7 @@ impl Serialize for Keyframe {
             t: self.t,
             yaw: fixed.then_some(v.yaw),
             pitch: fixed.then_some(v.pitch),
-            follow: self.follow,
+            follow: self.follow.clone(),
             offset_yaw: follows.then_some(v.yaw),
             offset_pitch: follows.then_some(v.pitch),
             roll: v.roll,
@@ -407,11 +428,19 @@ impl Keyframes {
             return i;
         }
         let i = self.0.partition_point(|f| f.t < t);
-        let (ease, follow) = i.checked_sub(1).map_or((Ease::default(), None), |p| (self.0[p].ease, self.0[p].follow));
+        let (ease, follow) = i.checked_sub(1).map_or((Ease::default(), None), |p| (self.0[p].ease, self.0[p].follow.clone()));
         let mut key = Keyframe { t, view, ease, follow };
         key.view = key.store(view, aim);
         self.0.insert(i, key);
         i
+    }
+
+    /// The track files followed, to resolve or relativise their paths.
+    pub fn tracks_mut(&mut self) -> impl Iterator<Item = &mut PathBuf> {
+        self.0.iter_mut().filter_map(|k| match &mut k.follow {
+            Some(Follow::Track(path)) => Some(path),
+            _ => None,
+        })
     }
 
     /// Makes keyframe `i` follow `follow` (or stop following), keeping the
@@ -517,7 +546,7 @@ impl TryFrom<Vec<RawKeyframe>> for Keyframes {
             if fixed && r.follow.is_some() {
                 bail!("keyframe at {} s has both follow and yaw/pitch; aim it with offset_yaw/offset_pitch", r.t);
             }
-            let follow = r.follow.or(if fixed { None } else { prev.and_then(|p| p.follow) });
+            let follow = r.follow.or(if fixed { None } else { prev.and_then(|p| p.follow.clone()) });
             if follow.is_none() && (r.offset_yaw.is_some() || r.offset_pitch.is_some()) {
                 bail!("keyframe at {} s has offset_yaw/offset_pitch but follows nothing", r.t);
             }
@@ -527,8 +556,8 @@ impl TryFrom<Vec<RawKeyframe>> for Keyframes {
             };
             // Offsets carry over between keyframes following the same thing;
             // a fixed keyframe after a following one has no angles to carry.
-            let prev_follow = prev.and_then(|p| p.follow);
-            let (yaw, pitch) = match follow {
+            let prev_follow = prev.and_then(|p| p.follow.as_ref());
+            let (yaw, pitch) = match &follow {
                 Some(f) => {
                     let (y, p) = if prev_follow == Some(f) { (base.yaw, base.pitch) } else { (0.0, 0.0) };
                     (r.offset_yaw.unwrap_or(y), r.offset_pitch.unwrap_or(p))
@@ -595,10 +624,10 @@ mod tests {
                 {"t": 4, "yaw": 170, "pitch": 0}]"#,
         )
         .unwrap();
-        assert_eq!((k[1].follow, k[1].view.pitch, k[1].view.fov), (Some(Follow::Stick), 30.0, 110.0));
+        assert_eq!((k[1].follow.clone(), k[1].view.pitch, k[1].view.fov), (Some(Follow::Stick), 30.0, 110.0));
         assert_eq!(k[2].follow, None);
         // The stick behind and below: yaw 170, pitch −60.
-        let aim = |_| Some((170.0, -60.0));
+        let aim = |_: &Follow| Some((170.0, -60.0));
         let v = k.view_at(1.0, &aim).unwrap();
         assert_eq!((v.yaw, v.pitch), (170.0, -30.0));
         // Half way from the stick at −170° to the fixed 170° it turns the
@@ -610,6 +639,9 @@ mod tests {
         assert!(serde_json::from_str::<Keyframes>(r#"[{"t": 0, "follow": "stick", "yaw": 3}]"#).is_err());
         assert!(serde_json::from_str::<Keyframes>(r#"[{"t": 0, "follow": "stick"}, {"t": 1, "yaw": 3}]"#).is_err());
         assert!(serde_json::from_str::<Keyframes>(r#"[{"t": 0, "offset_yaw": 3}]"#).is_err());
+        let tracked: Keyframes = serde_json::from_str(r#"[{"t": 0, "follow": "work/friend.csv"}]"#).unwrap();
+        assert_eq!(tracked[0].follow, Some(Follow::Track("work/friend.csv".into())));
+        assert!(serde_json::to_string(&tracked).unwrap().contains(r#""follow":"work/friend.csv""#));
         // Editing keeps the shown view: offsets come from the aim.
         let mut e = k.clone();
         e.set_follow(2, Some(Follow::Stick), &aim);

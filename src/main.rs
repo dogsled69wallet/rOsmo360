@@ -8,6 +8,7 @@ mod ring;
 mod sheet;
 mod stab;
 mod stitch;
+mod track;
 mod view;
 
 use anyhow::{Context, Result, bail};
@@ -208,6 +209,38 @@ enum Cmd {
         #[arg(long, default_value_t = 1.0)]
         every: f64,
     },
+    /// Track a coloured subject (a jacket, a tent) through a clip, as CSV for
+    /// keyframes to follow ("follow": "track.csv"): per sample its direction
+    /// in the camera (x, y, z), its yaw and pitch as a level view would look
+    /// at it (directions in the world, like scan's heading), and its size in
+    /// % of the sphere. Empty where it was lost.
+    Track {
+        input: PathBuf,
+        /// The subject's colour, #rrggbb (from a preview or a photo of it).
+        #[arg(long)]
+        colour: String,
+        /// How far the hue may differ, degrees either side.
+        #[arg(long, default_value_t = 18.0)]
+        tolerance: f64,
+        /// Where the subject is at the start, as level yaw,pitch (it may not
+        /// be the biggest patch of its colour); else it starts from that.
+        #[arg(long, value_parser = parse_pair, allow_hyphen_values = true)]
+        near: Option<(f64, f64)>,
+        /// Start time in seconds.
+        #[arg(short, long)]
+        start: Option<f64>,
+        /// Seconds to track; to the end if omitted.
+        #[arg(short, long)]
+        duration: Option<f64>,
+        /// Seconds between samples.
+        #[arg(long, default_value_t = 0.1)]
+        every: f64,
+    },
+}
+
+fn parse_pair(s: &str) -> Result<(f64, f64), String> {
+    let (a, b) = s.split_once(',').ok_or("give YAW,PITCH")?;
+    Ok((a.trim().parse().map_err(|e| format!("{a:?}: {e}"))?, b.trim().parse().map_err(|e| format!("{b:?}: {e}"))?))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
@@ -267,7 +300,13 @@ impl Framing {
     fn reframe(&self) -> Result<Option<Reframe>> {
         if let Some(path) = &self.reframe {
             let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-            return Ok(Some(serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?));
+            let mut reframe: Reframe = serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
+            // Tracks it follows are named relative to it, as in a project.
+            let dir = path.parent().unwrap_or(Path::new(""));
+            for track in reframe.keyframes.tracks_mut() {
+                *track = dir.join(&*track);
+            }
+            return Ok(Some(reframe));
         }
         Ok(self.view.as_ref().map(|Angles(v)| {
             let home = View::home(self.projection);
@@ -374,6 +413,8 @@ struct Pipeline {
     hw: ffmpeg::Hwaccel,
     /// Decode this side-by-side proxy instead of the lens tracks.
     proxy: Option<PathBuf>,
+    /// Tracks that keyframes follow, read once each (`None`: unreadable).
+    followed: std::sync::Mutex<std::collections::HashMap<PathBuf, Option<std::sync::Arc<track::Track>>>>,
 }
 
 /// Seam state carried from frame to frame so it eases instead of flickering.
@@ -428,13 +469,24 @@ impl Pipeline {
             cut: !opts.no_cut && opts.only.is_none(),
             hw,
             proxy: None,
+            followed: Default::default(),
         })
     }
 
     /// Where `follow` points in the view at clip time `t` (seconds).
-    fn aim(&self, follow: view::Follow, t: f64) -> Option<(f64, f64)> {
+    fn aim(&self, follow: &view::Follow, t: f64) -> Option<(f64, f64)> {
         match follow {
             view::Follow::Stick => self.stab.stick(t * 1000.0, self.readout_ms),
+            view::Follow::Track(path) => {
+                let track = self
+                    .followed
+                    .lock()
+                    .unwrap()
+                    .entry(path.clone())
+                    .or_insert_with(|| track::Track::load(path).inspect_err(|e| eprintln!("{e:#}; keyframes following it look ahead")).ok().map(std::sync::Arc::new))
+                    .clone()?;
+                track.aim(&self.stab, t, self.readout_ms)
+            }
         }
     }
 
@@ -792,6 +844,7 @@ fn main() -> Result<()> {
             eprintln!("wrote {}: {} tiles at {}", output.display(), tiles.len(), times.iter().map(|t| format!("{:.1}", p.snap(*t))).collect::<Vec<_>>().join(" "));
         }
         Cmd::Scan { input, every } => scan(&input, every)?,
+        Cmd::Track { input, colour, tolerance, near, start, duration, every } => track(&input, &track::Colour::parse(&colour, tolerance)?, near, start, duration, every)?,
     }
     Ok(())
 }
@@ -876,6 +929,51 @@ fn info(input: &Path) -> Result<()> {
         "attitude": !imu::read(&parsed).quats.is_empty(),
     });
     println!("{}", serde_json::to_string_pretty(&info)?);
+    Ok(())
+}
+
+/// See `Cmd::Track`.
+fn track(input: &Path, colour: &track::Colour, near: Option<(f64, f64)>, start: Option<f64>, duration: Option<f64>, every: f64) -> Result<()> {
+    // Small, unstabilised (so its directions are the rig's) and from the
+    // proxy: enough to find a jacket, and fast.
+    const WIDTH: usize = 512;
+    let mut p = Pipeline::new(input, &StitchOpts::default(), stab::Mode::Off)?;
+    if !p.stab.has_data() {
+        bail!("{} has no attitude data to track with", input.display());
+    }
+    p.use_proxy();
+    let (start, end) = p.span(start, duration, None)?;
+    let mut stream = p.stream(start)?;
+    let mut carry = Carry::default();
+    let mut last: Option<(f64, [f64; 3])> = near.map(|(yaw, pitch)| (start, track::from_level(&p.stab, start * 1000.0, p.readout_ms, yaw, pitch)));
+    let (mut next, mut n, mut found, mut rows) = (start, 0usize, 0usize, 0usize);
+    println!("t,x,y,z,yaw,pitch,size");
+    while let Some(frames) = stream.next()? {
+        let t = start + n as f64 / p.fps;
+        n += 1;
+        if t > end {
+            break;
+        }
+        if t + 0.5 / p.fps < next {
+            continue;
+        }
+        next += every;
+        rows += 1;
+        let pic = p.render(&frames, t, &mut carry, &Shot::Equirect(WIDTH));
+        // Look where it was last, carried through the camera's turning since;
+        // after a few seconds lost, anywhere again.
+        let guess = last.filter(|(at, _)| t - at < 3.0).map(|(at, d)| p.stab.to_rig(t * 1000.0, p.stab.to_world(at * 1000.0, d)));
+        match track::find(&pic.rgb, WIDTH, colour, guess) {
+            Some((d, share)) => {
+                let (yaw, pitch) = track::level_angles(&p.stab, t * 1000.0, p.readout_ms, d);
+                println!("{t:.3},{:.5},{:.5},{:.5},{yaw:.1},{pitch:.1},{:.3}", d[0], d[1], d[2], share * 100.0);
+                last = Some((t, d));
+                found += 1;
+            }
+            None => println!("{t:.3},,,,,,"),
+        }
+    }
+    eprintln!("found the colour in {found} of {rows} samples");
     Ok(())
 }
 

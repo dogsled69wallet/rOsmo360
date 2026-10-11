@@ -57,6 +57,9 @@ impl Project {
                 bail!("cut {} ends ({} s) before it starts ({} s)", n + 1, cut.end, cut.start);
             }
             cut.input = dir.join(&cut.input);
+            for track in cut.keyframes.tracks_mut() {
+                *track = dir.join(&*track);
+            }
         }
         Ok(project)
     }
@@ -69,6 +72,11 @@ impl Project {
         for cut in &mut project.cuts {
             if let Ok(rel) = cut.input.strip_prefix(dir) {
                 cut.input = rel.to_owned();
+            }
+            for track in cut.keyframes.tracks_mut() {
+                if let Ok(rel) = track.strip_prefix(dir) {
+                    *track = rel.to_owned();
+                }
             }
         }
         std::fs::write(path, serde_json::to_string_pretty(&project)? + "\n").with_context(|| format!("writing {}", path.display()))
@@ -111,7 +119,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"aspect": "9:16", "cuts": [
-                {"input": "a.OSV", "in": 28, "out": 37, "keyframes": [{"t": 28, "yaw": -20}, {"t": 37, "projection": "little-planet"}]},
+                {"input": "a.OSV", "in": 28, "out": 37, "keyframes": [{"t": 28, "yaw": -20}, {"t": 37, "projection": "little-planet"}, {"t": 37.5, "follow": "friend.csv"}]},
                 {"input": "/clips/b.OSV", "in": 5, "out": 12, "stabilize": "lock", "note": "the pan"}
             ]}"#,
         )
@@ -124,9 +132,11 @@ mod tests {
         assert_eq!((p.cuts[0].stabilize, p.cuts[1].stabilize), (None, Some(Mode::Lock)));
         assert_eq!((p.cuts[0].note.as_deref(), p.cuts[1].note.as_deref()), (None, Some("the pan")));
         assert_eq!(p.cuts[0].keyframes[1].view.projection, Projection::LittlePlanet);
+        assert_eq!(p.cuts[0].keyframes[2].follow, Some(crate::view::Follow::Track(dir.join("friend.csv"))));
         let saved = dir.join("again.json");
         p.save(&saved).unwrap();
-        assert!(std::fs::read_to_string(&saved).unwrap().contains(r#""input": "a.OSV""#));
+        let text = std::fs::read_to_string(&saved).unwrap();
+        assert!(text.contains(r#""input": "a.OSV""#) && text.contains(r#""follow": "friend.csv""#));
         assert_eq!(Project::load(&saved).unwrap(), p);
         std::fs::write(&path, r#"{"cuts": [{"input": "a.OSV", "in": 5, "out": 2}]}"#).unwrap();
         assert!(Project::load(&path).is_err());

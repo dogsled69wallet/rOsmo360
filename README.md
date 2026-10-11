@@ -40,6 +40,7 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Timeline** of cuts from one or more clips: split, trim, move and delete them, with undo and redo. Each cut shows thumbnails of its footage, and the timeline zooms in for fine work.
 - **Keyframes** for the view: where it looks (yaw, pitch, roll), the zoom, and the projection, so a shot can pan, zoom or morph into a little planet. Each keyframe eases into the next smoothly, at a steady speed, or holds and then cuts.
 - **Follow the stick**: a keyframe can follow the selfie stick, and so whoever holds it, for a third-person shot that frames you automatically. It works from the camera's motion data, even straight below the camera.
+- **Follow a subject by colour**: `rosmo360 track` finds a coloured subject (a friend's jacket, a tent) through a clip, and keyframes can follow it the same way.
 - **Stabilisation per cut**: one cut world-locked, the next following the horizon.
 - **Projects**: save the edit and open it again later. A cut can carry a short note, shown on the timeline.
 - **Export** the edit to MP4 with its sound, from 720p to 4K, in the aspect lock's shape. It renders on the GPU, about four times faster than the CPU (21 frames a second at 1080p on an RTX 3090).
@@ -180,6 +181,18 @@ rosmo360 export edit.json --format resolve -o edit.mov       # DNxHR HQ + PCM, f
 `t` is the clip time in seconds; `projection` is `perspective`, `little-planet` or `equirect`; `ease` (how a keyframe moves on to the next) is `smooth` (the default), `linear` or `hold`. Perspective and little planet morph smoothly into each other.
 
 Instead of `yaw` and `pitch`, a keyframe can say `"follow": "stick"`: it then looks along the selfie stick, at whoever holds it, plus `offset_yaw` and `offset_pitch` (degrees). For a third-person shot from above and behind, try `{"t": 30, "follow": "stick", "offset_pitch": 25, "fov": 100}`. Following carries on to the next keyframes until one gives its own `yaw` and `pitch`.
+
+To follow something else, track it by colour first, then give the track's file as `follow` (relative to the project or reframe file):
+
+```sh
+rosmo360 track clip.OSV --colour "#e8641e" -s 12 -d 15 > friend.csv   # --near YAW,PITCH where it starts, if it isn't the biggest patch of that colour
+```
+
+```json
+{"t": 12, "follow": "friend.csv", "offset_pitch": 10, "fov": 80}
+```
+
+The CSV has, every 0.1 s, the subject's direction in the camera, its yaw and pitch as world directions (as in `--stabilize level` and `scan`'s heading) and its size; empty rows where it was lost. Pick a colour that stands out: the sky, grass and rock won't do.
 
 Skimming a clip:
 
