@@ -85,12 +85,64 @@ impl Music {
             .unwrap_or(self.end())
     }
 
-    /// Where clip `i`'s neighbours leave it room on the edit: the end of the
-    /// one before and the start of the one after.
-    pub fn room(&self, i: usize) -> (f64, f64) {
-        let c = &self.clips[i];
-        let others = self.clips.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, o)| o);
-        others.fold((0.0, f64::INFINITY), |(lo, hi), o| if o.ends() <= c.at + 1e-6 { (lo.max(o.ends()), hi) } else { (lo, hi.min(o.at)) })
+    /// Whether clip `i` fits from `at` for `len` seconds. It may overlap
+    /// another clip only partly, at one of that clip's ends (the overlap is
+    /// their crossfade), and never where a third clip plays; with `overlap`
+    /// false, by no more than it overlaps that clip already (a plain drag
+    /// never makes a crossfade, nor grows one).
+    pub fn fits(&self, i: usize, at: f64, len: f64, overlap: bool) -> bool {
+        const E: f64 = 1e-6;
+        let (s, e) = (at, at + len);
+        let me = &self.clips[i];
+        let others = || self.clips.iter().enumerate().filter(move |&(j, _)| j != i).map(|(_, c)| c);
+        at >= -E
+            && others().all(|c| {
+                let o = overlap_of(s, e, c.at, c.ends());
+                if o <= E {
+                    return true;
+                }
+                let partly = (s > c.at + E && e > c.ends() + E) || (s < c.at - E && e < c.ends() - E);
+                let (o0, o1) = (s.max(c.at), e.min(c.ends()));
+                let alone = others().all(|d| std::ptr::eq(d, c) || overlap_of(o0, o1, d.at, d.ends()) <= E);
+                partly && alone && (overlap || o <= overlap_of(me.at, me.ends(), c.at, c.ends()) + E)
+            })
+    }
+
+    /// How far from `from` towards `to` a value can go while `ok` holds
+    /// (it holds at `from`): an edge dragged into a neighbour stops at it.
+    pub fn reach(from: f64, to: f64, ok: impl Fn(f64) -> bool) -> f64 {
+        if ok(to) {
+            return to;
+        }
+        let (mut good, mut bad) = (from, to);
+        for _ in 0..40 {
+            let mid = (good + bad) / 2.0;
+            if ok(mid) {
+                good = mid;
+            } else {
+                bad = mid;
+            }
+        }
+        good
+    }
+
+    /// Clip `i`'s crossfades: how long it overlaps the clip before it, and
+    /// the clip after it.
+    pub fn crossfades(&self, i: usize) -> (f64, f64) {
+        let me = &self.clips[i];
+        let (mut fade_in, mut fade_out) = (0.0, 0.0);
+        for (j, c) in self.clips.iter().enumerate() {
+            let o = overlap_of(me.at, me.ends(), c.at, c.ends());
+            if j == i || o <= 1e-6 {
+                continue;
+            }
+            if c.at < me.at {
+                fade_in = o;
+            } else {
+                fade_out = o;
+            }
+        }
+        (fade_in, fade_out)
     }
 
     /// Splits clip `i` at edit time `t`, each half staying where it was on the
@@ -128,6 +180,11 @@ pub struct MusicClip {
     pub fade_in: f64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub fade_out: f64,
+}
+
+/// How long the spans `a0..a1` and `b0..b1` share.
+fn overlap_of(a0: f64, a1: f64, b0: f64, b1: f64) -> f64 {
+    (a1.min(b1) - a0.max(b0)).max(0.0)
 }
 
 impl MusicClip {
@@ -330,8 +387,25 @@ mod tests {
         assert_eq!(m.place(0, 18.0), 30.0);
         m.clips[1].at = 40.0;
         assert_eq!(m.place(0, 35.0), 30.0);
-        assert_eq!(m.room(1), (10.0, f64::INFINITY));
-        assert_eq!(m.room(0), (0.0, 40.0));
+        // A crossfade is a partial overlap of two, made only on purpose.
+        assert!(!m.fits(0, 35.0, 10.0, false));
+        assert!(m.fits(0, 35.0, 10.0, true));
+        assert_eq!(m.crossfades(1), (0.0, 0.0));
+        m.clips[0].at = 35.0;
+        assert_eq!((m.crossfades(0), m.crossfades(1)), ((0.0, 5.0), (5.0, 0.0)));
+        // Not inside the other, nor over a third.
+        assert!(!m.fits(0, 45.0, 10.0, true));
+        m.clips.push(clip(58.0, 0.0, 10.0));
+        assert!(!m.fits(2, 50.0, 10.0, true));
+        assert!(m.fits(2, 46.0, 30.0, true));
+        assert!(!m.fits(2, 43.0, 30.0, true));
+        // An edge dragged into a neighbour without Shift stops against it.
+        let len = m.clips[2].end - m.clips[2].start;
+        let at = Music::reach(58.0, 40.0, |at| m.fits(2, at, len, false));
+        assert!((at - 58.0).abs() < 1e-6, "{at}");
+        m.clips[2].at = 70.0;
+        let at = Music::reach(70.0, 40.0, |at| m.fits(2, at, len, false));
+        assert!((at - 60.0).abs() < 1e-6, "{at}");
     }
 
     #[test]

@@ -63,112 +63,128 @@ pub fn gain(db: f64) -> f32 {
     project::gain(db) as f32
 }
 
-/// How loud music clip `clip` is at edit time `t` from its own fades and the
-/// fade-out before `video_end` when it runs on past it, 0..1.
-fn envelope(clip: &MusicClip, t: f64, video_end: f64) -> f64 {
+/// How loud music clip `clip` is at edit time `t` from its own fades, its
+/// `crossfades` with the clips before and after it (equal power, so the
+/// loudness holds through the middle), and the fade-out before `video_end`
+/// when it runs on past it, 0..1.
+fn envelope(clip: &MusicClip, (cross_in, cross_out): (f64, f64), t: f64, video_end: f64) -> f64 {
     let into = t - clip.at;
-    let ends = clip.at + clip.end - clip.start;
+    let left = clip.ends() - t;
     let mut g: f64 = 1.0;
     if clip.fade_in > 0.0 {
         g = g.min(into / clip.fade_in);
     }
     if clip.fade_out > 0.0 {
-        g = g.min((ends - t) / clip.fade_out);
+        g = g.min(left / clip.fade_out);
     }
-    if ends > video_end {
+    if clip.ends() > video_end {
         g = g.min((video_end - t) / project::END_FADE);
     }
-    g.clamp(0.0, 1.0)
+    let g = g.clamp(0.0, 1.0);
+    let quarter_sine = |x: f64| (x.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2).sin();
+    let mut x = 1.0;
+    if cross_in > 0.0 {
+        x *= quarter_sine(into / cross_in);
+    }
+    if cross_out > 0.0 {
+        x *= quarter_sine(left / cross_out);
+    }
+    g * x
 }
 
-/// A clip's sound, open: its song, where the clip sits on the edit, and from
-/// where in the song the stream started (so it's at `from + elapsed` now).
+/// A clip's sound, open: its song, where the clip sits on the edit, from
+/// where in the song the stream started (so it's at `from + elapsed` once
+/// let through), and whether it has been.
 struct Open {
     input: PathBuf,
     at: f64,
     from: f64,
     audio: Audio,
+    started: bool,
 }
 
 impl Open {
     fn is(&self, clip: &MusicClip) -> bool {
         self.input == clip.input && self.at == clip.at && self.from == clip.start
     }
+
+    fn play(&mut self) {
+        self.audio.play();
+        self.started = true;
+    }
 }
 
-/// The music playing now, and the next clip's, ready.
+/// The music's open streams: the clips playing now (two through a
+/// crossfade), and the next one's, ready.
 #[derive(Default)]
 pub struct Player {
-    playing: Option<Open>,
-    next: Option<Open>,
+    open: Vec<Open>,
 }
 
 impl Player {
     /// Keeps the music in step with edit time `t` while the edit plays (stops
-    /// it otherwise): the clip under `t`, at `listen` (the speakers' volume)
-    /// times the track's level and the clip's envelope.
+    /// it otherwise): the clips under `t`, each at `listen` (the speakers'
+    /// volume) times the track's level and the clip's envelope.
     pub fn follow(&mut self, track: &project::Music, t: f64, video_end: f64, listen: f32, playing: bool) {
         if !playing {
-            (self.playing, self.next) = (None, None);
+            self.open.clear();
             return;
         }
-        let level = |clip: &MusicClip, t: f64| listen * gain(track.volume) * envelope(clip, t, video_end) as f32;
-        let clip = track.clips.iter().find(|c| t >= c.at && t < c.ends() && t < video_end);
-        // Moving on to the clip that was made ready.
-        if let Some(clip) = clip
-            && self.next.as_ref().is_some_and(|n| n.is(clip))
-        {
-            let next = self.next.take().unwrap();
-            next.audio.play();
-            self.playing = Some(next);
-        }
-        match clip {
-            Some(clip) => {
-                let want = clip.start + (t - clip.at);
-                let volume = level(clip, t);
-                match &mut self.playing {
-                    // Within the same song and in step: a split clip's second
-                    // half just plays on.
-                    Some(open) if open.input == clip.input && (open.from + open.audio.elapsed() - want).abs() < DRIFT => open.audio.set_volume(volume),
-                    _ => {
-                        self.playing = match Audio::start(&clip.input, want, volume) {
-                            Ok(audio) => Some(Open { input: clip.input.clone(), at: clip.at, from: want, audio }),
-                            Err(e) => {
-                                eprintln!("no music: {e:#}");
-                                None
-                            }
-                        }
+        let level = |i: usize, t: f64| listen * gain(track.volume) * envelope(&track.clips[i], track.crossfades(i), t, video_end) as f32;
+        let mut old = std::mem::take(&mut self.open);
+        let now: Vec<usize> = (0..track.clips.len()).filter(|&i| t >= track.clips[i].at && t < track.clips[i].ends() && t < video_end).collect();
+        for &i in &now {
+            let clip = &track.clips[i];
+            let want = clip.start + (t - clip.at);
+            // Playing and in step (a split song's second half plays on in its
+            // first half's stream), else made ready for it, else started.
+            let in_step = old.iter().position(|o| o.started && o.input == clip.input && (o.from + o.audio.elapsed() - want).abs() < DRIFT);
+            let ready = || old.iter().position(|o| !o.started && o.is(clip));
+            let mut open = match in_step.or_else(ready) {
+                Some(k) => old.swap_remove(k),
+                None => match Audio::prepare(&clip.input, want, 0.0) {
+                    Ok(audio) => Open { input: clip.input.clone(), at: clip.at, from: want, audio, started: false },
+                    Err(e) => {
+                        eprintln!("no music: {e:#}");
+                        continue;
                     }
-                }
-            }
-            None => self.playing = None,
-        }
-        self.prime(track, clip, t, video_end, &level);
-    }
-
-    /// Opens the clip starting next within `PRIME` of `t`, unless the one
-    /// playing runs straight on into it, and lets it through a device latency
-    /// before it starts, so it's heard on time.
-    fn prime(&mut self, track: &project::Music, now: Option<&MusicClip>, t: f64, video_end: f64, level: &dyn Fn(&MusicClip, f64) -> f32) {
-        let next = track.clips.iter().filter(|c| c.at > t && c.at < t + PRIME && c.at < video_end).min_by(|a, b| a.at.total_cmp(&b.at));
-        let carries_on = |n: &MusicClip| now.is_some_and(|c| c.input == n.input && (c.ends() - n.at).abs() < 1e-3 && (c.end - n.start).abs() < 1e-3);
-        let Some(next) = next.filter(|n| !carries_on(n)) else {
-            self.next = None;
-            return;
-        };
-        if !self.next.as_ref().is_some_and(|n| n.is(next)) {
-            self.next = match Audio::prepare(&next.input, next.start, level(next, next.at)) {
-                Ok(audio) => Some(Open { input: next.input.clone(), at: next.at, from: next.start, audio }),
-                Err(e) => {
-                    eprintln!("no music: {e:#}");
-                    None
-                }
+                },
             };
+            if !open.started {
+                open.play();
+            }
+            open.audio.set_volume(level(i, t));
+            self.open.push(open);
         }
-        if let Some(open) = &self.next
-            && t >= next.at - open.audio.latency().min(0.25)
-        {
-            open.audio.play();
+        // The clips starting within `PRIME`, opened ahead and let through a
+        // device latency early so they're heard on time; not one the song
+        // playing runs straight on into.
+        for (i, next) in track.clips.iter().enumerate() {
+            if next.at <= t || next.at >= t + PRIME || next.at >= video_end {
+                continue;
+            }
+            let carries_on = now.iter().any(|&j| {
+                let c = &track.clips[j];
+                c.input == next.input && (c.ends() - next.at).abs() < 1e-3 && (c.end - next.start).abs() < 1e-3
+            });
+            if carries_on {
+                continue;
+            }
+            let mut open = match old.iter().position(|o| o.is(next)) {
+                Some(k) => old.swap_remove(k),
+                None => match Audio::prepare(&next.input, next.start, level(i, next.at)) {
+                    Ok(audio) => Open { input: next.input.clone(), at: next.at, from: next.start, audio, started: false },
+                    Err(e) => {
+                        eprintln!("no music: {e:#}");
+                        continue;
+                    }
+                },
+            };
+            if !open.started && t >= next.at - open.audio.latency().min(0.25) {
+                open.audio.set_volume(level(i, next.at));
+                open.play();
+            }
+            self.open.push(open);
         }
     }
 }
@@ -180,12 +196,17 @@ mod tests {
     #[test]
     fn fades_in_out_and_before_the_video_ends() {
         let clip = MusicClip { input: "song.mp3".into(), at: 10.0, start: 0.0, end: 100.0, fade_in: 2.0, fade_out: 0.0 };
-        assert_eq!(envelope(&clip, 11.0, 1000.0), 0.5);
-        assert_eq!(envelope(&clip, 50.0, 1000.0), 1.0);
+        let none = (0.0, 0.0);
+        assert_eq!(envelope(&clip, none, 11.0, 1000.0), 0.5);
+        assert_eq!(envelope(&clip, none, 50.0, 1000.0), 1.0);
         // The video ends at 60 s, so it fades over the last 3 s before it.
-        assert_eq!(envelope(&clip, 58.5, 60.0), 0.5);
-        assert_eq!(envelope(&clip, 56.0, 60.0), 1.0);
-        let short = MusicClip { fade_out: 4.0, end: 20.0, ..clip };
-        assert_eq!(envelope(&short, 28.0, 1000.0), 0.5);
+        assert_eq!(envelope(&clip, none, 58.5, 60.0), 0.5);
+        assert_eq!(envelope(&clip, none, 56.0, 60.0), 1.0);
+        let short = MusicClip { fade_out: 4.0, end: 20.0, ..clip.clone() };
+        assert_eq!(envelope(&short, none, 28.0, 1000.0), 0.5);
+        // Halfway through a 4 s crossfade into the next clip: equal power,
+        // so the two together are as loud as one.
+        let out = envelope(&clip, (0.0, 4.0), 108.0, 1000.0);
+        assert!((out * out - 0.5).abs() < 1e-9, "{out}");
     }
 }

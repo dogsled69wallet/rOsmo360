@@ -784,7 +784,7 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
         // The whole edit gets its mix; a file per cut is for another editor,
         // so its sound is left as recorded and the music goes beside it.
         let length: f64 = plan[cuts.clone()].iter().map(|p| p.2 as f64 / fps).sum();
-        let mix = ffmpeg::Mix { sound_db: project.sound.volume, music_db: project.music.volume, music: &project.music.clips, length };
+        let mix = ffmpeg::Mix { sound_db: project.sound.volume, music: &project.music, length };
         let mix = matches!(out.target, Target::One(_)).then_some(&mix);
         let mut encoder = ffmpeg::Encoder::new(&path, out.size, fps, &sound, mix, out.format)?;
         for (n, &(i, start, frames)) in cuts.clone().zip(&plan[cuts]) {

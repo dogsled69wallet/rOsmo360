@@ -276,10 +276,12 @@ enum Message {
     /// A song's waveform, read off the UI thread.
     Waveform(PathBuf, Result<Arc<music::Waveform>, String>),
     SelectMusic(usize),
-    /// Music clip `i` dragged to start at this edit time.
-    MusicMove(usize, f64),
-    /// Music clip `i`'s in (`true`) or out edge dragged to this song time.
-    MusicTrim(usize, bool, f64),
+    /// Music clip `i` dragged to start at this edit time; with Shift held
+    /// (`true`) it may overlap a neighbour, crossfading.
+    MusicMove(usize, f64, bool),
+    /// Music clip `i`'s in (`true`) or out edge dragged to this song time,
+    /// with Shift held or not.
+    MusicTrim(usize, bool, f64, bool),
     /// The mix: the clips' sound and the music track, in dB.
     SoundLevel(f64),
     MusicLevel(f64),
@@ -1241,31 +1243,46 @@ impl App {
                 self.selected_music = Some(i);
                 self.selected = None;
             }
-            Message::MusicMove(i, at) => {
+            Message::MusicMove(i, want, overlap) => {
                 self.begin_drag();
                 if i < self.edit.music.clips.len() {
-                    self.edit.music.clips[i].at = self.edit.music.place(i, at);
+                    let m = &self.edit.music;
+                    let c = &m.clips[i];
+                    let len = c.end - c.start;
+                    // A plain drag never overlaps: it stops edge to edge, or
+                    // hops past. With Shift it slides in as far as it may.
+                    let at = if overlap || m.crossfades(i) != (0.0, 0.0) {
+                        crate::project::Music::reach(c.at, want.max(0.0), |at| m.fits(i, at, len, overlap))
+                    } else {
+                        m.place(i, want)
+                    };
+                    self.edit.music.clips[i].at = at;
                 }
             }
-            Message::MusicTrim(i, in_edge, t) => {
+            Message::MusicTrim(i, in_edge, t, overlap) => {
                 self.begin_drag();
                 if i >= self.edit.music.clips.len() {
                     return Task::none();
                 }
                 let song = self.waveforms.get(&self.edit.music.clips[i].input).map_or(f64::INFINITY, |w| w.duration);
-                let (lo, hi) = self.edit.music.room(i);
-                let c = &mut self.edit.music.clips[i];
-                // Song time to edit time on this clip.
+                let m = &self.edit.music;
+                let c = &m.clips[i];
+                // Song time to edit time on this clip: the song stays put on
+                // the edit, so trimming its start moves where the clip
+                // begins, not what plays when. Within the song and the edit,
+                // and into a neighbour only with Shift.
                 let to_edit = c.at - c.start;
+                let (start, end) = (c.start, c.end);
                 if in_edge {
-                    // The song stays put on the edit: trimming its start
-                    // moves where the clip begins, not what plays when. Not
-                    // past the song's start, the edit's or the clip before.
-                    let start = t.max(c.start - c.at).max(lo - to_edit).max(0.0).min(c.end - edit::MIN_CUT);
-                    c.at += start - c.start;
+                    let want = t.max(start - c.at).max(0.0).min(end - edit::MIN_CUT);
+                    let start = crate::project::Music::reach(start, want, |s| m.fits(i, s + to_edit, end - s, overlap));
+                    let c = &mut self.edit.music.clips[i];
+                    c.at = start + to_edit;
                     c.start = start;
                 } else {
-                    c.end = t.min(song).min(hi - to_edit).max(c.start + edit::MIN_CUT);
+                    let want = t.min(song).max(start + edit::MIN_CUT);
+                    let end = crate::project::Music::reach(end, want, |e| m.fits(i, c.at, e - start, overlap));
+                    self.edit.music.clips[i].end = end;
                 }
             }
             Message::SoundLevel(db) => {

@@ -361,9 +361,8 @@ pub fn wav(input: &Path, start: f64, duration: f64, output: &Path) -> Result<()>
 pub struct Mix<'a> {
     /// The clips' sound, dB.
     pub sound_db: f64,
-    /// The music track, dB, and its clips.
-    pub music_db: f64,
-    pub music: &'a [crate::project::MusicClip],
+    /// The music track: its level and clips.
+    pub music: &'a crate::project::Music,
     /// The edit's length: music running on is cut here, faded out over
     /// `project::END_FADE`.
     pub length: f64,
@@ -372,7 +371,7 @@ pub struct Mix<'a> {
 impl Mix<'_> {
     /// Whether it changes anything.
     fn matters(&self) -> bool {
-        self.sound_db != 0.0 || !self.music.is_empty()
+        self.sound_db != 0.0 || !self.music.clips.is_empty()
     }
 }
 
@@ -461,7 +460,7 @@ fn mixed(cmd: &mut Command, audio: &[Sound<'_>], mix: &Mix<'_>) -> Result<String
         graph += &format!("anullsrc=r=48000:cl=stereo,atrim=duration={}[s];", mix.length);
     }
     let mut parts = vec!["[s]".to_owned()];
-    for clip in mix.music {
+    for (i, clip) in mix.music.clips.iter().enumerate() {
         // What's left of the edit from where it starts.
         let room = mix.length - clip.at;
         let len = (clip.end - clip.start).min(room);
@@ -475,13 +474,23 @@ fn mixed(cmd: &mut Command, audio: &[Sound<'_>], mix: &Mix<'_>) -> Result<String
             chain += &format!(",afade=t=in:st=0:d={}", clip.fade_in.min(len));
         }
         // Cut off by the edit's end: fade out there instead of its own fade.
-        let fade_out = if clip.end - clip.start > room { crate::project::END_FADE } else { clip.fade_out };
+        let cut_off = clip.end - clip.start > room;
+        let fade_out = if cut_off { crate::project::END_FADE } else { clip.fade_out };
         if fade_out > 0.0 {
             let d = fade_out.min(len);
             chain += &format!(",afade=t=out:st={}:d={d}", len - d);
         }
+        // Crossfades with the clips either side, equal power as the player
+        // has them (a quarter sine each way).
+        let (cross_in, cross_out) = mix.music.crossfades(i);
+        if cross_in > 0.0 {
+            chain += &format!(",afade=t=in:st=0:d={}:curve=qsin", cross_in.min(len));
+        }
+        if cross_out > 0.0 && !cut_off {
+            chain += &format!(",afade=t=out:st={}:d={cross_out}:curve=qsin", len - cross_out);
+        }
         let delay = (clip.at * 1000.0).round();
-        graph += &format!("{chain},adelay=delays={delay}:all=1,volume={}[m{input}];", crate::project::gain(mix.music_db));
+        graph += &format!("{chain},adelay=delays={delay}:all=1,volume={}[m{input}];", crate::project::gain(mix.music.volume));
         parts.push(format!("[m{input}]"));
     }
     graph += &format!("{}amix=inputs={}:duration=first:normalize=0[a]", parts.concat(), parts.len());

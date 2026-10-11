@@ -302,6 +302,24 @@ impl Timeline {
                 });
             }
         }
+        // Overlaps are crossfades: an X across each, as editors draw them.
+        for (i, a) in self.music.iter().enumerate() {
+            for c in &self.music[i + 1..] {
+                let (t0, t1) = (a.from.max(c.from), (a.from + a.len).min(c.from + c.len));
+                if t1 - t0 <= 1e-6 {
+                    continue;
+                }
+                let (l, r) = (self.x(t0, b), self.x(t1, b));
+                frame.fill(&Path::rectangle(Point::new(l, top), Size::new(r - l, h)), iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35));
+                let x = Path::new(|p| {
+                    p.move_to(Point::new(l, top + h));
+                    p.line_to(Point::new(r, top));
+                    p.move_to(Point::new(l, top));
+                    p.line_to(Point::new(r, top + h));
+                });
+                frame.stroke(&x, Stroke::default().with_width(1.5).with_color(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.85)));
+            }
+        }
         // Past the video's end the music fades out in the export: dim it,
         // and mark the end.
         if self.duration > self.video + 1e-6 {
@@ -453,7 +471,7 @@ impl canvas::Program<Message> for Marks {
                     Drag::MusicMove { clip, x0, at, per_px } => {
                         let at = *at + (x - *x0) as f64 * *per_px;
                         let len = self.music[*clip].len;
-                        Message::MusicMove(*clip, at + self.snap(*clip, &[at, at + len], *per_px))
+                        Message::MusicMove(*clip, at + self.snap(*clip, &[at, at + len], *per_px), state.shift)
                     }
                     Drag::MusicTrim { clip, start, x0, from, per_px } => {
                         // Song time to edit time is fixed while trimming:
@@ -461,7 +479,7 @@ impl canvas::Program<Message> for Marks {
                         let m = &self.music[*clip];
                         let t = *from + (x - *x0) as f64 * *per_px;
                         let to_edit = m.from - m.start;
-                        Message::MusicTrim(*clip, *start, t + self.snap(*clip, &[t + to_edit], *per_px))
+                        Message::MusicTrim(*clip, *start, t + self.snap(*clip, &[t + to_edit], *per_px), state.shift)
                     }
                 };
                 Some(canvas::Action::publish(message).and_capture())
