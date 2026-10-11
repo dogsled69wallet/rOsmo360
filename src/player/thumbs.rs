@@ -5,6 +5,7 @@
 //! seconds each.
 
 use super::{Media, Message};
+use crate::cache;
 use crate::ffmpeg;
 use crate::stab::Mode;
 use crate::stitch;
@@ -36,15 +37,24 @@ pub fn stream(media: Media) -> impl Stream<Item = Message> {
     })
 }
 
-fn make(media: &Media, mut send: impl FnMut(f64, Handle) -> bool) -> anyhow::Result<()> {
+pub fn make(media: &Media, mut send: impl FnMut(f64, Handle) -> bool) -> anyhow::Result<()> {
     let Some(proxy) = &media.proxy else { return Ok(()) };
+    let (w, h) = SIZE;
+    if let Some(thumbs) = cache::thumbs(&media.input, SIZE) {
+        for (t, rgba) in thumbs {
+            if !send(t, Handle::from_rgba(w as u32, h as u32, rgba)) {
+                break;
+            }
+        }
+        return Ok(());
+    }
     let mut stab = media.stab.clone();
     stab.set_mode(Mode::Horizon);
     let camera = View { fov: 100.0, ..View::home(Projection::Perspective) }.camera();
-    let (w, h) = SIZE;
     let ray = |x: f64, y: f64| stitch::apply(camera.user, camera.ray(w as f64 / h as f64, [x / w as f64 * 2.0 - 1.0, y / h as f64 * 2.0 - 1.0]));
     let every = media.duration / MOST;
     let mut last = f64::NEG_INFINITY;
+    let (mut made, mut whole) = (Vec::new(), true);
     ffmpeg::key_frames(proxy, 0, (LENS * media.rig.tracks.len(), LENS), |t, frame| {
         if t - last < every {
             return true;
@@ -54,6 +64,13 @@ fn make(media: &Media, mut send: impl FnMut(f64, Handle) -> bool) -> anyhow::Res
         let frames = ffmpeg::split_proxy(&frame, &media.rig.tracks);
         let picture = stitch::render(&media.rig.lenses, &frames, SIZE, ray, None, &views, &stitch::Seam::default());
         let rgba: Vec<u8> = picture.rgb.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
-        send(t, Handle::from_rgba(w as u32, h as u32, rgba))
-    })
+        made.push((t, rgba.clone()));
+        whole = send(t, Handle::from_rgba(w as u32, h as u32, rgba));
+        whole
+    })?;
+    // Only a whole set: one cut short (the clip closed) would stay short.
+    if whole {
+        cache::store_thumbs(&media.input, SIZE, &made);
+    }
+    Ok(())
 }

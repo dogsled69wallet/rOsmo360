@@ -70,7 +70,7 @@ From top to bottom:
 
    ![The top bar: Add clip…, Open project…, Save project, Aspect 16:9, Export…, 1080p, the clip's name, and the playback quality](guide/top-bar.png)
 
-   The buttons are icons: add clips (a film strip with a plus), open a project (a folder), save (a diskette; dimmed when there's nothing new to save), save as (a diskette with a pencil) and export (an arrow out of a tray). While an export or a track runs, a crossed circle cancels it.
+   The buttons are icons: new project (a page with a plus), add clips (a film strip with a plus), open a project (a folder), save (a diskette; dimmed when there's nothing new to save), save as (a diskette with a pencil) and export (an arrow out of a tray). While an export or a track runs, a crossed circle cancels it.
 
    On the right, two dimmed icons say what you're seeing (a film strip for the proxy, a picture for the OSV or full resolution, an hourglass while a full-resolution frame loads) and how it decodes (a lightning bolt for the GPU, a chip for software); hover over them for the details. After an export it says where the file went.
 
@@ -236,10 +236,13 @@ A project saves the edit: the cuts, their keyframes and stabilisation, and the a
 
 - **Save**: Ctrl+S, or the diskette. **Save as**: Ctrl+Shift+S, or the diskette with a pencil.
 - **Open**: Ctrl+Shift+O, or the folder. You can also give the file to `rosmo360 play edit.json`.
+- **New**: Ctrl+N, or the page with a plus at the left of the top bar, starts an empty project without closing the window. Clips you had open stay loaded, so adding them again is instant.
 
-The window title shows the project's name, with a dot (•) when there are unsaved changes. If you close the window or open another project with unsaved changes, rOsmo360 asks whether to **Save**, **Don't save** or **Cancel**.
+The window title shows the project's name, with a dot (•) when there are unsaved changes. If you close the window, open another project or start a new one with unsaved changes, rOsmo360 asks whether to **Save**, **Don't save** or **Cancel**.
 
 Projects are small JSON files. Clips in the project's folder, or in folders inside it, are saved by relative path, so you can move the whole folder, or copy it to another computer, and the project still finds its clips. If a clip is missing when you open a project, its cuts are left out and you're told which.
+
+A project starts playing as soon as its first cut's clip has loaded; the others load behind it, with the bar in the top bar. If playback reaches a cut whose clip isn't in yet, it waits there.
 
 ## 10. Exporting video
 
@@ -341,13 +344,15 @@ The [README](../README.md#usage) describes the project and reframe file formats.
 | Ctrl+O | Add clips |
 | Ctrl+S / Ctrl+Shift+S | Save the project / save as |
 | Ctrl+Shift+O | Open a project |
+| Ctrl+N | New project |
 
 With the mouse: drag in the view to look around, right-drag to roll, scroll to zoom. On the timeline, click to seek, click a keyframe mark to jump to it, drag a mark to retime it, drag a cut to move it or its edges to trim it, and scroll to zoom.
 
 ## 14. Tips and troubleshooting
 
 - **Playback stutters.** Use the **Proxy (LRF)** source; it needs far less than the full `.OSV`. If a clip has no `.LRF`, copy it from the camera's card; DJI records one next to every clip.
-- **Clips load slowly the first time.** Each clip is checked for its calibration and motion data, and the GPU decoder is tested once. Video on a spinning hard drive is slower to start and scrub than on an SSD.
+- **Clips load slowly the first time.** Each clip is read for its calibration and motion data, which are spread through the file: from a network share that can take most of a minute for a long clip. rOsmo360 keeps what it read, and the timeline's thumbnails, in a cache, so the next time the clip opens in a fraction of a second, in any project and from the command line too. It recognises a clip by its contents, so moving or renaming footage doesn't matter, and a changed file is read afresh. Video on a spinning hard drive is still slower to start and scrub than on an SSD.
+- **The cache** is in `~/.cache/rosmo360` on Linux (`%LOCALAPPDATA%\rosmo360` on Windows), about 1.5 MB a minute of footage. To keep it elsewhere, say on a disk meant for media, run `rosmo360 cache move /mnt/media/rosmo360-cache`: it moves what's cached and stays there from then on (`rosmo360 cache move --default` goes back). `rosmo360 cache add ~/Videos/Hike` caches every clip in a folder ahead of time, so even the first open is quick; run it after copying a card (`--force` reads every clip afresh, even those already cached). `rosmo360 cache` shows where the cache is and its size; `rosmo360 cache clear` empties it, and `rosmo360 cache clear --older-than 90` removes only what no clip has used for 90 days. It's always safe to clear. `--no-cache` on any command reads clips afresh and caches nothing.
 - **The paused picture keeps changing sharpness.** Turn off **Full res when paused** while keyframing.
 - **Something close to the camera looks doubled or cut at the edges.** That's the seam where the two lenses meet. rOsmo360 lines up close subjects and cuts cleanly where it can't, but a hand or face very close to the seam can still show it, most of all next to the selfie stick, where the two lenses overlap least. Turn the view so close subjects sit away from the sides of the camera.
 - **"World lock" starts tilted.** It holds the clip's first orientation. Use **Level** instead: it holds the direction but keeps the horizon level.

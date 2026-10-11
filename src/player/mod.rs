@@ -76,6 +76,15 @@ pub struct Options {
     pub world_z_down: bool,
 }
 
+/// Caches `input` the way opening it in the player would: its telemetry and
+/// timeline thumbnails (`rosmo360 cache add`).
+pub fn cache_clip(input: &Path) -> Result<()> {
+    let opts = Options { osv_size: None, hw: Some(Hwaccel::Software), stabilize: Mode::Horizon, imu_axes: ImuAxes::X180, world_z_down: false };
+    thumbs::make(&Media::load(input.to_owned(), &opts, &|_| {})?, |_, _| true)
+}
+
+pub use settings::config_dir;
+
 impl Media {
     /// `progress` hears how far reading the clip's telemetry has got (0..1),
     /// which is most of the time a clip takes to load.
@@ -85,9 +94,12 @@ impl Media {
         let proxy = ffmpeg::proxy(&input);
         let hw = match opts.hw {
             Some(hw) => hw,
-            None => Hwaccel::pick(&input, p.tracks[0])?,
+            None => {
+                let hw = Hwaccel::pick(&input, p.tracks[0])?;
+                eprintln!("decoding with {hw:?}");
+                hw
+            }
         };
-        eprintln!("decoding with {hw:?}");
         Ok(Media {
             duration: ffmpeg::duration(&input)?,
             osv_full: ffmpeg::dimensions(&input, p.tracks[0])?.0 as u32,
@@ -205,6 +217,7 @@ impl fmt::Display for Source {
 enum Then {
     Close,
     OpenProject,
+    NewProject,
 }
 
 /// An answer to "save changes first?".
@@ -251,6 +264,8 @@ enum Message {
     ExportCancel,
     /// Starts (or stops) drawing a box over a subject to track its colour.
     PickColour,
+    /// Start an empty edit (asking first if there are unsaved changes).
+    NewProject,
     /// A redraw while clips load, for the loading bar.
     LoadingTick,
     /// The box being drawn, in fractions of the view.
@@ -481,6 +496,12 @@ impl App {
     /// Adds the next queued clip: straight away if it is in the library
     /// already, else once it has loaded.
     fn open_next(&mut self) -> Task<Message> {
+        // A project's first cut plays once its clip is in, while the rest load.
+        if self.clip.is_none() && self.edit.cuts.first().is_some_and(|c| self.library.iter().any(|m| m.input == c.input)) {
+            let start = self.edit.cuts[0].start;
+            self.follow = true;
+            self.goto(0, start, false);
+        }
         while let Some((path, add)) = self.queue.pop_front() {
             match self.library.iter().find(|m| m.input == path).map(|m| m.duration) {
                 Some(duration) if add => self.add_cut(path, duration),
@@ -492,12 +513,6 @@ impl App {
             }
         }
         self.loaded = 0;
-        // A project's first cut can play once its clip is in.
-        if self.clip.is_none() && !self.edit.cuts.is_empty() {
-            let start = self.edit.cuts[0].start;
-            self.follow = true;
-            self.goto(0, start, false);
-        }
         Task::none()
     }
 
@@ -751,6 +766,7 @@ impl App {
         match then {
             Then::Close => iced::exit(),
             Then::OpenProject => self.update(Message::OpenProject),
+            Then::NewProject => self.update(Message::NewProject),
         }
     }
 
@@ -843,6 +859,25 @@ impl App {
                 return self.open_next();
             }
             Message::OpenProject if self.unsaved() => return self.confirm(Then::OpenProject),
+            Message::NewProject if self.unsaved() => return self.confirm(Then::NewProject),
+            Message::NewProject => {
+                // Back to the start screen with an empty edit. Loaded clips
+                // stay in the library, so adding them again is instant; one
+                // still loading finishes there without becoming a cut.
+                self.edit.replace(Vec::new());
+                self.saved_version = self.edit.version;
+                self.project = None;
+                self.clip = None;
+                self.held = None;
+                self.current = 0;
+                self.selected = None;
+                self.queue.clear();
+                self.loading_adds = false;
+                self.error = None;
+                self.save_status = None;
+                self.timeline_zoom = 1.0;
+                self.timeline_start = 0.0;
+            }
             Message::CloseRequested if self.unsaved() => return self.confirm(Then::Close),
             Message::CloseRequested => return iced::exit(),
             Message::Confirmed(then, choice) => match choice {
@@ -1525,8 +1560,14 @@ impl App {
         let Some(cut) = self.edit.cuts.get(self.current) else { return };
         let p = &c.playback;
         if (p.playing && p.now() >= cut.end) || p.ended {
-            if self.current + 1 < self.edit.cuts.len() {
-                let next = self.current + 1;
+            let next = self.current + 1;
+            if next < self.edit.cuts.len() && !self.library.iter().any(|m| m.input == self.edit.cuts[next].input) {
+                // Its clip is still loading: wait at the out point.
+                if p.playing {
+                    c.playback.pause();
+                    self.save_status = Some(format!("Cut {} is still loading", next + 1));
+                }
+            } else if next < self.edit.cuts.len() {
                 let start = self.edit.cuts[next].start;
                 self.goto(next, start, true);
             } else if p.playing {
@@ -1592,6 +1633,7 @@ impl App {
             Key::Named(Named::Delete | Named::Backspace) => return self.update(Message::KeyDelete),
             Key::Character(c) => match c {
                 "o" | "O" if mods.command() && mods.shift() => return self.update(Message::OpenProject),
+                "n" | "N" if mods.command() => return self.update(Message::NewProject),
                 "o" if mods.command() => return self.update(Message::Open),
                 "s" | "S" if mods.command() => return self.update(Message::SaveProject(mods.shift())),
                 "z" | "Z" if mods.command() && mods.shift() => return self.update(Message::Redo),
@@ -1712,6 +1754,7 @@ impl App {
             None => row![].push(message).push(showing).push(decode).spacing(10).align_y(Alignment::Center).into(),
         };
         let top = row![
+            tip(icon_button(NEW_PROJECT, Some(Message::NewProject)), text("Start a new, empty project (Ctrl+N)"), tooltip::Position::Bottom),
             tip(icon_button(ADD_CLIP, Some(Message::Open)), text(open_hint), tooltip::Position::Bottom),
             tip(icon_button(OPEN_PROJECT, Some(Message::OpenProject)), text("Open a saved edit (Ctrl+Shift+O)"), tooltip::Position::Bottom),
             tip(
@@ -1941,8 +1984,10 @@ const PICK: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 
 const KEY_ADD: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M10 2 18 10 10 18 2 10z" fill="white"/><path d="M19 15v8M15 19h8" stroke-linecap="round"/></svg>"#;
 const KEY_DELETE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M10 2 18 10 10 18 2 10z"/><path d="m16 16 6 6M22 16l-6 6" stroke-linecap="round"/></svg>"#;
 
-/// File icons: a film strip with a plus (open or add clips), an open folder
-/// (open a project), a diskette (save) and one with a pencil (save as).
+/// File icons: a page with a plus (new project), a film strip with a plus
+/// (open or add clips), an open folder (open a project), a diskette (save)
+/// and one with a pencil (save as).
+const NEW_PROJECT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4M9 15h6M12 18v-6"/></svg>"#;
 const ADD_CLIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="14" height="18" rx="2"/><path d="M6 3v18M12 3v18M2 8h4M2 16h4M12 8h4M12 16h4M20 9v6M17 12h6"/></svg>"#;
 const OPEN_PROJECT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>"#;
 const SAVE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7M7 3v4a1 1 0 0 0 1 1h7"/></svg>"#;

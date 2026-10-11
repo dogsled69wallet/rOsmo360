@@ -120,7 +120,7 @@ In the player:
 | Trim / move a cut | Drag its edge / drag the cut on the timeline |
 | Delete the selected cut | Shift+Delete, or 🗑 |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
-| Save / open a project | Ctrl+S (Ctrl+Shift+S: save as) / Ctrl+Shift+O |
+| Save / open / new project | Ctrl+S (Ctrl+Shift+S: save as) / Ctrl+Shift+O / Ctrl+N |
 | Export the edit | The export button, an arrow out of a tray (pick 720p–2160p next to it); the aspect lock sets the shape, 16:9 when free. **Clips** writes each cut to its own file ("project - 001" and on) for another editor; **Resolve** writes DNxHR and PCM in `.mov`, which DaVinci Resolve's free Linux version can read |
 
 A project saves the cuts, their keyframes and the aspect lock, in the same file `rosmo360 export` renders (see below). Clips in the project's folder are stored by relative path, so the folder can be moved as a whole.
@@ -205,6 +205,8 @@ rosmo360 preview edit.json -o check.png      # a project: a row per cut, framed 
 rosmo360 scan clip.OSV > scan.csv           # per second: heading, tilt, turning, shake, loudness
 rosmo360 scan clip.OSV --image > scan.csv   # and open sky, skyline height, views out to the horizon
 ```
+
+Clips' telemetry and thumbnails are cached in `~/.cache/rosmo360`, so a clip opens in a fraction of a second after the first time (0047 from a network share: 46 s, then 0.4 s). `rosmo360 cache add FOLDER` caches a folder's clips ahead of time, `rosmo360 cache move FOLDER` keeps the cache elsewhere (or set `ROSMO360_CACHE` for one run), `rosmo360 cache` shows where it is and its size, `rosmo360 cache clear [--older-than DAYS]` empties it, and `--no-cache` on any command bypasses it.
 
 `rosmo360 --help` lists everything, including `rig` (calibration as JSON), `imu` (motion data as CSV) and `seam` (seam quality report).
 

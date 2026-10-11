@@ -1,4 +1,5 @@
 mod align;
+mod cache;
 mod exposure;
 mod ffmpeg;
 mod imu;
@@ -26,12 +27,23 @@ use telemetry_parser::rig::{RigPicture, geometry::ProjectionKind};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Read clips afresh instead of from the cache of their telemetry and
+    /// thumbnails, and cache nothing.
+    #[arg(long, global = true)]
+    no_cache: bool,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
     /// Dump the camera rig (DJI Studio's default stitch geometry) as JSON.
     Rig { input: PathBuf },
+    /// Where the cache of clips' telemetry and thumbnails is and what it
+    /// holds (it makes clips open in a fraction of a second after the first
+    /// time); `cache clear` empties it.
+    Cache {
+        #[command(subcommand)]
+        action: Option<CacheAction>,
+    },
     /// Dump orientation (q), gyro (g) and accelerometer (a) samples as CSV.
     Imu { input: PathBuf },
     /// The clip's length, frame rate, recording time and what it holds, as JSON.
@@ -246,6 +258,84 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Cache clips ahead of time, so they open at once later: each .OSV
+    /// given, and every .OSV in the folders given (and folders inside).
+    Add {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Read every clip afresh, even those already cached.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Move the cache to another folder (a disk with room, say), and keep it
+    /// there from now on; ROSMO360_CACHE, if set, still wins for a run.
+    Move {
+        #[arg(required_unless_present = "default")]
+        folder: Option<PathBuf>,
+        /// Back to the system's cache folder (~/.cache/rosmo360 on Linux).
+        #[arg(long, conflicts_with = "folder")]
+        default: bool,
+    },
+    /// Delete the cached entries: all of them, or those unused for a while.
+    Clear {
+        /// Only entries no clip has used for this many days.
+        #[arg(long)]
+        older_than: Option<f64>,
+    },
+}
+
+/// `cache add`: caches each clip under `paths` that isn't yet (all of them
+/// with `force`), saying how it went one line a clip. A clip that fails is
+/// reported and skipped.
+fn cache_clips(paths: &[PathBuf], force: bool) -> Result<()> {
+    fn osv_under(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        if path.is_dir() {
+            let mut inside: Vec<_> = std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?.flatten().map(|e| e.path()).collect();
+            inside.sort();
+            for p in inside {
+                if p.is_dir() || p.extension().is_some_and(|e| e.eq_ignore_ascii_case("osv")) {
+                    osv_under(&p, out)?;
+                }
+            }
+        } else if path.exists() {
+            out.push(path.to_owned());
+        } else {
+            bail!("{} does not exist", path.display());
+        }
+        Ok(())
+    }
+    let mut clips = Vec::new();
+    for p in paths {
+        osv_under(p, &mut clips)?;
+    }
+    let dir = cache::dir().context("no cache folder (HOME is not set)")?;
+    eprintln!("caching {} clips in {}", clips.len(), dir.display());
+    let (mut added, mut failed) = (0, 0);
+    for (i, clip) in clips.iter().enumerate() {
+        let name = clip.file_name().map_or_else(|| clip.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let at = std::time::Instant::now();
+        let was = !force && cache::has(clip);
+        if force {
+            cache::forget(clip)?;
+        }
+        match player::cache_clip(clip) {
+            Ok(()) if was => println!("[{}/{}] {name}: already cached", i + 1, clips.len()),
+            Ok(()) => {
+                added += 1;
+                println!("[{}/{}] {name}: cached in {:.0} s", i + 1, clips.len(), at.elapsed().as_secs_f64());
+            }
+            Err(e) => {
+                failed += 1;
+                println!("[{}/{}] {name}: failed: {e:#}", i + 1, clips.len());
+            }
+        }
+    }
+    eprintln!("{added} added, {} already there, {failed} failed", clips.len() - added - failed);
+    Ok(())
+}
+
 fn parse_pair(s: &str) -> Result<(f64, f64), String> {
     let (a, b) = s.split_once(',').ok_or("give YAW,PITCH")?;
     Ok((a.trim().parse().map_err(|e| format!("{a:?}: {e}"))?, b.trim().parse().map_err(|e| format!("{b:?}: {e}"))?))
@@ -440,8 +530,8 @@ impl Pipeline {
 
     /// `new`, telling `progress` how far reading the telemetry has got (0..1).
     fn load(input: &Path, opts: &StitchOpts, stabilize: stab::Mode, progress: &dyn Fn(f64)) -> Result<Self> {
-        let parsed = load_input(input, progress)?;
-        let rig = telemetry_parser::util::camera_rig(&parsed).context("no camera rig in file")?;
+        let telemetry = cache::telemetry(input, progress)?;
+        let rig = telemetry.rig.context("no camera rig in file")?;
         let projection = match opts.variant {
             Some(i) => &rig.variants.get(i).context("no such variant")?.projection,
             None => &rig.projection,
@@ -459,7 +549,7 @@ impl Pipeline {
             })
             .collect::<Result<Vec<_>>>()?;
         let mode = opts.stabilize.unwrap_or(stabilize);
-        let stab = stab::Stabilizer::new(&imu::read(&parsed).quats, mode, opts.imu_axes, if opts.world_z_down { 1.0 } else { -1.0 }, opts.smooth);
+        let stab = stab::Stabilizer::new(&telemetry.quats, mode, opts.imu_axes, if opts.world_z_down { 1.0 } else { -1.0 }, opts.smooth);
         if !stab.has_data() && mode != stab::Mode::Off {
             bail!("no attitude data to stabilise with");
         }
@@ -736,9 +826,17 @@ impl Stream {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    if cli.no_cache {
+        cache::disable();
+    }
+    match cli.cmd {
+        Cmd::Cache { action: None } => cache::report()?,
+        Cmd::Cache { action: Some(CacheAction::Clear { older_than }) } => cache::clear(older_than)?,
+        Cmd::Cache { action: Some(CacheAction::Add { paths, force }) } => cache_clips(&paths, force)?,
+        Cmd::Cache { action: Some(CacheAction::Move { folder, .. }) } => cache::move_to(folder)?,
         Cmd::Rig { input } => {
-            let rig = telemetry_parser::util::camera_rig(&load_input(&input, &|_| {})?).context("no camera rig in file")?;
+            let rig = cache::telemetry(&input, &|_| {})?.rig.context("no camera rig in file")?;
             println!("{}", serde_json::to_string_pretty(&rig)?);
         }
         Cmd::Imu { input } => {
@@ -934,7 +1032,7 @@ fn save_png(path: &Path, f: &stitch::Frame) -> Result<()> {
 }
 
 fn info(input: &Path) -> Result<()> {
-    let parsed = load_input(input, &|_| {})?;
+    let quats = cache::telemetry(input, &|_| {})?.quats;
     let info = serde_json::json!({
         "input": input,
         "proxy": ffmpeg::proxy(input),
@@ -943,7 +1041,7 @@ fn info(input: &Path) -> Result<()> {
         "lens_size": ffmpeg::dimensions(input, 0)?,
         "recorded": ffmpeg::creation_time(input)?,
         "audio": ffmpeg::has_audio(input)?,
-        "attitude": !imu::read(&parsed).quats.is_empty(),
+        "attitude": !quats.is_empty(),
     });
     println!("{}", serde_json::to_string_pretty(&info)?);
     Ok(())
@@ -1016,8 +1114,7 @@ pub fn track_to(
 /// One CSV row per `every` seconds; see `Cmd::Scan` and the header.
 fn scan(input: &Path, every: f64, image: bool) -> Result<()> {
     let skies = if image { skies(input)? } else { Vec::new() };
-    let parsed = load_input(input, &|_| {})?;
-    let quats = imu::read(&parsed).quats;
+    let quats = cache::telemetry(input, &|_| {})?.quats;
     let duration = ffmpeg::duration(input)?;
     let levels = if ffmpeg::has_audio(input)? { ffmpeg::audio_levels(input, every)? } else { Vec::new() };
     let stab = (!quats.is_empty()).then(|| stab::Stabilizer::new(&quats, stab::Mode::Off, stab::ImuAxes::X180, -1.0, 0.0));
