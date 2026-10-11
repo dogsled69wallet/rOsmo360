@@ -8,8 +8,9 @@
 //! the first and last megabyte (the MP4 header and sample index, which any
 //! re-encode or trim rewrites) and of four blocks between. That reads ~2 MB
 //! where hashing the whole file would read the gigabytes the cache avoids.
-//! Each entry also holds the rOsmo360 version that wrote it; another version
-//! rebuilds it, in case parsing or thumbnails changed. Entries are written
+//! Each entry holds a format number (`FORMAT`) and is rebuilt when it differs,
+//! so updates keep the cache unless a release changes what goes in it (an
+//! update used to re-read every clip). Entries are written
 //! to a temporary file and renamed into place, so runs side by side never
 //! read half an entry; a hit refreshes the file's time, which
 //! `rosmo360 cache clear --older-than` goes by.
@@ -22,7 +23,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use telemetry_parser::rig::CameraRig;
 
-/// Bumped when an entry's layout changes; the version is checked too.
+/// Bump this when a release changes what an entry holds or how it is made: its
+/// layout, a telemetry-parser update that reads the rig or attitude differently,
+/// thumbnails worth redoing. Entries of another format are rebuilt; otherwise
+/// they outlive updates, so a new version doesn't re-read every clip.
 const FORMAT: u32 = 1;
 const MAGIC: &[u8; 8] = b"rOsmo360";
 
@@ -143,15 +147,17 @@ fn fingerprint(input: &Path) -> Result<u128> {
 }
 
 /// Reads entry `path` with `read`, refreshing its time; `None` if it is
-/// missing, from another version or unreadable (it is then rebuilt).
+/// missing, of another format or unreadable (it is then rebuilt).
 fn hit<T>(path: &Path, read: impl FnOnce(&mut &[u8]) -> Option<T>) -> Option<T> {
     let bytes = fs::read(path).ok()?;
     let mut r = bytes.as_slice();
     let mut magic = [0; 8];
     r.read_exact(&mut magic).ok()?;
-    if &magic != MAGIC || u32_from(&mut r)? != FORMAT || string_from(&mut r)? != env!("CARGO_PKG_VERSION") {
+    if &magic != MAGIC || u32_from(&mut r)? != FORMAT {
         return None;
     }
+    // Which version wrote it: kept for whoever looks, not checked.
+    string_from(&mut r)?;
     let value = read(&mut r)?;
     if let Ok(f) = File::options().write(true).open(path) {
         let _ = f.set_modified(std::time::SystemTime::now());
@@ -282,7 +288,7 @@ pub fn report() -> Result<()> {
     Ok(())
 }
 
-/// Whether `input`'s telemetry is cached for this version.
+/// Whether `input`'s telemetry is cached in this format.
 pub fn has(input: &Path) -> bool {
     entry(input, "telemetry").is_some_and(|e| hit(&e, |_| Some(())).is_some())
 }
