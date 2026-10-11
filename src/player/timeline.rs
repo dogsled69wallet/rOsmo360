@@ -184,7 +184,8 @@ impl Timeline {
     }
 
     fn block_at(&self, x: f32, b: Rectangle) -> Option<usize> {
-        self.blocks.iter().position(|c| x >= self.x(c.from, b) && x <= self.x(c.from + c.len, b))
+        // Later first: in a crossfade the incoming cut lies over the one before.
+        self.blocks.iter().rposition(|c| x >= self.x(c.from, b) && x <= self.x(c.from + c.len, b))
     }
 
     /// The nearest diamond within reach of `x`: (cut, keyframe).

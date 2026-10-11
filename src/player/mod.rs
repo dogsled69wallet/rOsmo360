@@ -392,9 +392,11 @@ struct App {
     selected_volume: Option<usize>,
     selected_sound: Option<(usize, usize)>,
     music: music::Player,
-    /// Through a crossfade, the next cut playing alongside: its index and
-    /// clip.
-    incoming: Option<(usize, Clip)>,
+    /// Through a crossfade, the other cut of it alongside: its index and
+    /// clip. Usually the next one, coming in over the playing cut; while
+    /// paused with the incoming cut selected for editing, that one is the
+    /// current cut and this is the one before (`follow_crossfade`).
+    partner: Option<(usize, Clip)>,
     edit: edit::Edit,
     /// The cut being played, and the one selected on the timeline.
     current: usize,
@@ -477,7 +479,7 @@ impl App {
             selected_volume: None,
             selected_sound: None,
             music: Default::default(),
-            incoming: None,
+            partner: None,
             edit: edit::Edit::default(),
             current: 0,
             selected: None,
@@ -562,16 +564,16 @@ impl App {
         self.music.follow(&self.edit.music, t, self.edit.duration(), listen, playing);
         // The cut's own volume points move its level as it plays, and
         // through a crossfade the two cuts trade places, equal power.
-        let mix = self.crossfade_mix();
+        let shares = self.crossfade_shares();
         let quarter = |x: f64| (x.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2).sin() as f32;
-        let v = self.clip_volume() * mix.map_or(1.0, |x| quarter(1.0 - x));
+        let v = self.clip_volume() * shares.map_or(1.0, |(mine, _)| quarter(mine));
         if let Some(c) = &mut self.clip {
             c.playback.set_volume(v);
         }
-        if let (Some(x), Some((i, inc))) = (mix, &self.incoming) {
+        if let (Some((_, theirs)), Some((i, inc))) = (shares, &self.partner) {
             let points = self.edit.cuts.get(*i).map_or(0.0, |c| crate::project::volume_at(&c.volume, inc.playback.now()));
-            let v = self.volume() * music::gain(self.edit.sound.volume + points) * quarter(x);
-            if let Some((_, inc)) = &mut self.incoming {
+            let v = self.volume() * music::gain(self.edit.sound.volume + points) * quarter(theirs);
+            if let Some((_, inc)) = &mut self.partner {
                 inc.playback.set_volume(v);
             }
         }
@@ -582,18 +584,39 @@ impl App {
     /// there): at the matching time in its own clip, playing or paused with
     /// it. Elsewhere there's none.
     fn follow_crossfade(&mut self) {
+        // Played, the outgoing cut leads again, as `tick` expects.
+        if self.clip.as_ref().is_some_and(|c| c.playback.playing) && self.partner.as_ref().is_some_and(|(j, _)| j + 1 == self.current) {
+            self.swap_partner();
+            if let Some(c) = &mut self.clip {
+                c.playback.scrub_end();
+                c.playback.play();
+            }
+        }
         let want = (|| {
-            let from = self.edit.crossfade_from(self.current)?;
             let (cut, t) = self.clip_now()?;
-            let next = self.edit.cuts.get(self.current + 1)?;
             let playing = self.clip.as_ref()?.playback.playing;
-            (t >= from && t < cut.end).then(|| (self.current + 1, next.input.clone(), next.start + (t - from), playing))
+            // The outgoing cut playing or paused in its crossfade: the next
+            // cut alongside.
+            if let Some(from) = self.edit.crossfade_from(self.current)
+                && t >= from
+                && t < cut.end
+            {
+                let next = &self.edit.cuts[self.current + 1];
+                return Some((self.current + 1, next.input.clone(), next.start + (t - from), playing));
+            }
+            // The incoming cut paused in it (taken over to edit): the one
+            // before alongside, shown when it's not selected.
+            if !playing && self.current > 0 && t < cut.start + cut.crossfade {
+                let before = &self.edit.cuts[self.current - 1];
+                return Some((self.current - 1, before.input.clone(), before.end - cut.crossfade + (t - cut.start), false));
+            }
+            None
         })();
         let Some((i, input, t, playing)) = want else {
-            self.incoming = None;
+            self.partner = None;
             return;
         };
-        match &mut self.incoming {
+        match &mut self.partner {
             Some((j, inc)) if *j == i && inc.playback.media.input == input => {
                 let p = &mut inc.playback;
                 if p.playing != playing {
@@ -618,7 +641,7 @@ impl App {
             _ if playing && t - self.edit.cuts[i].start < 0.25 && self.preroll.as_ref().is_some_and(|(j, inp, at, _)| (*j, inp, *at) == (i, &input, self.edit.cuts[i].start)) => {
                 let (_, _, _, mut primed) = self.preroll.take().unwrap();
                 primed.go();
-                self.incoming = Some((i, Clip { playback: primed, shown: None }));
+                self.partner = Some((i, Clip { playback: primed, shown: None }));
             }
             _ => {
                 let Some(media) = self.library.iter().find(|m| m.input == input) else { return };
@@ -627,7 +650,7 @@ impl App {
                 media.stab.set_mode(self.edit.cuts[i].stabilize.unwrap_or(self.opts.stabilize));
                 let mut playback = Playback::new(media, 0.0, self.full_on_pause);
                 playback.jump(t, playing);
-                self.incoming = Some((i, Clip { playback, shown: None }));
+                self.partner = Some((i, Clip { playback, shown: None }));
             }
         }
     }
@@ -1298,18 +1321,28 @@ impl App {
             }
             Message::Scrub(t) => {
                 self.follow = true;
-                if let Some((i, t)) = self.edit.locate(t) {
+                // In an overlap, the selected cut's time, if it's one of the two.
+                let selected = self.selected.filter(|&i| i < self.edit.cuts.len()).and_then(|i| {
+                    let (from, c) = (self.edit.offset(i), &self.edit.cuts[i]);
+                    (t >= from && t < from + c.len()).then(|| (i, c.start + t - from))
+                });
+                if let Some((i, t)) = selected.or_else(|| self.edit.locate(t)) {
                     self.scrub_to(i, t);
                 }
             }
             Message::ScrubDone => {
                 self.dragging = false;
                 self.with_playback(Playback::scrub_end);
-                if let Some((_, inc)) = &mut self.incoming {
+                if let Some((_, inc)) = &mut self.partner {
                     inc.playback.scrub_end();
                 }
             }
             Message::Select(i) => {
+                // The other cut of a crossfade selected while paused: it
+                // takes the overlap over, to be framed there.
+                if self.partner.as_ref().is_some_and(|(j, _)| *j == i) && self.clip.as_ref().is_some_and(|c| !c.playback.playing) {
+                    self.swap_partner();
+                }
                 self.selected = Some(i);
                 self.selected_music = None;
                 self.selected_volume = None;
@@ -1595,6 +1628,7 @@ impl App {
             }
             Message::KeyJump(i, k) => {
                 self.follow = true;
+                self.selected = Some(i);
                 if let Some(t) = self.edit.cuts.get(i).and_then(|c| c.keyframes.get(k)).map(|k| k.t) {
                     let playing = self.clip.as_ref().is_some_and(|c| c.playback.playing);
                     self.goto(i, t, playing);
@@ -1826,13 +1860,18 @@ impl App {
             rig_from_view: c.playback.rig_from_view(self.rolling_shutter),
             fov_deg: self.shown_view().fov,
             picking: self.picking.is_some(),
-            incoming: self.incoming_layer(),
+            incoming: self.partner_layer(),
         })
     }
 
-    /// The cut crossfading in, as the view draws it over the playing one.
-    fn incoming_layer(&self) -> Option<(Arc<Rig>, Arc<Shown>, Camera, Vec<M3>, f32)> {
-        let (i, inc) = self.incoming.as_ref()?;
+    /// The other cut of a crossfade, as the view draws it over the current one.
+    fn partner_layer(&self) -> Option<(Arc<Rig>, Arc<Shown>, Camera, Vec<M3>, f32)> {
+        // Paused with the playing cut selected, it's shown on its own, to
+        // frame it.
+        if self.selected == Some(self.current) && self.clip.as_ref().is_some_and(|c| !c.playback.playing) {
+            return None;
+        }
+        let (i, inc) = self.partner.as_ref()?;
         let shown = inc.shown.clone()?;
         let p = &inc.playback;
         let t = p.target();
@@ -1840,7 +1879,7 @@ impl App {
         // holds from before), else the view as it is.
         let keyed = || crate::project::keyframed(&self.edit.cuts, *i, t).and_then(|(k, at)| k.camera_at(at, &crate::project::held(&|f, t| self.aim_in(&p.media, f, t), at == t, t)));
         let camera = if self.follow { keyed().unwrap_or_else(|| self.look.camera()) } else { self.look.camera() };
-        Some((p.media.rig.clone(), shown, camera, p.rig_from_view(self.rolling_shutter), self.crossfade_mix()? as f32))
+        Some((p.media.rig.clone(), shown, camera, p.rig_from_view(self.rolling_shutter), self.crossfade_shares()?.1 as f32))
     }
 
     /// Where playback is in the playing cut, by the clock `tick` changes
@@ -1853,12 +1892,29 @@ impl App {
         Some((cut, if p.playing { p.now() } else { p.target() }.clamp(cut.start, cut.end)))
     }
 
-    /// How far into the crossfade to the next cut playback is, 0..1, while
-    /// in one.
-    fn crossfade_mix(&self) -> Option<f64> {
-        let from = self.edit.crossfade_from(self.current)?;
+    /// Through a crossfade, the current cut's share of the blend and its
+    /// partner's (linear, adding to 1): the outgoing cut's falls as the
+    /// incoming one's rises.
+    fn crossfade_shares(&self) -> Option<(f64, f64)> {
         let (cut, t) = self.clip_now()?;
-        (t >= from && t < cut.end).then(|| (t - from) / (cut.end - from))
+        let (j, _) = self.partner.as_ref()?;
+        let incoming = if *j == self.current + 1 {
+            let from = self.edit.crossfade_from(self.current)?;
+            (t >= from && t < cut.end).then(|| (t - from) / (cut.end - from))?
+        } else {
+            (*j + 1 == self.current && t < cut.start + cut.crossfade).then(|| (t - cut.start) / cut.crossfade)?
+        };
+        Some(if *j == self.current + 1 { (1.0 - incoming, incoming) } else { (incoming, 1.0 - incoming) })
+    }
+
+    /// Makes the partner the current cut and the current one its partner:
+    /// to edit the other cut of a crossfade, or to play it as it plays.
+    fn swap_partner(&mut self) {
+        let Some((j, other)) = self.partner.take() else { return };
+        if let Some(mine) = self.clip.replace(other) {
+            self.partner = Some((self.current, mine));
+        }
+        self.current = j;
     }
 
     /// Adds the whole clip as a cut at the end of the edit and selects it.
@@ -1985,7 +2041,7 @@ impl App {
 
     fn tick(&mut self) {
         let volume = self.clip_volume();
-        if let Some((_, inc)) = &mut self.incoming
+        if let Some((_, inc)) = &mut self.partner
             && let Some((frame, fix)) = inc.playback.tick()
         {
             inc.shown = Some(Arc::new(Shown::new(frame, fix)));
@@ -2017,7 +2073,7 @@ impl App {
         // instant.
         if p.now() >= change - PREROLL
             && !carries_on
-            && self.incoming.as_ref().is_none_or(|(i, _)| *i != next)
+            && self.partner.as_ref().is_none_or(|(i, _)| *i != next)
             && let Some(n) = next_cut
             && self.preroll.as_ref().is_none_or(|(i, input, start, _)| (*i, input, *start) != (next, &n.input, n.start))
             && let Some(media) = loaded(&n.input)
@@ -2041,12 +2097,12 @@ impl App {
         // this one, until this one ends.
         if change < cut.end
             && p.now() >= change
-            && self.incoming.as_ref().is_none_or(|(i, _)| *i != next)
+            && self.partner.as_ref().is_none_or(|(i, _)| *i != next)
             && let Some((i, input, at, mut primed)) = self.preroll.take()
         {
             if next_cut.is_some_and(|n| (i, &input, at) == (next, &n.input, n.start)) {
                 primed.go();
-                self.incoming = Some((next, Clip { playback: primed, shown: None }));
+                self.partner = Some((next, Clip { playback: primed, shown: None }));
             }
         }
         // At a cut's out point (or the clip's end), play on into the next cut.
@@ -2069,8 +2125,8 @@ impl App {
                 self.with_playback(|p| p.media.stab.set_mode(mode));
             }
             // Out of a crossfade: the cut that came in plays on.
-            Some(_) if self.incoming.as_ref().is_some_and(|(i, _)| *i == next) => {
-                let (_, incoming) = self.incoming.take().unwrap();
+            Some(_) if self.partner.as_ref().is_some_and(|(i, _)| *i == next) => {
+                let (_, incoming) = self.partner.take().unwrap();
                 self.clip = Some(incoming);
                 self.current = next;
                 self.preroll = None;
