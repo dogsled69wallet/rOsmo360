@@ -1,8 +1,8 @@
 # rOsmo360
 
-A 360° video player and editor for **DJI Osmo 360** footage, written in Rust. It plays the camera's `.OSV` files directly: it stitches the two fisheye lenses, stabilises with the camera's gyro data and lets you look around freely, without going through DJI Studio. Then you can cut clips together on a timeline, keyframe the camera's view, and export a framed video.
+A 360° video player and editor for **DJI Osmo 360** footage, written in Rust. It plays the camera's `.OSV` files directly: it stitches the two fisheye lenses, stabilises with the camera's gyro data and lets you look around freely, without going through DJI Studio. Then you can cut clips together on a timeline, keyframe the camera's view, add crossfades, music and colour effects, and export a framed video.
 
-![rOsmo360 editing a mountain hike: the view over a cairn on a ridge, a lake and glaciers, with cuts from four clips on the timeline below, their thumbnails and keyframes](docs/screenshot.png)
+![rOsmo360 editing a mountain hike: the view over a cairn on a ridge, a lake and glaciers, with cuts from four clips on the timeline below, crossfades between them, their thumbnails and keyframes, and a soundtrack lane with its waveform and volume line](docs/screenshot.png)
 
 **New here? Read the [user guide](docs/user-guide.md)**: the whole app, step by step, with screenshots.
 
@@ -42,9 +42,13 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Follow the stick**: a keyframe can follow the selfie stick, and so whoever holds it, for a third-person shot that frames you automatically. It works from the camera's motion data, even straight below the camera.
 - **Follow a subject by colour**: `rosmo360 track` finds a coloured subject (a friend's jacket, a tent) through a clip, and keyframes can follow it the same way.
 - **Stabilisation per cut**: one cut world-locked, the next following the horizon.
+- **Crossfades** between cuts, picture and sound: overlap two cuts and the first dissolves into the second. Select a cut in the overlap to frame it on its own.
+- **Music**: songs on a lane of their own under the edit, to move, trim, split and crossfade; it fades out by itself where the video ends. A project can start from a song.
+- **Sound levels**: one slider for the clips' sound and one for the music, plus volume points over time on the music and on each cut's own sound, to dip the music under talk or tame the wind.
+- **Colour effects**, keyframed per cut: exposure, contrast, highlights and shadows, temperature and tint (with a white-balance eyedropper), saturation, vibrance and a vignette, in a side panel. Plus fades from and to black for the whole edit.
 - **Projects**: save the edit and open it again later. A cut can carry a short note, shown on the timeline.
 - **Export** the edit to MP4 with its sound, from 720p to 4K, in the aspect lock's shape. It renders on the GPU, about four times faster than the CPU (21 frames a second at 1080p on an RTX 3090).
-- **Export for another editor**: a file per cut (`My hike - 001.mp4`, `- 002` …), and a DaVinci Resolve format (DNxHR HQ with PCM sound in `.mov`) that Resolve's free Linux version can read.
+- **Export for another editor**: a file per cut (`My hike - 001.mp4`, `- 002` …) with the music beside them as WAVs, graded or as shot, and a DaVinci Resolve format (DNxHR HQ with PCM sound in `.mov`) that Resolve's free Linux version can read.
 
 ### Command line
 
@@ -126,11 +130,18 @@ In the player:
 | Split the cut at the playhead | C, or ✂ |
 | Trim / move a cut | Drag its edge / drag the cut on the timeline |
 | Delete the selected cut | Shift+Delete, or 🗑 |
+| Crossfade into a cut | Select it and click the crossfade button (1 s, again to remove), or Shift-drag its left edge for any length |
+| Frame the cut coming in during a crossfade | Pause in the overlap and click that cut |
+| Add music | The note with a plus (top bar or start screen); it goes after the music already there |
+| Move / trim / split / delete a song | Drag it (it snaps edge to edge) / drag its edges / C / Delete, with it selected; Shift-drag onto another song to crossfade them |
+| Mix levels | The **Clip sound** and **Music** sliders |
+| Volume points | Ctrl+click on the music lane or on a cut; drag them up/down and sideways, Delete removes; K adds one at the playhead with a song or point selected |
+| Colour effects and fades | G, or the sliders button: the Effects panel (sliders keyframe the cut's look at the playhead; white-balance eyedropper; to all cuts; fades in/out) |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
 | Save / open / new project | Ctrl+S (Ctrl+Shift+S: save as) / Ctrl+Shift+O / Ctrl+N |
-| Export the edit | The export button, an arrow out of a tray (pick 720p–2160p next to it); the aspect lock sets the shape, 16:9 when free. **Clips** writes each cut to its own file ("project - 001" and on) for another editor; **Resolve** writes DNxHR and PCM in `.mov`, which DaVinci Resolve's free Linux version can read |
+| Export the edit | The export button, an arrow out of a tray (pick 720p–2160p next to it); the aspect lock sets the shape, 16:9 when free. **Clips** writes each cut to its own file ("project - 001" and on) and the music as WAVs, for another editor (**Graded** gives them their effects); **Resolve** writes DNxHR and PCM in `.mov`, which DaVinci Resolve's free Linux version can read |
 
-A project saves the cuts, their keyframes and the aspect lock, in the same file `rosmo360 export` renders (see below). Clips in the project's folder are stored by relative path, so the folder can be moved as a whole.
+A project saves the cuts with their keyframes, crossfades, effects and volume points, the music, the levels, the fades and the aspect lock, in the same file `rosmo360 export` renders (see below). Clips in the project's folder are stored by relative path, so the folder can be moved as a whole.
 
 Command-line tools:
 
@@ -178,9 +189,38 @@ To join cuts from one or more clips, write a project file and export it. Each cu
 }
 ```
 
+A cut may also have:
+
+- `crossfade`: seconds it overlaps the cut before, dissolving in from it (the edit is that much shorter);
+- `volume`: its own sound's level over time, `[{"t": 12, "volume": -10}, …]` in clip time and dB, straight lines between points;
+- `effects`: colour keyframes in clip time, each holding the whole look (fields left out are 0): `exposure` (stops, −3…3), `contrast`, `highlights`, `shadows`, `temperature`, `tint`, `saturation`, `vibrance` (−1…1), `vignette` (0…1), and `ease`.
+
+And the edit as a whole: `sound` (the clips' level in dB), `fades` (seconds from and to black) and `music`, songs placed in edit time:
+
+```json
+{
+  "cuts": [
+    {"input": "CAM_0037.OSV", "in": 28, "out": 34,
+     "effects": [{"t": 28, "exposure": 0.2, "highlights": -0.3, "vibrance": 0.2}]},
+    {"input": "CAM_0043.OSV", "in": 5, "out": 12, "crossfade": 1,
+     "volume": [{"t": 8, "volume": 0}, {"t": 9, "volume": -12}]}
+  ],
+  "sound": {"volume": -6},
+  "fades": {"in": 1, "out": 2},
+  "music": {
+    "volume": -3,
+    "clips": [{"input": "song.mp3", "at": 0, "in": 30, "out": 60, "fade_in": 2}],
+    "keyframes": [{"t": 4, "volume": 0}, {"t": 5, "volume": -10}]
+  }
+}
+```
+
+A music clip plays `in` to `out` of its song from `at` in the edit; two may overlap partly, which crossfades them. Its `keyframes` are volume points in edit time, in dB on top of `volume`. The export ends with the last cut, fading out music that runs on.
+
 ```sh
 rosmo360 export edit.json -o edit.mp4
-rosmo360 export edit.json --clips --handles 1 -o clips/      # a file per cut: "edit - 001.mp4", … with 1 s extra either side
+rosmo360 export edit.json --clips --handles 1 -o clips/      # a file per cut: "edit - 001.mp4", … with 1 s extra either side, the music as WAVs
+rosmo360 export edit.json --clips --graded -o clips/         # the same, with the cuts' colour effects
 rosmo360 export edit.json --format resolve -o edit.mov       # DNxHR HQ + PCM, for DaVinci Resolve on Linux
 ```
 
@@ -219,7 +259,7 @@ Clips' telemetry and thumbnails are cached in `~/.cache/rosmo360`, so a clip ope
 
 ## Roadmap
 
-- Version 0.3: crossfades between cuts, and sound controls (a music track and each cut's volume).
+- Version 0.3: ordinary video files (MP4, MOV from a phone or drone) as cuts beside the Osmo clips.
 - 360° metadata on equirectangular exports, so YouTube and VR players show them as 360° video.
 - Smooth full-resolution playback on modest hardware (zero-copy decoding).
 - Windows and macOS builds.

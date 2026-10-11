@@ -2330,6 +2330,7 @@ impl App {
                     };
                     return self.update(Message::Stab(next));
                 }
+                "g" | "G" => self.effect_message(effects::EffectMsg::Toggle),
                 "r" | "R" => self.rolling_shutter = !self.rolling_shutter,
                 "m" | "M" => return self.update(Message::Mute),
                 "p" | "P" => {
@@ -2576,7 +2577,7 @@ impl App {
             ),
             tip(
                 icon_button(EFFECTS, Some(Message::Effect(effects::EffectMsg::Toggle))),
-                text(if self.effects_open { "Close the Effects panel" } else { "Effects: exposure, colour and tone of the cut, keyframed; fades for the edit" }),
+                text(if self.effects_open { "Close the Effects panel (G)" } else { "Effects: exposure, colour and tone of the cut, keyframed; fades for the edit (G)" }),
                 tooltip::Position::Top,
             ),
             tip(

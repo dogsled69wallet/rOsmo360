@@ -8,6 +8,8 @@ use super::audio::Audio;
 use super::gpu::SeamFix;
 use crate::stitch::M3;
 use anyhow::Result;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
@@ -25,6 +27,12 @@ pub struct Playback {
     /// A sharper frame for while paused, being decoded: its time and size
     /// (`None` for full resolution).
     still: Option<(f64, Option<u32>, Receiver<Result<Frame>>)>,
+    /// A still decoding (it can outlive `still`, which a seek drops), and
+    /// the time of the one asked for since: one decodes at a time, the
+    /// latest asked for after it. A still a frame (stepping, a held key)
+    /// started a full-resolution decode each, dozens at once.
+    still_busy: Arc<AtomicBool>,
+    still_next: Option<f64>,
     /// The frame on screen is such a still, at this size.
     showing_still: Option<Option<u32>>,
     /// Swap in a full-resolution frame when paused. Off, a paused frame is
@@ -67,6 +75,8 @@ impl Playback {
             pending: None,
             preview_only: false,
             still: None,
+            still_busy: Default::default(),
+            still_next: None,
             showing_still: None,
             full_on_pause,
             scrub: None,
@@ -351,10 +361,18 @@ impl Playback {
                 return;
             }
         };
+        if self.still_busy.load(Ordering::Relaxed) {
+            self.still_next = Some(t);
+            return;
+        }
         let (tx, rx) = channel();
         let (path, tracks, hw) = (self.media.input.clone(), self.media.rig.tracks.clone(), self.media.hw);
+        let busy = self.still_busy.clone();
+        busy.store(true, Ordering::Relaxed);
         std::thread::spawn(move || {
-            let _ = tx.send(source::still(&path, &tracks, t, size, hw));
+            let frame = source::still(&path, &tracks, t, size, hw);
+            busy.store(false, Ordering::Relaxed);
+            let _ = tx.send(frame);
         });
         self.still = Some((t, size, rx));
     }
@@ -445,6 +463,14 @@ impl Playback {
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => self.still = None,
             }
+        }
+        // The still asked for while another decoded, if it's still wanted.
+        if !self.still_busy.load(Ordering::Relaxed)
+            && let Some(t) = self.still_next.take()
+            && !self.playing
+            && (t - self.anchor_pts).abs() < 0.5 / self.media.fps
+        {
+            self.request_still(t);
         }
         let (frame, still) = show?;
         // Playing frames follow on from each other; anything else is a jump.
