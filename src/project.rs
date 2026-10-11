@@ -67,7 +67,46 @@ impl Music {
 
     /// Where the last clip ends on the edit, in seconds.
     pub fn end(&self) -> f64 {
-        self.clips.iter().map(|c| c.at + c.end - c.start).fold(0.0, f64::max)
+        self.clips.iter().map(MusicClip::ends).fold(0.0, f64::max)
+    }
+
+    /// The start nearest `want` where clip `i` fits without overlapping the
+    /// others: clips never play over each other (crossfades will be an effect
+    /// of their own), so one pushed into another stops edge to edge against
+    /// it, and hops past it once `want` is nearer the far side.
+    pub fn place(&self, i: usize, want: f64) -> f64 {
+        let len = self.clips[i].end - self.clips[i].start;
+        let others = || self.clips.iter().enumerate().filter(move |&(j, _)| j != i).map(|(_, c)| c);
+        let free = |at: f64| at >= 0.0 && others().all(|c| at + len <= c.at + 1e-6 || at >= c.ends() - 1e-6);
+        std::iter::once(want.max(0.0))
+            .chain(others().flat_map(|c| [c.ends(), c.at - len]))
+            .filter(|&at| free(at))
+            .min_by(|a, b| (a - want).abs().total_cmp(&(b - want).abs()))
+            .unwrap_or(self.end())
+    }
+
+    /// Where clip `i`'s neighbours leave it room on the edit: the end of the
+    /// one before and the start of the one after.
+    pub fn room(&self, i: usize) -> (f64, f64) {
+        let c = &self.clips[i];
+        let others = self.clips.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, o)| o);
+        others.fold((0.0, f64::INFINITY), |(lo, hi), o| if o.ends() <= c.at + 1e-6 { (lo.max(o.ends()), hi) } else { (lo, hi.min(o.at)) })
+    }
+
+    /// Splits clip `i` at edit time `t`, each half staying where it was on the
+    /// edit; false if `t` leaves either half shorter than `min`.
+    pub fn split(&mut self, i: usize, t: f64, min: f64) -> bool {
+        let Some(c) = self.clips.get(i) else { return false };
+        let song = c.start + t - c.at;
+        if song - c.start < min || c.end - song < min {
+            return false;
+        }
+        let second = MusicClip { at: t, start: song, fade_in: 0.0, ..c.clone() };
+        let first = &mut self.clips[i];
+        first.end = song;
+        first.fade_out = 0.0;
+        self.clips.insert(i + 1, second);
+        true
     }
 }
 
@@ -89,6 +128,13 @@ pub struct MusicClip {
     pub fade_in: f64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub fade_out: f64,
+}
+
+impl MusicClip {
+    /// Where it ends on the edit.
+    pub fn ends(&self) -> f64 {
+        self.at + self.end - self.start
+    }
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -266,6 +312,26 @@ mod tests {
         std::fs::write(&path, r#"{"music": {"clips": [{"input": "song.mp3", "at": 0, "in": 9, "out": 9}]}}"#).unwrap();
         assert!(Project::load(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn music_clips_split_in_place_and_never_overlap() {
+        let clip = |at: f64, start: f64, end: f64| MusicClip { input: "song.mp3".into(), at, start, end, fade_in: 1.0, fade_out: 2.0 };
+        let mut m = Music { volume: 0.0, clips: vec![clip(0.0, 0.0, 30.0)] };
+        assert!(m.split(0, 10.0, 0.1));
+        assert_eq!((m.clips[0].end, m.clips[0].fade_out), (10.0, 0.0));
+        assert_eq!((m.clips[1].at, m.clips[1].start, m.clips[1].end, m.clips[1].fade_in, m.clips[1].fade_out), (10.0, 10.0, 30.0, 0.0, 2.0));
+        assert!(!m.split(0, 10.05, 0.1));
+        // The second half pushed onto the first stops against it (there's
+        // no room before it); the first dragged over the second stays before
+        // it until it's nearer the far side.
+        assert_eq!(m.place(1, 5.0), 10.0);
+        assert_eq!(m.place(0, 12.0), 0.0);
+        assert_eq!(m.place(0, 18.0), 30.0);
+        m.clips[1].at = 40.0;
+        assert_eq!(m.place(0, 35.0), 30.0);
+        assert_eq!(m.room(1), (10.0, f64::INFINITY));
+        assert_eq!(m.room(0), (0.0, 40.0));
     }
 
     #[test]

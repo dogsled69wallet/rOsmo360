@@ -338,6 +338,24 @@ pub struct Sound<'a> {
     pub duration: Option<f64>,
 }
 
+/// Writes `duration` seconds of `input`'s sound from `start` to `output` as
+/// a 48 kHz 24-bit WAV, untouched otherwise: music for another editor, in a
+/// form any of them reads (Resolve's free version on Linux reads no AAC or
+/// MP3).
+pub fn wav(input: &Path, start: f64, duration: f64, output: &Path) -> Result<()> {
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-y", "-ss", &start.to_string(), "-t", &duration.to_string(), "-i"])
+        .arg(input)
+        .args(["-map", "0:a:0", "-ar", "48000", "-c:a", "pcm_s24le"])
+        .arg(output)
+        .status()
+        .context("running ffmpeg")?;
+    if !status.success() {
+        bail!("ffmpeg couldn't write {}", output.display());
+    }
+    Ok(())
+}
+
 /// What a whole edit's sound gets on top of joining its clips' stretches:
 /// their level, and the music track.
 pub struct Mix<'a> {

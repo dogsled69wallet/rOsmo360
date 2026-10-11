@@ -331,7 +331,7 @@ enum Message {
     MoveCut(usize, usize),
     /// Split the cut at the playhead.
     Split,
-    /// Delete the selected cut.
+    /// Delete the selected cut, or the selected music clip.
     DeleteCut,
     Undo,
     Redo,
@@ -591,7 +591,11 @@ impl App {
             Aspect::Free => None,
             Aspect::Ratio(w, h) => Some(crate::view::Aspect(w.into(), h.into())),
         };
-        Project { aspect, cuts: self.edit.cuts.clone(), sound: self.edit.sound, music: self.edit.music.clone() }
+        // The music in edit order, as it plays (the lane keeps the order
+        // they were added and split in).
+        let mut music = self.edit.music.clone();
+        music.clips.sort_by(|a, b| a.at.total_cmp(&b.at));
+        Project { aspect, cuts: self.edit.cuts.clone(), sound: self.edit.sound, music }
     }
 
     /// Renders the edit to `path` on its own thread with the export the
@@ -794,7 +798,7 @@ impl App {
                 pick_list(&crate::Resolution::ALL[..], Some(self.resolution), Message::Resolution),
                 tip(
                     checkbox(self.export_clips).label("Clips").on_toggle(Message::ExportClips),
-                    text("Export each cut to its own file, for another editor: \"<project> - 001\" and on, into a folder you pick"),
+                    text("Export each cut to its own file, for another editor: \"<project> - 001\" and on, into a folder you pick; each music clip as a WAV beside them, unfaded"),
                     tooltip::Position::Bottom,
                 ),
                 tip(
@@ -1222,9 +1226,10 @@ impl App {
                 // that the waveform corrects.
                 let duration = ffmpeg::duration(&path).unwrap_or(60.0);
                 self.edit.checkpoint();
-                // One song for now: it replaces the one there, from the start.
-                self.edit.music.clips = vec![crate::project::MusicClip { input: path.clone(), at: 0.0, start: 0.0, end: duration, fade_in: 0.0, fade_out: 0.0 }];
-                self.selected_music = Some(0);
+                // After the music already there, whole.
+                let at = self.edit.music.end();
+                self.edit.music.clips.push(crate::project::MusicClip { input: path.clone(), at, start: 0.0, end: duration, fade_in: 0.0, fade_out: 0.0 });
+                self.selected_music = Some(self.edit.music.clips.len() - 1);
                 self.selected = None;
                 return self.load_waveform(&path);
             }
@@ -1238,23 +1243,29 @@ impl App {
             }
             Message::MusicMove(i, at) => {
                 self.begin_drag();
-                if let Some(c) = self.edit.music.clips.get_mut(i) {
-                    c.at = at.max(0.0);
+                if i < self.edit.music.clips.len() {
+                    self.edit.music.clips[i].at = self.edit.music.place(i, at);
                 }
             }
             Message::MusicTrim(i, in_edge, t) => {
                 self.begin_drag();
-                let song = self.edit.music.clips.get(i).and_then(|c| self.waveforms.get(&c.input)).map_or(f64::INFINITY, |w| w.duration);
-                if let Some(c) = self.edit.music.clips.get_mut(i) {
-                    if in_edge {
-                        // The song stays put on the edit: trimming its start
-                        // moves where the clip begins, not what plays when.
-                        let start = t.clamp((c.start - c.at).max(0.0), c.end - edit::MIN_CUT);
-                        c.at += start - c.start;
-                        c.start = start;
-                    } else {
-                        c.end = t.clamp(c.start + edit::MIN_CUT, song);
-                    }
+                if i >= self.edit.music.clips.len() {
+                    return Task::none();
+                }
+                let song = self.waveforms.get(&self.edit.music.clips[i].input).map_or(f64::INFINITY, |w| w.duration);
+                let (lo, hi) = self.edit.music.room(i);
+                let c = &mut self.edit.music.clips[i];
+                // Song time to edit time on this clip.
+                let to_edit = c.at - c.start;
+                if in_edge {
+                    // The song stays put on the edit: trimming its start
+                    // moves where the clip begins, not what plays when. Not
+                    // past the song's start, the edit's or the clip before.
+                    let start = t.max(c.start - c.at).max(lo - to_edit).max(0.0).min(c.end - edit::MIN_CUT);
+                    c.at += start - c.start;
+                    c.start = start;
+                } else {
+                    c.end = t.min(song).min(hi - to_edit).max(c.start + edit::MIN_CUT);
                 }
             }
             Message::SoundLevel(db) => {
@@ -1296,6 +1307,15 @@ impl App {
                     self.selected = Some(at(from));
                 }
             }
+            Message::Split if self.selected_music.is_some() => {
+                let i = self.selected_music.unwrap();
+                self.edit.checkpoint();
+                if self.edit.music.split(i, self.position(), edit::MIN_CUT) {
+                    self.selected_music = Some(i + 1);
+                } else {
+                    self.edit.undo();
+                }
+            }
             Message::Split => {
                 let Some((_, t)) = self.playing_cut() else { return Task::none() };
                 let i = self.current;
@@ -1306,6 +1326,15 @@ impl App {
                     self.selected = Some(i + 1);
                 } else {
                     self.edit.undo();
+                }
+            }
+            // With a song selected, delete that, not the cut under the
+            // playhead (Shift+Del used to, being the key for cuts).
+            Message::DeleteCut if self.selected_music.is_some() => {
+                let i = self.selected_music.take().unwrap();
+                if i < self.edit.music.clips.len() {
+                    self.edit.checkpoint();
+                    self.edit.music.clips.remove(i);
                 }
             }
             Message::DeleteCut => {
@@ -1842,14 +1871,7 @@ impl App {
             Key::Named(Named::ArrowUp) => self.free_look().pitch += step,
             Key::Named(Named::ArrowDown) => self.free_look().pitch -= step,
             Key::Named(Named::Home) => self.free_look().reset(),
-            Key::Named(Named::Delete | Named::Backspace) if mods.shift() => return self.update(Message::DeleteCut),
-            Key::Named(Named::Delete | Named::Backspace) if self.selected_music.is_some() => {
-                let i = self.selected_music.take().unwrap();
-                if i < self.edit.music.clips.len() {
-                    self.edit.checkpoint();
-                    self.edit.music.clips.remove(i);
-                }
-            }
+            Key::Named(Named::Delete | Named::Backspace) if mods.shift() || self.selected_music.is_some() => return self.update(Message::DeleteCut),
             Key::Named(Named::Delete | Named::Backspace) => return self.update(Message::KeyDelete),
             Key::Character(c) => match c {
                 "o" | "O" if mods.command() && mods.shift() => return self.update(Message::OpenProject),
@@ -1986,7 +2008,7 @@ impl App {
             tip(icon_button(ADD_CLIP, Some(Message::Open)), text(open_hint), tooltip::Position::Bottom),
             tip(
                 icon_button(ADD_MUSIC, Some(Message::AddMusic)),
-                text(if self.edit.music.clips.is_empty() { "Add music under the edit" } else { "Replace the music" }),
+                text(if self.edit.music.clips.is_empty() { "Add music under the edit" } else { "Add more music, after the last song" }),
                 tooltip::Position::Bottom,
             ),
             tip(icon_button(OPEN_PROJECT, Some(Message::OpenProject)), text("Open a saved edit (Ctrl+Shift+O)"), tooltip::Position::Bottom),
@@ -2086,7 +2108,12 @@ impl App {
             current: current.map(|k| (self.current, k)),
         }
         .view();
-        let can_split = self.edit.cuts.get(self.current).is_some_and(|c| p.target() > c.start + edit::MIN_CUT && p.target() < c.end - edit::MIN_CUT);
+        // With a song selected, C splits that instead.
+        let music = self.selected_music.and_then(|i| self.edit.music.clips.get(i));
+        let can_split = match music {
+            Some(c) => self.position() > c.at + edit::MIN_CUT && self.position() < c.ends() - edit::MIN_CUT,
+            None => self.edit.cuts.get(self.current).is_some_and(|c| p.target() > c.start + edit::MIN_CUT && p.target() < c.end - edit::MIN_CUT),
+        };
         let transport = row![
             tip(
                 icon_button(if p.playing { PAUSE } else { PLAY }, Some(Message::Toggle)),
@@ -2126,10 +2153,10 @@ impl App {
                 text("Track a colour: draw a box over a subject (a jacket, a tent); the keyframe here then follows it"),
                 tooltip::Position::Top,
             ),
-            tip(icon_button(SPLIT, can_split.then_some(Message::Split)), text("Split the cut at the playhead (C)"), tooltip::Position::Top),
+            tip(icon_button(SPLIT, can_split.then_some(Message::Split)), text(if music.is_some() { "Split the selected music at the playhead (C)" } else { "Split the cut at the playhead (C)" }), tooltip::Position::Top),
             tip(
-                icon_button(DELETE_CUT, self.selected.map(|_| Message::DeleteCut)),
-                text("Delete the selected cut (Shift+Del)"),
+                icon_button(DELETE_CUT, (self.selected.is_some() || music.is_some()).then_some(Message::DeleteCut)),
+                text(if music.is_some() { "Delete the selected music (Del)" } else { "Delete the selected cut (Shift+Del)" }),
                 tooltip::Position::Top,
             ),
             tip(icon_button(UNDO, Some(Message::Undo)), text("Undo (Ctrl+Z)"), tooltip::Position::Top),

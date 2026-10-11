@@ -161,11 +161,14 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = ffmpeg::Format::Mp4)]
         format: ffmpeg::Format,
         /// Write each cut to its own file for another editor, named after
-        /// the project: "<name> - 001.mp4" and on, in the folder -o.
+        /// the project: "<name> - 001.mp4" and on, in the folder -o; and each
+        /// music clip as "<name> - music 001.wav" (48 kHz 24-bit, unfaded,
+        /// at the song's own level).
         #[arg(long)]
         clips: bool,
-        /// With --clips, seconds of extra footage either side of each cut,
-        /// where the clip has it, for the other editor's transitions.
+        /// With --clips, seconds of extra footage either side of each cut
+        /// (and song either side of each music clip), where there is some,
+        /// for the other editor's transitions.
         #[arg(long, default_value_t = 0.0, requires = "clips")]
         handles: f64,
         /// Stitch from the low-resolution proxy (LRF): a quick, soft draft.
@@ -713,8 +716,9 @@ pub enum Target {
     /// The whole edit in one file.
     One(PathBuf),
     /// A file per cut in `dir`, named `<name> - 001.<ext>` and on, for an
-    /// external editor. Each runs `handles` seconds longer either side where
-    /// its clip has the footage, for that editor's own transitions.
+    /// external editor, and a WAV per music clip. Each runs `handles` seconds
+    /// longer either side where its clip has the footage, for that editor's
+    /// own transitions.
     Clips { dir: PathBuf, name: String, handles: f64 },
 }
 
@@ -778,7 +782,7 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
     for (path, cuts) in files {
         let sound: Vec<_> = plan[cuts.clone()].iter().map(|&(i, start, frames)| ffmpeg::Sound { input: &pipelines[i].input, start, duration: Some(frames as f64 / fps) }).collect();
         // The whole edit gets its mix; a file per cut is for another editor,
-        // so its sound is left as recorded and the music out.
+        // so its sound is left as recorded and the music goes beside it.
         let length: f64 = plan[cuts.clone()].iter().map(|p| p.2 as f64 / fps).sum();
         let mix = ffmpeg::Mix { sound_db: project.sound.volume, music_db: project.music.volume, music: &project.music.clips, length };
         let mix = matches!(out.target, Target::One(_)).then_some(&mix);
@@ -799,6 +803,19 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
         }
         encoder.finish()?;
         written.push(path);
+    }
+    // Beside the clips, each music clip as it is in the song, for the other
+    // editor to level and fade: with handles, but none of the mix.
+    if let Target::Clips { dir, name, .. } = &out.target {
+        let mut music: Vec<_> = project.music.clips.iter().collect();
+        music.sort_by(|a, b| a.at.total_cmp(&b.at));
+        for (k, clip) in music.into_iter().enumerate() {
+            let path = dir.join(format!("{name} - music {:03}.wav", k + 1));
+            let from = (clip.start - handles).max(0.0);
+            let end = (clip.end + handles).min(ffmpeg::duration(&clip.input)?);
+            ffmpeg::wav(&clip.input, from, end - from, &path)?;
+            written.push(path);
+        }
     }
     Ok(written)
 }
@@ -910,7 +927,9 @@ fn main() -> Result<()> {
             };
             let written = export(&project, &opts, &ExportOpts { size: (w, h), draft, cpu, format, target }, &mut print_progress())?;
             for path in &written {
-                eprintln!("wrote {} ({w}×{h})", path.display());
+                // The music beside clips is sound only.
+                let size = if path.extension().is_some_and(|e| e == "wav") { String::new() } else { format!(" ({w}×{h})") };
+                eprintln!("wrote {}{size}", path.display());
             }
             eprintln!("{} file(s), {:.2} s of edit", written.len(), project.duration());
         }

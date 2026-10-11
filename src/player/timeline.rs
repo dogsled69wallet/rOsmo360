@@ -39,6 +39,9 @@ const SCROLL_BAR: f32 = 5.0;
 pub const HEIGHT: f32 = CUTS + SEEK + MUSIC + SCROLL;
 /// A press on a cut that moves less than this is a click, not a drag.
 const DRAG_FROM: f32 = 4.0;
+/// A music edge dragged this close to a cut boundary, the playhead or
+/// another song's edge snaps to it.
+const SNAP: f32 = 8.0;
 
 /// One cut as the timeline shows it.
 pub struct Block {
@@ -201,6 +204,28 @@ impl Timeline {
         } else {
             None
         }
+    }
+
+    /// Edit times a music clip's edges snap to, but for music clip `clip`'s
+    /// own: the start, the cut boundaries, the playhead, and the other songs'
+    /// edges.
+    fn snap_targets(&self, clip: usize) -> Vec<f64> {
+        let mut at = vec![0.0, self.position];
+        at.extend(self.blocks.iter().flat_map(|c| [c.from, c.from + c.len]));
+        at.extend(self.music.iter().enumerate().filter(|&(i, _)| i != clip).flat_map(|(_, m)| [m.from, m.from + m.len]));
+        at
+    }
+
+    /// How far to shift any of `edges` (edit times) onto the nearest snap
+    /// target within `SNAP` pixels, or 0.
+    fn snap(&self, clip: usize, edges: &[f64], per_px: f64) -> f64 {
+        let reach = SNAP as f64 * per_px;
+        self.snap_targets(clip)
+            .iter()
+            .flat_map(|t| edges.iter().map(move |e| t - e))
+            .filter(|d| d.abs() < reach)
+            .min_by(|a, b| a.abs().total_cmp(&b.abs()))
+            .unwrap_or(0.0)
     }
 
     /// Where a moved cut would land: before the first cut whose middle is
@@ -425,8 +450,19 @@ impl canvas::Program<Message> for Marks {
                         return Some(canvas::Action::request_redraw().and_capture());
                     }
                     Drag::Scroll { x0, start } => Message::TimelinePan(*start + (x - *x0) as f64 * self.duration / Timeline::width(bounds) as f64),
-                    Drag::MusicMove { clip, x0, at, per_px } => Message::MusicMove(*clip, *at + (x - *x0) as f64 * *per_px),
-                    Drag::MusicTrim { clip, start, x0, from, per_px } => Message::MusicTrim(*clip, *start, *from + (x - *x0) as f64 * *per_px),
+                    Drag::MusicMove { clip, x0, at, per_px } => {
+                        let at = *at + (x - *x0) as f64 * *per_px;
+                        let len = self.music[*clip].len;
+                        Message::MusicMove(*clip, at + self.snap(*clip, &[at, at + len], *per_px))
+                    }
+                    Drag::MusicTrim { clip, start, x0, from, per_px } => {
+                        // Song time to edit time is fixed while trimming:
+                        // either edge moves, the song stays put.
+                        let m = &self.music[*clip];
+                        let t = *from + (x - *x0) as f64 * *per_px;
+                        let to_edit = m.from - m.start;
+                        Message::MusicTrim(*clip, *start, t + self.snap(*clip, &[t + to_edit], *per_px))
+                    }
                 };
                 Some(canvas::Action::publish(message).and_capture())
             }
