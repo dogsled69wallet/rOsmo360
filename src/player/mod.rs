@@ -282,6 +282,11 @@ enum Message {
     /// Music clip `i`'s in (`true`) or out edge dragged to this song time,
     /// with Shift held or not.
     MusicTrim(usize, bool, f64, bool),
+    /// A music volume point added at this edit time and level (dB).
+    VolumeAdd(f64, f64),
+    VolumeSelect(usize),
+    /// Music volume point `i` dragged to this edit time and level.
+    VolumeMove(usize, f64, f64),
     /// The mix: the clips' sound and the music track, in dB.
     SoundLevel(f64),
     MusicLevel(f64),
@@ -373,6 +378,8 @@ struct App {
     /// Songs' waveforms, and the music clip selected on its lane.
     waveforms: std::collections::HashMap<PathBuf, Arc<music::Waveform>>,
     selected_music: Option<usize>,
+    /// The music volume point selected.
+    selected_volume: Option<usize>,
     music: music::Player,
     edit: edit::Edit,
     /// The cut being played, and the one selected on the timeline.
@@ -453,6 +460,7 @@ impl App {
             thumbs: Default::default(),
             waveforms: Default::default(),
             selected_music: None,
+            selected_volume: None,
             music: Default::default(),
             edit: edit::Edit::default(),
             current: 0,
@@ -946,6 +954,7 @@ impl App {
                 // still loading finishes there without becoming a cut.
                 self.edit.replace(Vec::new(), Default::default(), Default::default());
                 self.selected_music = None;
+                self.selected_volume = None;
                 self.saved_version = self.edit.version;
                 self.project = None;
                 self.clip = None;
@@ -1026,6 +1035,7 @@ impl App {
                 self.saved_version = if complete { self.edit.version } else { 0 };
                 self.project = Some(path);
                 self.selected_music = None;
+                self.selected_volume = None;
                 let next = if self.loading.is_none() { self.open_next() } else { Task::none() };
                 return Task::batch(waves.into_iter().chain([next]));
             }
@@ -1206,6 +1216,7 @@ impl App {
             Message::Select(i) => {
                 self.selected = Some(i);
                 self.selected_music = None;
+                self.selected_volume = None;
             }
             Message::AddMusic => {
                 let dir = self.project.as_ref().and_then(|p| p.parent().map(Path::to_owned));
@@ -1242,6 +1253,25 @@ impl App {
             Message::SelectMusic(i) => {
                 self.selected_music = Some(i);
                 self.selected = None;
+                self.selected_volume = None;
+            }
+            Message::VolumeAdd(t, db) => {
+                self.begin_drag();
+                let keys = &mut self.edit.music.keyframes;
+                let i = keys.partition_point(|k| k.t <= t);
+                keys.insert(i, crate::project::VolumeKey { t, volume: db });
+                self.select_volume(i);
+            }
+            Message::VolumeSelect(i) => self.select_volume(i),
+            Message::VolumeMove(i, t, db) => {
+                self.begin_drag();
+                let keys = &mut self.edit.music.keyframes;
+                // Between its neighbours: points keep their order.
+                let lo = i.checked_sub(1).map_or(0.0, |j| keys[j].t + 0.01);
+                let hi = keys.get(i + 1).map_or(f64::INFINITY, |k| k.t - 0.01);
+                if let Some(k) = keys.get_mut(i) {
+                    *k = crate::project::VolumeKey { t: t.clamp(lo, hi.max(lo)), volume: db };
+                }
             }
             Message::MusicMove(i, want, overlap) => {
                 self.begin_drag();
@@ -1343,6 +1373,13 @@ impl App {
                     self.selected = Some(i + 1);
                 } else {
                     self.edit.undo();
+                }
+            }
+            Message::DeleteCut if self.selected_volume.is_some() => {
+                let i = self.selected_volume.take().unwrap();
+                if i < self.edit.music.keyframes.len() {
+                    self.edit.checkpoint();
+                    self.edit.music.keyframes.remove(i);
                 }
             }
             // With a song selected, delete that, not the cut under the
@@ -1699,6 +1736,13 @@ impl App {
     }
 
     /// Saves the edit for undo once per drag.
+    /// Selects music volume point `i`, and nothing else.
+    fn select_volume(&mut self, i: usize) {
+        self.selected_volume = Some(i);
+        self.selected_music = None;
+        self.selected = None;
+    }
+
     fn begin_drag(&mut self) {
         if !self.dragging {
             self.edit.checkpoint();
@@ -1888,7 +1932,9 @@ impl App {
             Key::Named(Named::ArrowUp) => self.free_look().pitch += step,
             Key::Named(Named::ArrowDown) => self.free_look().pitch -= step,
             Key::Named(Named::Home) => self.free_look().reset(),
-            Key::Named(Named::Delete | Named::Backspace) if mods.shift() || self.selected_music.is_some() => return self.update(Message::DeleteCut),
+            Key::Named(Named::Delete | Named::Backspace) if mods.shift() || self.selected_music.is_some() || self.selected_volume.is_some() => {
+                return self.update(Message::DeleteCut);
+            }
             Key::Named(Named::Delete | Named::Backspace) => return self.update(Message::KeyDelete),
             Key::Character(c) => match c {
                 "o" | "O" if mods.command() && mods.shift() => return self.update(Message::OpenProject),
@@ -1905,6 +1951,21 @@ impl App {
                 "-" if mods.command() => return self.update(Message::TimelineZoom(1.0 / 1.5, None)),
                 "0" if mods.command() => return self.update(Message::TimelineZoomTo(0.0)),
                 "0" => self.free_look().reset(),
+                // On the music: a volume point at the playhead, on the line.
+                "k" | "K" if self.selected_music.is_some() || self.selected_volume.is_some() => {
+                    let t = self.position();
+                    let db = crate::project::volume_at(&self.edit.music.keyframes, t);
+                    self.edit.checkpoint();
+                    let keys = &mut self.edit.music.keyframes;
+                    match keys.iter().position(|k| (k.t - t).abs() < 0.01) {
+                        Some(i) => self.select_volume(i),
+                        None => {
+                            let i = keys.partition_point(|k| k.t <= t);
+                            keys.insert(i, crate::project::VolumeKey { t, volume: db });
+                            self.select_volume(i);
+                        }
+                    }
+                }
                 "k" | "K" => return self.update(Message::KeyAdd),
                 "j" | "J" => {
                     if let Some(k) = self.current_key() {
@@ -2116,6 +2177,8 @@ impl App {
             blocks,
             music,
             selected_music: self.selected_music,
+            volume: self.edit.music.keyframes.clone(),
+            selected_volume: self.selected_volume,
             video: self.edit.duration(),
             duration: self.edit.frame(),
             start: timeline_start,

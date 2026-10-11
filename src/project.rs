@@ -58,11 +58,40 @@ pub struct Music {
     pub volume: f64,
     #[serde(default)]
     pub clips: Vec<MusicClip>,
+    /// Volume points at edit times, in time order: dB on top of `volume`,
+    /// so the track's level still trims the whole line. They stay where
+    /// they are when songs move.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyframes: Vec<VolumeKey>,
+}
+
+/// A volume point: `volume` dB at time `t`, straight lines (in dB) between
+/// points, held before the first and after the last.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeKey {
+    pub t: f64,
+    pub volume: f64,
+}
+
+/// The level `keys` give at `t`, dB; 0 without any.
+pub fn volume_at(keys: &[VolumeKey], t: f64) -> f64 {
+    let i = keys.partition_point(|k| k.t <= t);
+    match (i.checked_sub(1).map(|j| keys[j]), keys.get(i).copied()) {
+        (Some(a), Some(b)) => a.volume + (b.volume - a.volume) * (t - a.t) / (b.t - a.t).max(1e-9),
+        (Some(k), None) | (None, Some(k)) => k.volume,
+        (None, None) => 0.0,
+    }
 }
 
 impl Music {
     pub fn is_empty(&self) -> bool {
-        self.clips.is_empty() && self.volume == 0.0
+        self.clips.is_empty() && self.volume == 0.0 && self.keyframes.is_empty()
+    }
+
+    /// The track's level at edit time `t`, dB: its own and its points'.
+    pub fn level_at(&self, t: f64) -> f64 {
+        self.volume + volume_at(&self.keyframes, t)
     }
 
     /// Where the last clip ends on the edit, in seconds.
@@ -255,6 +284,10 @@ impl Project {
             }
             clip.input = dir.join(&clip.input);
         }
+        if project.music.keyframes.iter().any(|k| !k.t.is_finite() || !k.volume.is_finite()) {
+            bail!("a music volume point isn't a number");
+        }
+        project.music.keyframes.sort_by(|a, b| a.t.total_cmp(&b.t));
         Ok(project)
     }
 
@@ -360,6 +393,9 @@ mod tests {
         assert_eq!((p.cuts.len(), p.sound.volume, p.music.volume), (0, 0.0, -3.0));
         assert_eq!(p.music.clips[0].input, dir.join("song.mp3"));
         assert_eq!(p.music.end(), 142.0);
+        let keys = [VolumeKey { t: 10.0, volume: -6.0 }, VolumeKey { t: 20.0, volume: 0.0 }];
+        assert_eq!([5.0, 10.0, 15.0, 25.0].map(|t| volume_at(&keys, t)), [-6.0, -6.0, -3.0, 0.0]);
+        assert_eq!(volume_at(&[], 3.0), 0.0);
         p.save(&dir.join("again.json")).unwrap();
         let text = std::fs::read_to_string(dir.join("again.json")).unwrap();
         assert!(text.contains(r#""input": "song.mp3""#) && !text.contains("fade_out") && !text.contains("sound"));
@@ -374,7 +410,7 @@ mod tests {
     #[test]
     fn music_clips_split_in_place_and_never_overlap() {
         let clip = |at: f64, start: f64, end: f64| MusicClip { input: "song.mp3".into(), at, start, end, fade_in: 1.0, fade_out: 2.0 };
-        let mut m = Music { volume: 0.0, clips: vec![clip(0.0, 0.0, 30.0)] };
+        let mut m = Music { clips: vec![clip(0.0, 0.0, 30.0)], ..Default::default() };
         assert!(m.split(0, 10.0, 0.1));
         assert_eq!((m.clips[0].end, m.clips[0].fade_out), (10.0, 0.0));
         assert_eq!((m.clips[1].at, m.clips[1].start, m.clips[1].end, m.clips[1].fade_in, m.clips[1].fade_out), (10.0, 10.0, 30.0, 0.0, 2.0));

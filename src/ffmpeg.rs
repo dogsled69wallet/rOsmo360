@@ -439,6 +439,25 @@ impl Encoder {
     }
 }
 
+/// The music track's level as a `volume` filter on edit time: fixed, or
+/// with volume points the same line the player follows (straight in dB
+/// between points), worked out per audio frame (~20 ms).
+fn level_filter(music: &crate::project::Music) -> String {
+    let keys = &music.keyframes;
+    if keys.is_empty() {
+        return format!("volume={}", crate::project::gain(music.volume));
+    }
+    // dB at `t`: nested ifs from the last stretch back to the first.
+    let mut db = format!("{}", keys[keys.len() - 1].volume);
+    for w in keys.windows(2).rev() {
+        let (a, b) = (w[0], w[1]);
+        db = format!("if(lt(t,{}),{}+({})*(t-{})/{},{db})", b.t, a.volume, b.volume - a.volume, a.t, (b.t - a.t).max(1e-9));
+    }
+    db = format!("if(lt(t,{}),{},{db})", keys[0].t, keys[0].volume);
+    let off = crate::project::OFF_DB;
+    format!("volume=eval=frame:volume='if(lte({0}+{db},{off}),0,pow(10,({0}+{db})/20))'", music.volume)
+}
+
 /// The filter graph for `Encoder::new` with a mix, adding the music's inputs
 /// to `cmd`: the clips' stretches joined (or silence where they have none)
 /// at their level, and each music clip trimmed to its stretch and to the
@@ -490,7 +509,7 @@ fn mixed(cmd: &mut Command, audio: &[Sound<'_>], mix: &Mix<'_>) -> Result<String
             chain += &format!(",afade=t=out:st={}:d={cross_out}:curve=qsin", len - cross_out);
         }
         let delay = (clip.at * 1000.0).round();
-        graph += &format!("{chain},adelay=delays={delay}:all=1,volume={}[m{input}];", crate::project::gain(mix.music.volume));
+        graph += &format!("{chain},adelay=delays={delay}:all=1,{}[m{input}];", level_filter(mix.music));
         parts.push(format!("[m{input}]"));
     }
     graph += &format!("{}amix=inputs={}:duration=first:normalize=0[a]", parts.concat(), parts.len());
