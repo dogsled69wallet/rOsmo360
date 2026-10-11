@@ -204,6 +204,14 @@ Two common patterns:
 - **Pause, then pan**: two keyframes with the same view (the first Smooth or Hold), then a third with the new view.
 - **Cut between angles**: set a keyframe to Hold, and put the next keyframe, with the other angle, where the cut should happen.
 
+### Follow: a third-person shot
+
+A keyframe can **follow the selfie stick** instead of looking in a fixed direction. The stick points at whoever holds it, so the view keeps you in the picture as you walk, turn and move the stick, like a drone following from above and behind. rOsmo360 knows where the stick points from the camera's own motion data, so it needs no picture analysis and keeps working even when the stick points straight down.
+
+1. Frame the shot you want around yourself: for example tilt the view up a little from the stick so the trail ahead shows too, and widen it (FOV 100 or so).
+2. Press **K**, then choose **Stick** in the **Follow** picker. The view stays as it is: the keyframe now keeps it as an offset from the stick. Its mark on the seek bar gets a ring.
+3. Play. Keyframes you add after it follow too, until you set one back to **Fixed**. A move from a following keyframe to a fixed one, or back, eases over as usual.
+
 ## 8. Framing: the aspect lock
 
 The **Aspect** picker in the top bar sets the shape of the picture: Free, 16:9, 9:16, 4:3, 1:1 or 2:1. The view is letterboxed to that shape, so you frame exactly what will be exported. Use 9:16 for phone video such as Reels, Shorts or TikTok:

@@ -431,6 +431,13 @@ impl Pipeline {
         })
     }
 
+    /// Where `follow` points in the view at clip time `t` (seconds).
+    fn aim(&self, follow: view::Follow, t: f64) -> Option<(f64, f64)> {
+        match follow {
+            view::Follow::Stick => self.stab.stick(t * 1000.0, self.readout_ms),
+        }
+    }
+
     /// Decode from the clip's proxy from now on, if it has one.
     fn use_proxy(&mut self) {
         self.proxy = ffmpeg::proxy(&self.input);
@@ -615,8 +622,8 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
             let size = out.size;
             let mut tick = |n: usize| progress(done + n, total);
             let result = match &mut gpu {
-                Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut encoder, |t| project::camera_at(&project.cuts, n, t), size, &mut tick),
-                None => encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: project::camera_at(&project.cuts, n, t), size }, &mut tick),
+                Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut encoder, |t| project::camera_at(&project.cuts, n, t, &|f| pipelines[i].aim(f, t)), size, &mut tick),
+                None => encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: project::camera_at(&project.cuts, n, t, &|f| pipelines[i].aim(f, t)), size }, &mut tick),
             };
             if let Err(e) = result {
                 encoder.abort();
@@ -764,7 +771,7 @@ fn main() -> Result<()> {
                 None => Shot::Equirect(tile),
                 Some(r) => {
                     let view::Aspect(w, h) = r.aspect.unwrap_or(view::Aspect(16, 9));
-                    Shot::View { camera: r.camera_at(t), size: (tile, ((tile * h as usize / w as usize) / 2).max(8) * 2) }
+                    Shot::View { camera: r.camera_at(t, &|f| p.aim(f, t)), size: (tile, ((tile * h as usize / w as usize) / 2).max(8) * 2) }
                 }
             };
             let tiles = times
@@ -816,7 +823,7 @@ fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<
         .map(|shot| {
             let Some((n, i, t)) = *shot else { return Ok(stitch::Frame { width: size.0, height: size.1, rgb: vec![0; size.0 * size.1 * 3] }) };
             let p = &pipelines[i];
-            let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &Shot::View { camera: project::camera_at(&project.cuts, n, t), size });
+            let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &Shot::View { camera: project::camera_at(&project.cuts, n, t, &|f| p.aim(f, t)), size });
             sheet::label(&mut f, 4, 4, &format!("#{} {t:.1}s", n + 1));
             Ok(f)
         })

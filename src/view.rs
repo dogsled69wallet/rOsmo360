@@ -10,7 +10,7 @@
 
 use crate::stitch::{M3, mat_mul};
 use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
@@ -205,13 +205,98 @@ impl fmt::Display for Ease {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+/// What a keyframe can follow instead of looking at fixed angles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Follow {
+    /// The selfie stick, and so whoever holds it: it runs down the rig's
+    /// +y, so the camera's attitude says where it points, with no picture
+    /// analysis, even straight below the camera.
+    Stick,
+}
+
+impl fmt::Display for Follow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Follow::Stick => "Stick",
+        })
+    }
+}
+
+/// Where each `Follow` points in the frame being drawn, as view yaw and
+/// pitch in degrees; `None` where the clip has no attitude data.
+pub type Aim<'a> = &'a dyn Fn(Follow) -> Option<(f64, f64)>;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Keyframe {
     /// Clip time in seconds.
     pub t: f64,
-    #[serde(flatten)]
+    /// With `follow`, `view.yaw` and `view.pitch` are offsets from where
+    /// it points.
     pub view: View,
     pub ease: Ease,
+    pub follow: Option<Follow>,
+}
+
+impl Keyframe {
+    /// The view it shows in the frame being drawn.
+    fn view_with(&self, aim: Aim) -> View {
+        match self.follow {
+            None => self.view,
+            Some(f) => {
+                let (yaw, pitch) = aim(f).unwrap_or((0.0, 0.0));
+                View { yaw: yaw + self.view.yaw, pitch: (pitch + self.view.pitch).clamp(-90.0, 90.0), ..self.view }
+            }
+        }
+    }
+
+    /// `view` (as shown) stored the way this keyframe keeps it.
+    fn store(&self, view: View, aim: Aim) -> View {
+        match self.follow.and_then(|f| aim(f)) {
+            Some((yaw, pitch)) => View { yaw: view.yaw - yaw, pitch: view.pitch - pitch, ..view },
+            None => view,
+        }
+    }
+}
+
+/// The JSON form: a following keyframe has `follow` and offsets in place
+/// of `yaw` and `pitch`.
+impl Serialize for Keyframe {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Json {
+            t: f64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            yaw: Option<f64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pitch: Option<f64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            follow: Option<Follow>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            offset_yaw: Option<f64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            offset_pitch: Option<f64>,
+            roll: f64,
+            fov: f64,
+            projection: Projection,
+            ease: Ease,
+        }
+        let (fixed, follows) = (self.follow.is_none(), self.follow.is_some());
+        let v = &self.view;
+        Json {
+            t: self.t,
+            yaw: fixed.then_some(v.yaw),
+            pitch: fixed.then_some(v.pitch),
+            follow: self.follow,
+            offset_yaw: follows.then_some(v.yaw),
+            offset_pitch: follows.then_some(v.pitch),
+            roll: v.roll,
+            fov: v.fov,
+            projection: v.projection,
+            ease: self.ease,
+        }
+        .serialize(s)
+    }
 }
 
 /// Keyframed views in clip time. Between keyframes yaw, pitch and roll move
@@ -247,23 +332,29 @@ impl Keyframes {
         (b > a).then_some((a, b))
     }
 
-    /// The view at clip time `t`; `None` without keyframes.
-    pub fn camera_at(&self, t: f64) -> Option<Camera> {
-        let (view, planet) = self.blend(t)?;
+    /// The view at clip time `t`; `None` without keyframes. `aim` says
+    /// where following keyframes point in the frame being drawn.
+    pub fn camera_at(&self, t: f64, aim: Aim) -> Option<Camera> {
+        let (view, planet) = self.blend(t, aim)?;
         Some(Camera { planet, ..view.camera() })
     }
 
     /// The view at clip time `t` as angles, to carry on from by hand. Mid-
     /// morph it takes the nearer keyframe's projection.
-    pub fn view_at(&self, t: f64) -> Option<View> {
-        self.blend(t).map(|(view, _)| view)
+    pub fn view_at(&self, t: f64, aim: Aim) -> Option<View> {
+        self.blend(t, aim).map(|(view, _)| view)
     }
 
     /// The interpolated view at `t`, plus its perspective-to-planet morph.
-    fn blend(&self, t: f64) -> Option<(View, Option<f64>)> {
+    /// A following keyframe takes part as the view it shows now, so a move
+    /// from it to a fixed one keeps tracking until it hands over.
+    fn blend(&self, t: f64, aim: Aim) -> Option<(View, Option<f64>)> {
         let k = &self.0;
         let i = k.partition_point(|f| f.t <= t);
-        let held = |f: &Keyframe| (f.view, f.view.projection.planet());
+        let held = |f: &Keyframe| {
+            let v = f.view_with(aim);
+            (v, v.projection.planet())
+        };
         if i == 0 || i == k.len() {
             return k.get(i.saturating_sub(1)).map(held);
         }
@@ -275,7 +366,15 @@ impl Keyframes {
             Ease::Hold => return Some(held(a)),
         };
         let lerp = |p: f64, q: f64| p + (q - p) * u;
-        let (va, vb) = (a.view, b.view);
+        let (mut va, mut vb) = (a.view_with(aim), b.view_with(aim));
+        // Where the stick points is known only modulo a turn: take the turn
+        // nearest the fixed keyframe's yaw, or the move would spin round.
+        let turn_near = |y: f64, to: f64| to + (y - to + 180.0).rem_euclid(360.0) - 180.0;
+        match (a.follow.is_some(), b.follow.is_some()) {
+            (true, false) => va.yaw = turn_near(va.yaw, vb.yaw),
+            (false, true) => vb.yaw = turn_near(vb.yaw, va.yaw),
+            _ => {}
+        }
         let zoom = |v: View| (v.fov.to_radians() / 2.0).tan().ln();
         let near = if u < 0.5 { va } else { vb };
         let view = View {
@@ -298,17 +397,29 @@ impl Keyframes {
         self.0.iter().position(|f| (f.t - t).abs() <= tolerance)
     }
 
-    /// Sets the view at `t`: updates a keyframe within `tolerance`, else
-    /// adds one, easing like the keyframe before it. Returns its index.
-    pub fn set(&mut self, t: f64, view: View, tolerance: f64) -> usize {
+    /// Sets the view shown at `t`: updates a keyframe within `tolerance`,
+    /// else adds one, easing and following like the keyframe before it.
+    /// A following keyframe keeps `view` as offsets from `aim`. Returns its
+    /// index.
+    pub fn set(&mut self, t: f64, view: View, tolerance: f64, aim: Aim) -> usize {
         if let Some(i) = self.near(t, tolerance) {
-            self.0[i].view = view;
+            self.0[i].view = self.0[i].store(view, aim);
             return i;
         }
         let i = self.0.partition_point(|f| f.t < t);
-        let ease = i.checked_sub(1).map_or(Ease::default(), |p| self.0[p].ease);
-        self.0.insert(i, Keyframe { t, view, ease });
+        let (ease, follow) = i.checked_sub(1).map_or((Ease::default(), None), |p| (self.0[p].ease, self.0[p].follow));
+        let mut key = Keyframe { t, view, ease, follow };
+        key.view = key.store(view, aim);
+        self.0.insert(i, key);
         i
+    }
+
+    /// Makes keyframe `i` follow `follow` (or stop following), keeping the
+    /// view it shows now, per `aim`.
+    pub fn set_follow(&mut self, i: usize, follow: Option<Follow>, aim: Aim) {
+        let shown = self.0[i].view_with(aim);
+        self.0[i].follow = follow;
+        self.0[i].view = self.0[i].store(shown, aim);
     }
 
     pub fn remove(&mut self, i: usize) {
@@ -344,15 +455,15 @@ pub struct Reframe {
 
 impl Reframe {
     pub fn fixed(view: View) -> Reframe {
-        Reframe { keyframes: Keyframes(vec![Keyframe { t: 0.0, view, ease: Ease::Hold }]), aspect: None }
+        Reframe { keyframes: Keyframes(vec![Keyframe { t: 0.0, view, ease: Ease::Hold, follow: None }]), aspect: None }
     }
 
     pub fn span(&self) -> Option<(f64, f64)> {
         self.keyframes.span()
     }
 
-    pub fn camera_at(&self, t: f64) -> Camera {
-        self.keyframes.camera_at(t).expect("a reframe has keyframes")
+    pub fn camera_at(&self, t: f64, aim: Aim) -> Camera {
+        self.keyframes.camera_at(t, aim).expect("a reframe has keyframes")
     }
 }
 
@@ -385,6 +496,9 @@ struct RawKeyframe {
     fov: Option<f64>,
     projection: Option<Projection>,
     ease: Option<Ease>,
+    follow: Option<Follow>,
+    offset_yaw: Option<f64>,
+    offset_pitch: Option<f64>,
 }
 
 impl TryFrom<Vec<RawKeyframe>> for Keyframes {
@@ -397,21 +511,39 @@ impl TryFrom<Vec<RawKeyframe>> for Keyframes {
             if prev.is_some_and(|p| r.t < p.t) {
                 bail!("keyframe at {} s comes after one at {} s; keep them in time order", r.t, prev.unwrap().t);
             }
+            // Following carries over like the rest, until a keyframe gives
+            // its own yaw or pitch.
+            let fixed = r.yaw.is_some() || r.pitch.is_some();
+            if fixed && r.follow.is_some() {
+                bail!("keyframe at {} s has both follow and yaw/pitch; aim it with offset_yaw/offset_pitch", r.t);
+            }
+            let follow = r.follow.or(if fixed { None } else { prev.and_then(|p| p.follow) });
+            if follow.is_none() && (r.offset_yaw.is_some() || r.offset_pitch.is_some()) {
+                bail!("keyframe at {} s has offset_yaw/offset_pitch but follows nothing", r.t);
+            }
             let base = match (prev, r.projection) {
                 (None, p) => View::home(p.unwrap_or(Projection::Perspective)),
                 (Some(p), proj) => View { projection: proj.unwrap_or(p.view.projection), ..p.view },
             };
-            let view = View {
-                yaw: r.yaw.unwrap_or(base.yaw),
-                pitch: r.pitch.unwrap_or(base.pitch),
-                roll: r.roll.unwrap_or(base.roll),
-                fov: r.fov.unwrap_or(base.fov),
-                projection: base.projection,
+            // Offsets carry over between keyframes following the same thing;
+            // a fixed keyframe after a following one has no angles to carry.
+            let prev_follow = prev.and_then(|p| p.follow);
+            let (yaw, pitch) = match follow {
+                Some(f) => {
+                    let (y, p) = if prev_follow == Some(f) { (base.yaw, base.pitch) } else { (0.0, 0.0) };
+                    (r.offset_yaw.unwrap_or(y), r.offset_pitch.unwrap_or(p))
+                }
+                None if prev_follow.is_some() => match (r.yaw, r.pitch) {
+                    (Some(y), Some(p)) => (y, p),
+                    _ => bail!("keyframe at {} s stops following; give it both yaw and pitch", r.t),
+                },
+                None => (r.yaw.unwrap_or(base.yaw), r.pitch.unwrap_or(base.pitch)),
             };
+            let view = View { yaw, pitch, roll: r.roll.unwrap_or(base.roll), fov: r.fov.unwrap_or(base.fov), projection: base.projection };
             if !(1.0..=359.0).contains(&view.fov) {
                 bail!("fov {} at {} s is out of range (1–359°)", view.fov, r.t);
             }
-            keyframes.push(Keyframe { t: r.t, view, ease: r.ease.or(prev.map(|p| p.ease)).unwrap_or_default() });
+            keyframes.push(Keyframe { t: r.t, view, ease: r.ease.or(prev.map(|p| p.ease)).unwrap_or_default(), follow });
         }
         Ok(Keyframes(keyframes))
     }
@@ -456,14 +588,45 @@ mod tests {
     }
 
     #[test]
+    fn follows_the_stick() {
+        let k: Keyframes = serde_json::from_str(
+            r#"[{"t": 0, "follow": "stick", "offset_pitch": 30, "fov": 110},
+                {"t": 2},
+                {"t": 4, "yaw": 170, "pitch": 0}]"#,
+        )
+        .unwrap();
+        assert_eq!((k[1].follow, k[1].view.pitch, k[1].view.fov), (Some(Follow::Stick), 30.0, 110.0));
+        assert_eq!(k[2].follow, None);
+        // The stick behind and below: yaw 170, pitch −60.
+        let aim = |_| Some((170.0, -60.0));
+        let v = k.view_at(1.0, &aim).unwrap();
+        assert_eq!((v.yaw, v.pitch), (170.0, -30.0));
+        // Half way from the stick at −170° to the fixed 170° it turns the
+        // short way, through 180°, not back through 0°.
+        let half = k.view_at(3.0, &|_| Some((-170.0, -60.0))).unwrap();
+        assert!((half.yaw - 180.0).abs() < 1e-9, "{}", half.yaw);
+        let back: Keyframes = serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
+        assert_eq!(back, k);
+        assert!(serde_json::from_str::<Keyframes>(r#"[{"t": 0, "follow": "stick", "yaw": 3}]"#).is_err());
+        assert!(serde_json::from_str::<Keyframes>(r#"[{"t": 0, "follow": "stick"}, {"t": 1, "yaw": 3}]"#).is_err());
+        assert!(serde_json::from_str::<Keyframes>(r#"[{"t": 0, "offset_yaw": 3}]"#).is_err());
+        // Editing keeps the shown view: offsets come from the aim.
+        let mut e = k.clone();
+        e.set_follow(2, Some(Follow::Stick), &aim);
+        assert_eq!((e[2].view.yaw, e[2].view.pitch), (0.0, 60.0));
+        e.set(1.0, View { yaw: 175.0, pitch: -20.0, ..k[0].view }, 0.01, &aim);
+        assert_eq!((e[1].view.yaw, e[1].view.pitch), (5.0, 40.0));
+    }
+
+    #[test]
     fn edits_keyframes() {
         let mut k = Keyframes::default();
         let v = |yaw| View { yaw, ..View::home(Projection::Perspective) };
-        assert_eq!(k.set(2.0, v(10.0), 0.01), 0);
-        assert_eq!(k.set(1.0, v(0.0), 0.01), 0);
-        assert_eq!(k.set(2.005, v(20.0), 0.01), 1);
+        assert_eq!(k.set(2.0, v(10.0), 0.01, &|_| None), 0);
+        assert_eq!(k.set(1.0, v(0.0), 0.01, &|_| None), 0);
+        assert_eq!(k.set(2.005, v(20.0), 0.01, &|_| None), 1);
         assert_eq!((k.len(), k[1].view.yaw), (2, 20.0));
-        assert_eq!(k.view_at(1.5).unwrap().yaw, 10.0);
+        assert_eq!(k.view_at(1.5, &|_| None).unwrap().yaw, 10.0);
         k.retime(0, 5.0, 0.1);
         assert!((k[0].t - 1.9).abs() < 1e-9);
         k.remove(0);
@@ -474,7 +637,7 @@ mod tests {
     fn interpolates_between_keyframes() {
         let r: Reframe = serde_json::from_str(r#"{"keyframes": [{"t": 0, "yaw": 0, "ease": "linear"}, {"t": 2, "yaw": 90}]}"#).unwrap();
         let mid = View { yaw: 45.0, ..View::home(Projection::Perspective) }.camera();
-        assert!(close(r.camera_at(1.0).user[0], mid.user[0]));
-        assert!(close(r.camera_at(-1.0).user[0], r.keyframes[0].view.camera().user[0]));
+        assert!(close(r.camera_at(1.0, &|_| None).user[0], mid.user[0]));
+        assert!(close(r.camera_at(-1.0, &|_| None).user[0], r.keyframes[0].view.camera().user[0]));
     }
 }

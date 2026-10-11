@@ -7,7 +7,7 @@
 //! axis — found on handheld footage by world-locking across fast pans until
 //! the sun held still, then checking the horizon levels at 30–50° of tilt.
 
-use crate::stitch::{M3, mat_mul, quat_to_mat, transpose};
+use crate::stitch::{M3, apply, mat_mul, quat_to_mat, transpose};
 use telemetry_parser::rig::geometry::Quat;
 
 /// How the IMU's axes sit relative to the rig's: identity or a half turn
@@ -62,6 +62,15 @@ impl std::fmt::Display for Mode {
         })
     }
 }
+
+/// The stick's direction is averaged over this many ms either side, so
+/// hand shake doesn't shake a view that follows it.
+const STICK_SMOOTH_MS: f64 = 250.0;
+/// Straight below (or above) the camera the stick's yaw means nothing and
+/// swings wildly as it wobbles past; this much of the view's forward axis
+/// (per unit length) is mixed into its horizontal part, so there the yaw
+/// eases towards straight ahead instead.
+const STICK_NADIR_BIAS: f64 = 0.08;
 
 #[derive(Clone)]
 pub struct Stabilizer {
@@ -160,6 +169,27 @@ impl Stabilizer {
                 mat_mul(transpose(rig), view)
             })
             .collect()
+    }
+
+    /// Where the selfie stick points (rig +y, towards whoever holds it) in
+    /// the view at frame time `t_ms`, as view yaw and pitch in degrees.
+    /// `None` without attitude data.
+    pub fn stick(&self, t_ms: f64, readout_ms: f64) -> Option<(f64, f64)> {
+        if !self.has_data() {
+            return None;
+        }
+        let mid = t_ms + readout_ms / 2.0;
+        let n = 16;
+        let mut world = [0.0; 3];
+        for k in 0..=n {
+            let r = self.world_from_rig(mid + STICK_SMOOTH_MS * (2.0 * k as f64 / n as f64 - 1.0));
+            for i in 0..3 {
+                world[i] += r[i][1];
+            }
+        }
+        let d = normalise(apply(transpose(self.world_from_view(mid)), world));
+        // View x right, y down, z forward: yaw turns right, pitch looks up.
+        Some((d[0].atan2(d[2] + STICK_NADIR_BIAS).to_degrees(), (-d[1]).clamp(-1.0, 1.0).asin().to_degrees()))
     }
 
     /// The camera's pose at `t_ms`: its heading in degrees, turning the same

@@ -17,7 +17,7 @@ use crate::ffmpeg::{self, Hwaccel};
 use crate::stab::{ImuAxes, Mode, Stabilizer};
 use crate::project::{Cut, Project};
 use crate::stitch::M3;
-use crate::view::{Camera, Ease, Keyframes, Projection, View};
+use crate::view::{Camera, Ease, Follow, Keyframes, Projection, View};
 use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
@@ -270,6 +270,7 @@ enum Message {
     Thumb(PathBuf, f64, image::Handle),
     /// How the keyframe at the playhead moves on to the next.
     KeyEase(Ease),
+    KeyFollow(Aiming),
     /// Jump to keyframe `.1` of cut `.0`.
     KeyJump(usize, usize),
     /// Drag keyframe `.1` of cut `.0` to clip time `.2`.
@@ -927,9 +928,10 @@ impl App {
             Message::KeyAdd => {
                 let (view, tolerance) = (self.shown_view(), self.tolerance());
                 let Some((_, t)) = self.playing_cut() else { return Task::none() };
+                let stick = self.aim(Follow::Stick, t);
                 self.edit.checkpoint();
                 if let Some(cut) = self.edit.cuts.get_mut(self.current) {
-                    cut.keyframes.set(t, view, tolerance);
+                    cut.keyframes.set(t, view, tolerance, &|Follow::Stick| stick);
                     self.follow = true;
                 }
             }
@@ -950,6 +952,16 @@ impl App {
                 {
                     self.edit.checkpoint();
                     self.edit.cuts[self.current].keyframes.set_ease(k, ease);
+                    self.follow = true;
+                }
+            }
+            Message::KeyFollow(aiming) => {
+                if let (Some(k), Some((_, t))) = (self.current_key(), self.playing_cut())
+                    && self.edit.cuts[self.current].keyframes[k].follow != aiming.follow()
+                {
+                    let stick = self.aim(Follow::Stick, t);
+                    self.edit.checkpoint();
+                    self.edit.cuts[self.current].keyframes.set_follow(k, aiming.follow(), &|Follow::Stick| stick);
                     self.follow = true;
                 }
             }
@@ -1124,10 +1136,18 @@ impl App {
         crate::project::keyframed(&self.edit.cuts, self.current, t)
     }
 
+    /// Where `follow` points in the playing clip's view at its time `t`.
+    fn aim(&self, follow: Follow, t: f64) -> Option<(f64, f64)> {
+        let media = &self.clip.as_ref()?.playback.media;
+        match follow {
+            Follow::Stick => media.stab.stick(t * 1000.0, media.readout_ms),
+        }
+    }
+
     /// The view on screen, as angles.
     fn shown_view(&self) -> View {
         match self.playing_cut() {
-            Some((_, t)) if self.follow => self.keyframed(t).and_then(|(k, t)| k.view_at(t)).unwrap_or(self.look),
+            Some((_, t)) if self.follow => self.keyframed(t).and_then(|(k, at)| k.view_at(at, &|f| self.aim(f, t))).unwrap_or(self.look),
             _ => self.look,
         }
     }
@@ -1136,7 +1156,7 @@ impl App {
     /// little planet when following keyframes.
     fn camera(&self) -> Camera {
         match self.playing_cut() {
-            Some((_, t)) if self.follow => self.keyframed(t).and_then(|(k, t)| k.camera_at(t)).unwrap_or_else(|| self.look.camera()),
+            Some((_, t)) if self.follow => self.keyframed(t).and_then(|(k, at)| k.camera_at(at, &|f| self.aim(f, t))).unwrap_or_else(|| self.look.camera()),
             _ => self.look.camera(),
         }
     }
@@ -1464,7 +1484,7 @@ impl App {
             .cuts
             .iter()
             .map(|c| {
-                let keys = c.keyframes.iter().enumerate().filter(|(_, k)| k.t >= c.start - tolerance && k.t <= c.end + tolerance).map(|(i, k)| (i, k.t, k.ease)).collect();
+                let keys = c.keyframes.iter().enumerate().filter(|(_, k)| k.t >= c.start - tolerance && k.t <= c.end + tolerance).map(|(i, k)| (i, k.t, k.ease, k.follow.is_some())).collect();
                 // Only those in the cut, and one either side for its ends.
                 let thumbs = self.thumbs.get(&c.input).map_or_else(Vec::new, |all| {
                     let from = all.partition_point(|(t, _)| *t < c.start).saturating_sub(1);
@@ -1510,6 +1530,13 @@ impl App {
             tooltip(
                 pick_list(&Ease::ALL[..], current.map(|k| self.edit.cuts[self.current].keyframes[k].ease), Message::KeyEase).placeholder("Ease").width(96),
                 text("How this keyframe moves on to the next (J cycles)"),
+                tooltip::Position::Top,
+            ),
+            tooltip(
+                pick_list(&Aiming::ALL[..], current.map(|k| Aiming::of(self.edit.cuts[self.current].keyframes[k].follow)), Message::KeyFollow)
+                    .placeholder("Follow")
+                    .width(96),
+                text("What this keyframe looks at: fixed angles, or the selfie stick (whoever holds it) with this view's offset from it"),
                 tooltip::Position::Top,
             ),
             tooltip(icon_button(SPLIT, can_split.then_some(Message::Split)), text("Split the cut at the playhead (C)"), tooltip::Position::Top),
@@ -1657,6 +1684,37 @@ fn theme_changes() -> impl iced::futures::Stream<Item = Message> {
 
 fn labelled<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     row![text(label), widget.into()].spacing(6).align_y(Alignment::Center).into()
+}
+
+/// The Follow picker's choices for a keyframe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aiming {
+    Fixed,
+    Follows(Follow),
+}
+
+impl Aiming {
+    const ALL: [Aiming; 2] = [Aiming::Fixed, Aiming::Follows(Follow::Stick)];
+
+    fn of(follow: Option<Follow>) -> Aiming {
+        follow.map_or(Aiming::Fixed, Aiming::Follows)
+    }
+
+    fn follow(self) -> Option<Follow> {
+        match self {
+            Aiming::Fixed => None,
+            Aiming::Follows(f) => Some(f),
+        }
+    }
+}
+
+impl std::fmt::Display for Aiming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Aiming::Fixed => f.write_str("Fixed"),
+            Aiming::Follows(follow) => follow.fmt(f),
+        }
+    }
 }
 
 /// A cut's names on the timeline, longest first, for the block to show the

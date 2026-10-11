@@ -43,7 +43,8 @@ pub struct Block {
     pub start: f64,
     /// Its keyframes within the cut: index into the cut's keyframes, clip
     /// time, and how it moves on to the next (drawn as its shape).
-    pub keys: Vec<(usize, f64, Ease)>,
+    /// Keyframes: index, clip time, ease, and whether it follows the stick.
+    pub keys: Vec<(usize, f64, Ease, bool)>,
     /// Thumbnails of its clip by clip time, in order (see `thumbs`).
     pub thumbs: Vec<(f64, Handle)>,
 }
@@ -128,7 +129,7 @@ impl Timeline {
     fn key_at(&self, x: f32, b: Rectangle) -> Option<(usize, usize)> {
         let mut best = None;
         for (ci, c) in self.blocks.iter().enumerate() {
-            for &(ki, t, _) in &c.keys {
+            for &(ki, t, _, _) in &c.keys {
                 let d = (self.x(c.from + t - c.start, b) - x).abs();
                 if d <= PICK && best.is_none_or(|(bd, _)| d < bd) {
                     best = Some((d, (ci, ki)));
@@ -369,7 +370,7 @@ impl canvas::Program<Message> for Marks {
             frame.fill(&Path::rectangle(Point::new(x - 1.0, mid - BAR), Size::new(2.0, 2.0 * BAR)), palette.background.base.color);
         }
         for (ci, c) in self.blocks.iter().enumerate() {
-            for &(ki, t, ease) in &c.keys {
+            for &(ki, t, ease, follows) in &c.keys {
                 let x = self.x(c.from + t - c.start, bounds);
                 // Smooth is a diamond, linear a circle, hold a square.
                 let mark = match ease {
@@ -386,6 +387,10 @@ impl canvas::Program<Message> for Marks {
                 let fill = if Some((ci, ki)) == self.current { palette.primary.strong.color } else { palette.background.base.text };
                 frame.fill(&mark, fill);
                 frame.stroke(&mark, Stroke::default().with_width(1.5).with_color(palette.background.base.color));
+                // A keyframe that follows the stick wears a ring.
+                if follows {
+                    frame.stroke(&Path::circle(Point::new(x, mid), DIAMOND * 1.7), Stroke::default().with_width(1.5).with_color(fill));
+                }
             }
         }
         frame.fill(&Path::rectangle(Point::new(at - 1.0, 0.0), Size::new(2.0, CUTS)), palette.primary.strong.color);

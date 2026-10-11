@@ -8,7 +8,7 @@
 //! in and out points are kept, so extending the cut again brings them back.
 
 use crate::stab::Mode;
-use crate::view::{Aspect, Camera, Keyframes, Projection, View};
+use crate::view::{Aim, Aspect, Camera, Keyframes, Projection, View};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -92,9 +92,11 @@ pub fn keyframed(cuts: &[Cut], n: usize, t: f64) -> Option<(&Keyframes, f64)> {
 }
 
 /// The view of cut `n` at clip time `t` (see `keyframed`), or straight ahead
-/// before any keyframe.
-pub fn camera_at(cuts: &[Cut], n: usize, t: f64) -> Camera {
-    keyframed(cuts, n, t).and_then(|(k, t)| k.camera_at(t)).unwrap_or_else(|| View::home(Projection::Perspective).camera())
+/// before any keyframe. `aim` is where following keyframes point in this
+/// cut's clip at `t`, so a cut that holds an earlier cut's following view
+/// goes on following in its own footage.
+pub fn camera_at(cuts: &[Cut], n: usize, t: f64, aim: Aim) -> Camera {
+    keyframed(cuts, n, t).and_then(|(k, t)| k.camera_at(t, aim)).unwrap_or_else(|| View::home(Projection::Perspective).camera())
 }
 
 #[cfg(test)]
@@ -142,11 +144,11 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let yaw = |n, t| camera_at(&p.cuts, n, t).user;
+        let yaw = |n, t| camera_at(&p.cuts, n, t, &|_| None).user;
         assert_eq!(yaw(0, 2.0), View::home(Projection::Perspective).camera().user);
         assert_eq!(keyframed(&p.cuts, 1, 12.0).map(|k| k.1), Some(12.0));
         // The view at the earlier cut's out point, not at its last keyframe.
-        let held = p.cuts[1].keyframes.camera_at(20.0).unwrap().user;
+        let held = p.cuts[1].keyframes.camera_at(20.0, &|_| None).unwrap().user;
         assert_eq!((yaw(2, 55.0), yaw(3, 75.0)), (held, held));
     }
 }
