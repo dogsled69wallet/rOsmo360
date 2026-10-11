@@ -47,6 +47,9 @@ const SNAP: f32 = 8.0;
 const VOLUME_TOP: f64 = 6.0;
 const VOLUME_BOTTOM: f64 = crate::project::OFF_DB;
 const POINT: f32 = 4.0;
+/// How far above a cut block's bottom its effect keyframe marks sit.
+const EFFECT_ROW: f32 = 5.0;
+const EFFECT_MARK: iced::Color = iced::Color::from_rgb(0.78, 0.55, 1.0);
 /// Where a volume line runs: its top and height. The music's over the music
 /// lane, a cut's sound over its block.
 type Lane = (f32, f32);
@@ -74,6 +77,8 @@ pub struct Block {
     pub sound: Vec<crate::project::VolumeKey>,
     /// How long it overlaps the cut before, dissolving in.
     pub crossfade: f64,
+    /// Its effect keyframes' clip times.
+    pub effects: Vec<f64>,
 }
 
 impl Block {
@@ -217,6 +222,17 @@ impl Timeline {
         } else {
             None
         }
+    }
+
+    /// The effect keyframe mark under `p` (they sit along a cut's bottom):
+    /// (cut, clip time).
+    fn effect_at(&self, p: Point, b: Rectangle) -> Option<(usize, f64)> {
+        if p.y < CUTS - EFFECT_ROW - PICK / 2.0 || p.y > CUTS {
+            return None;
+        }
+        self.blocks.iter().enumerate().rev().find_map(|(i, c)| {
+            c.effects.iter().find(|&&t| t >= c.start && t <= c.start + c.len && (self.x(c.from + t - c.start, b) - p.x).abs() <= PICK).map(|&t| (i, t))
+        })
     }
 
     /// The cut edge under `x`: (cut, whether it's the in edge). Later cuts
@@ -560,6 +576,8 @@ impl canvas::Program<Message> for Marks {
                     let start = if p.x >= l && p.x <= r { self.start } else { self.start + (p.x - (l + r) / 2.0) as f64 * per_px };
                     *drag = Drag::Scroll { x0: p.x, start };
                     Message::TimelinePan(start)
+                } else if p.y < CUTS && let Some((cut, t)) = self.effect_at(p, bounds) {
+                    Message::Effect(super::effects::EffectMsg::Jump(cut, t))
                 } else if p.y < CUTS && let Some((cut, key)) = self.sound_at(p, bounds) {
                     *drag = Drag::Sound { cut, key };
                     Message::SoundKeySelect(cut, key)
@@ -699,6 +717,15 @@ impl canvas::Program<Message> for Marks {
                 });
             }
         }
+        // Effect keyframes: small squares along the bottom of their cut.
+        for c in &self.blocks {
+            for &t in c.effects.iter().filter(|&&t| t >= c.start && t <= c.start + c.len) {
+                let x = self.x(c.from + t - c.start, bounds);
+                let mark = Path::rectangle(Point::new(x - 3.5, CUTS - EFFECT_ROW - 3.5), Size::new(7.0, 7.0));
+                frame.fill(&mark, EFFECT_MARK);
+                frame.stroke(&mark, Stroke::default().with_width(1.0).with_color(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.7)));
+            }
+        }
         // Crossfades: an X over each overlap, as on the music lane.
         for c in self.blocks.iter().filter(|c| c.crossfade > 0.0) {
             let (l, r) = (self.x(c.from, bounds), self.x(c.from + c.crossfade, bounds));
@@ -794,6 +821,9 @@ impl canvas::Program<Message> for Marks {
                 }
                 if self.sound_at(p, bounds).is_some() {
                     return mouse::Interaction::Grab;
+                }
+                if self.effect_at(p, bounds).is_some() {
+                    return mouse::Interaction::Pointer;
                 }
                 if state.ctrl && self.block_at(p.x, bounds).is_some() {
                     return mouse::Interaction::Crosshair;

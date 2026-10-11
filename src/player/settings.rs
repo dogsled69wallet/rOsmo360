@@ -22,6 +22,8 @@ pub struct Settings {
     pub aspect: Option<[u16; 2]>,
     /// Export each cut to its own file.
     pub export_clips: bool,
+    /// Apply the cuts' colour effects to those files.
+    pub export_graded: bool,
     pub export_format: Format,
 }
 
@@ -37,6 +39,7 @@ impl Default for Settings {
             resolution: Resolution::P1080,
             aspect: None,
             export_clips: false,
+            export_graded: false,
             export_format: Format::Mp4,
         }
     }

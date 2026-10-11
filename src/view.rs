@@ -91,7 +91,7 @@ impl View {
     }
 
     pub fn camera(&self) -> Camera {
-        Camera { user: self.matrix(), zoom: (self.fov.to_radians() / 2.0).tan(), planet: self.projection.planet() }
+        Camera { user: self.matrix(), zoom: (self.fov.to_radians() / 2.0).tan(), planet: self.projection.planet(), grade: Default::default() }
     }
 
     /// view_from_screen-ray: yaw about +y, then pitch about +x, then roll.
@@ -116,6 +116,8 @@ pub struct Camera {
     /// `Some(d)`: an azimuthal mapping from perspective (0) to little planet
     /// (1); in between is how one morphs into the other. `None`: equirect.
     pub planet: Option<f64>,
+    /// The colour effects on what it shows.
+    pub grade: crate::grade::Grade,
 }
 
 impl Camera {
@@ -194,6 +196,16 @@ pub enum Ease {
 
 impl Ease {
     pub const ALL: [Ease; 3] = [Ease::Smooth, Ease::Linear, Ease::Hold];
+
+    /// How far along the move from this keyframe to the next it is at
+    /// `x` (0..1) of the time between them; `None` while it holds.
+    pub fn shape(self, x: f64) -> Option<f64> {
+        match self {
+            Ease::Smooth => Some(x * x * (3.0 - 2.0 * x)),
+            Ease::Linear => Some(x),
+            Ease::Hold => None,
+        }
+    }
 }
 
 impl fmt::Display for Ease {
@@ -381,11 +393,7 @@ impl Keyframes {
         }
         let (a, b) = (&k[i - 1], &k[i]);
         let x = ((t - a.t) / (b.t - a.t)).clamp(0.0, 1.0);
-        let u = match a.ease {
-            Ease::Smooth => x * x * (3.0 - 2.0 * x),
-            Ease::Linear => x,
-            Ease::Hold => return Some(held(a)),
-        };
+        let Some(u) = a.ease.shape(x) else { return Some(held(a)) };
         let lerp = |p: f64, q: f64| p + (q - p) * u;
         let (va, mut vb) = (a.view_with(aim, t), b.view_with(aim, t));
         // Where a followed subject is is known only modulo a turn, so a move
@@ -593,7 +601,7 @@ mod tests {
 
     #[test]
     fn azimuthal_matches_perspective_and_planet() {
-        let cam = |planet| Camera { user: crate::stitch::IDENTITY, zoom: 0.7, planet: Some(planet) };
+        let cam = |planet| Camera { user: crate::stitch::IDENTITY, zoom: 0.7, planet: Some(planet), grade: Default::default() };
         let ndc = [0.3, -0.8];
         let (q, z) = ([0.3 * 1.5 * 0.7, -0.8 * 0.7], 0.7);
         let n = (q[0] * q[0] + q[1] * q[1] + 1.0f64).sqrt();

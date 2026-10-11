@@ -11,6 +11,7 @@ pub mod render;
 mod settings;
 mod source;
 mod thumbs;
+mod effects;
 mod music;
 mod timeline;
 
@@ -257,6 +258,8 @@ enum Message {
     Resolution(crate::Resolution),
     /// Export each cut to its own file.
     ExportClips(bool),
+    /// Grade those files with the cuts' effects.
+    ExportGraded(bool),
     /// Export for DaVinci Resolve (true) or as MP4.
     ExportResolve(bool),
     /// Export the edit: ask where (a file, or a folder for the clips), then
@@ -347,6 +350,8 @@ enum Message {
     Crossfade(usize, f64),
     /// Give the selected (or playing) cut a 1 s crossfade, or take its away.
     ToggleCrossfade,
+    /// From the Effects panel.
+    Effect(effects::EffectMsg),
     /// Delete the selected cut, or the selected music clip.
     DeleteCut,
     Undo,
@@ -424,6 +429,7 @@ struct App {
     resolution: crate::Resolution,
     /// Export each cut to its own file, and in which format.
     export_clips: bool,
+    export_graded: bool,
     export_format: ffmpeg::Format,
     /// A running export: its cancel flag and how far it has got.
     exporting: Option<(Arc<std::sync::atomic::AtomicBool>, f32)>,
@@ -459,6 +465,10 @@ struct App {
     /// Picking a colour to track: `Some(None)` until a box is drawn, then
     /// the box in fractions of the view.
     picking: Option<Option<Rectangle>>,
+    /// The box picks a white balance, not a colour to track.
+    picking_white: bool,
+    /// The Effects panel shows beside the view.
+    effects_open: bool,
     /// A running colour track: its cancel flag and progress, 0..1.
     tracking: Option<(Arc<std::sync::atomic::AtomicBool>, f32)>,
     /// The settings as last written, to save only when they change.
@@ -496,6 +506,7 @@ impl App {
             after_save: None,
             resolution: saved.resolution,
             export_clips: saved.export_clips,
+            export_graded: saved.export_graded,
             export_format: saved.export_format,
             exporting: None,
             clip: None,
@@ -513,6 +524,8 @@ impl App {
             aspect: saved.aspect.map_or(Aspect::Free, |[w, h]| Aspect::Ratio(w, h)),
             save_status: None,
             picking: None,
+            picking_white: false,
+            effects_open: false,
             tracking: None,
             saved_settings: saved,
         }
@@ -533,6 +546,7 @@ impl App {
                 Aspect::Ratio(w, h) => Some([w, h]),
             },
             export_clips: self.export_clips,
+            export_graded: self.export_graded,
             export_format: self.export_format,
         }
     }
@@ -719,7 +733,7 @@ impl App {
         // they were added and split in).
         let mut music = self.edit.music.clone();
         music.clips.sort_by(|a, b| a.at.total_cmp(&b.at));
-        Project { aspect, cuts: self.edit.cuts.clone(), sound: self.edit.sound, music }
+        Project { aspect, cuts: self.edit.cuts.clone(), sound: self.edit.sound, music, fades: self.edit.fades }
     }
 
     /// Renders the edit to `path` on its own thread with the export the
@@ -727,10 +741,19 @@ impl App {
     /// shape (16:9 when free), stabilised as the player is.
     fn start_export(&mut self, path: PathBuf) -> Task<Message> {
         use iced::futures::{SinkExt, StreamExt};
-        let project = self.to_project();
+        let mut project = self.to_project();
+        // Cuts with no keyframes of their own nor any before them show the
+        // view as it is; the export would frame them straight ahead. The
+        // first cut holding that view frames them all as seen (later ones
+        // carry an earlier cut's keyframes on).
+        if let Some(first) = project.cuts.first_mut()
+            && first.keyframes.is_empty()
+        {
+            first.keyframes = crate::view::Reframe::fixed(self.look).keyframes;
+        }
         let [w, h] = project.aspect.unwrap_or(crate::view::Aspect(16, 9)).size(self.resolution.short_side());
         let target = if self.export_clips {
-            crate::Target::Clips { dir: path, name: self.export_name(), handles: 0.0 }
+            crate::Target::Clips { dir: path, name: self.export_name(), handles: 0.0, graded: self.export_graded }
         } else {
             crate::Target::One(path.with_extension(self.export_format.extension()))
         };
@@ -925,12 +948,21 @@ impl App {
                     text("Export each cut to its own file, for another editor: \"<project> - 001\" and on, into a folder you pick; each music clip as a WAV beside them, unfaded"),
                     tooltip::Position::Bottom,
                 ),
+            ]
+            .push(self.export_clips.then(|| {
+                tip(
+                    checkbox(self.export_graded).label("Graded").on_toggle(Message::ExportGraded),
+                    text("Apply the cuts' colour effects to the clips too; left off, they're as shot, to grade in the other editor"),
+                    tooltip::Position::Bottom,
+                )
+            }))
+            .push(
                 tip(
                     checkbox(self.export_format == ffmpeg::Format::Resolve).label("Resolve").on_toggle(Message::ExportResolve),
                     text("For DaVinci Resolve, whose free Linux version can't read MP4's H.264 and AAC: DNxHR HQ with PCM sound in .mov. Large: about 27 MB a second at 1080p"),
                     tooltip::Position::Bottom,
                 ),
-            ]
+            )
             .spacing(6)
             .align_y(Alignment::Center)
             .into(),
@@ -1066,7 +1098,7 @@ impl App {
                 // Back to the start screen with an empty edit. Loaded clips
                 // stay in the library, so adding them again is instant; one
                 // still loading finishes there without becoming a cut.
-                self.edit.replace(Vec::new(), Default::default(), Default::default());
+                self.edit.replace(Vec::new(), Default::default(), Default::default(), Default::default());
                 self.selected_music = None;
                 self.selected_volume = None;
                 self.selected_sound = None;
@@ -1146,7 +1178,7 @@ impl App {
                 let waves: Vec<_> = music.clips.iter().map(|c| self.load_waveform(&c.input)).collect();
                 self.queue.extend(cuts.iter().map(|c| (c.input.clone(), false)));
                 let complete = missing.is_empty() && gone.is_empty();
-                self.edit.replace(cuts, music, project.sound);
+                self.edit.replace(cuts, music, project.sound, project.fades);
                 self.saved_version = if complete { self.edit.version } else { 0 };
                 self.project = Some(path);
                 self.selected_music = None;
@@ -1182,6 +1214,7 @@ impl App {
             }
             Message::Resolution(r) => self.resolution = r,
             Message::ExportClips(on) => self.export_clips = on,
+            Message::ExportGraded(on) => self.export_graded = on,
             Message::ExportResolve(on) => self.export_format = if on { ffmpeg::Format::Resolve } else { ffmpeg::Format::Mp4 },
             Message::Export => {
                 if self.edit.cuts.is_empty() || self.exporting.is_some() {
@@ -1218,7 +1251,9 @@ impl App {
                     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+            Message::Effect(e) => self.effect_message(e),
             Message::PickColour => {
+                self.picking_white = false;
                 if self.picking.take().is_none() && self.clip.is_some() {
                     self.with_playback(Playback::pause);
                     self.picking = Some(None);
@@ -1238,7 +1273,11 @@ impl App {
                 if area.width < 0.004 || area.height < 0.004 {
                     return Task::none();
                 }
-                if let Some((rgb, dir)) = self.sample_area(area, aspect) {
+                if std::mem::take(&mut self.picking_white) {
+                    if let Some((rgb, _)) = self.sample_area(area, aspect) {
+                        self.white_balance(rgb);
+                    }
+                } else if let Some((rgb, dir)) = self.sample_area(area, aspect) {
                     match crate::track::Colour::from_rgb(rgb, 18.0) {
                         Ok(colour) => return self.start_track(colour, crate::track::hex(rgb), dir),
                         Err(e) => self.error = Some(format!("{e:#}")),
@@ -1844,10 +1883,21 @@ impl App {
     /// The view on screen, ready to draw: mid-morph between perspective and
     /// little planet when following keyframes.
     fn camera(&self) -> Camera {
-        match self.playing_cut() {
+        let camera = match self.playing_cut() {
             Some((_, t)) if self.follow => self.keyframed(t).and_then(|(k, at)| k.camera_at(at, &crate::project::held(&|f, t| self.aim(f, t), at == t, t))).unwrap_or_else(|| self.look.camera()),
             _ => self.look.camera(),
-        }
+        };
+        let grade = self.playing_cut().map(|(_, t)| self.grade(self.current, t)).unwrap_or_default();
+        Camera { grade, ..camera }
+    }
+
+    /// Cut `i`'s colour effects at clip time `t`, faded to black where the
+    /// edit's fades are.
+    fn grade(&self, i: usize, t: f64) -> crate::grade::Grade {
+        let Some(cut) = self.edit.cuts.get(i) else { return Default::default() };
+        let mut grade = crate::grade::grade_at(&cut.effects, t);
+        grade.black = self.edit.fades.black(self.edit.edit_time(i, t), self.edit.duration());
+        grade
     }
 
     /// The 360 view as it should be drawn now, once a frame is decoded.
@@ -1879,6 +1929,7 @@ impl App {
         // holds from before), else the view as it is.
         let keyed = || crate::project::keyframed(&self.edit.cuts, *i, t).and_then(|(k, at)| k.camera_at(at, &crate::project::held(&|f, t| self.aim_in(&p.media, f, t), at == t, t)));
         let camera = if self.follow { keyed().unwrap_or_else(|| self.look.camera()) } else { self.look.camera() };
+        let camera = Camera { grade: self.grade(*i, t), ..camera };
         Some((p.media.rig.clone(), shown, camera, p.rig_from_view(self.rolling_shutter), self.crossfade_shares()?.1 as f32))
     }
 
@@ -1922,7 +1973,7 @@ impl App {
     /// ones leave playback where it is.
     fn add_cut(&mut self, input: PathBuf, duration: f64) {
         self.edit.checkpoint();
-        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None, volume: Vec::new(), crossfade: 0.0 });
+        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new() });
         let i = self.edit.cuts.len() - 1;
         self.selected = Some(i);
         if self.clip.is_none() {
@@ -2423,6 +2474,7 @@ impl App {
             None => center(column![self.logo(), text("Decoding…")].spacing(16).align_x(Alignment::Center)).into(),
         };
         let view = container(view).width(Length::Fill).height(Length::Fill).style(|_| container::background(iced::Color::BLACK));
+        let view: Element<'_, Message> = if self.effects_open { row![view, self.effects_panel()].into() } else { view.into() };
 
         let current = self.current_key();
         let aiming = current.map(|k| Aiming::of(&self.edit.cuts[self.current].keyframes[k].follow));
@@ -2441,7 +2493,7 @@ impl App {
                     let to = (all.partition_point(|(t, _)| *t <= c.end) + 1).min(all.len());
                     all[from..to].to_vec()
                 });
-                timeline::Block { labels: cut_labels(c, self.opts.stabilize), from, len: c.end - c.start, start: c.start, keys, sound: c.volume.clone(), thumbs, crossfade: c.crossfade }
+                timeline::Block { labels: cut_labels(c, self.opts.stabilize), from, len: c.end - c.start, start: c.start, keys, sound: c.volume.clone(), thumbs, crossfade: c.crossfade, effects: c.effects.iter().map(|k| k.t).collect() }
             })
             .collect();
         let (timeline_start, timeline_span) = self.timeline_window();
@@ -2520,6 +2572,11 @@ impl App {
             tip(
                 icon_button(PICK, (self.clip.is_some() && self.tracking.is_none()).then_some(Message::PickColour)),
                 text("Track a colour: draw a box over a subject (a jacket, a tent); the keyframe here then follows it"),
+                tooltip::Position::Top,
+            ),
+            tip(
+                icon_button(EFFECTS, Some(Message::Effect(effects::EffectMsg::Toggle))),
+                text(if self.effects_open { "Close the Effects panel" } else { "Effects: exposure, colour and tone of the cut, keyframed; fades for the edit" }),
                 tooltip::Position::Top,
             ),
             tip(
@@ -2644,6 +2701,10 @@ fn credit<'a>() -> Element<'a, Message> {
 }
 
 /// Edit icons: scissors (split), a bin (delete cut), arrows (undo, redo).
+/// Two film frames and a plus: give every cut this look.
+const TO_ALL_CUTS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="11" height="8" rx="1"/><rect x="6" y="9" width="11" height="8" rx="1"/><path d="M9 9v2M13 9v2M20 15v6M17 18h6"/></svg>"#;
+/// Three sliders (the Effects panel).
+const EFFECTS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3M14 2v4M8 10v4M16 18v4"/></svg>"#;
 /// Two strips crossing: one picture dissolving into the next.
 const CROSSFADE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="12" height="12" rx="2"/><rect x="10" y="6" width="12" height="12" rx="2" stroke-dasharray="2 2"/></svg>"#;
 const SPLIT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.1 15.9M14.5 14.5 20 20M8.1 8.1 12 12"/></svg>"#;

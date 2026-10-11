@@ -381,12 +381,14 @@ pub struct Mix<'a> {
     /// The edit's length: music running on is cut here, faded out over
     /// `project::END_FADE`.
     pub length: f64,
+    /// The edit's fades from and to black, the sound with the picture.
+    pub fades: crate::project::Fades,
 }
 
 impl Mix<'_> {
     /// Whether it changes anything.
     fn matters(&self) -> bool {
-        self.sound_db != 0.0 || !self.music.clips.is_empty()
+        self.sound_db != 0.0 || !self.music.clips.is_empty() || !self.fades.is_none()
     }
 }
 
@@ -537,6 +539,14 @@ fn mixed(cmd: &mut Command, audio: &[Sound<'_>], mix: &Mix<'_>) -> Result<String
         graph += &format!("{chain},adelay=delays={delay}:all=1,{}[m{input}];", level_filter(mix.music.volume, &mix.music.keyframes, "t"));
         parts.push(format!("[m{input}]"));
     }
-    graph += &format!("{}amix=inputs={}:duration=first:normalize=0[a]", parts.concat(), parts.len());
+    let mut fades = String::new();
+    if mix.fades.fade_in > 0.0 {
+        fades += &format!(",afade=t=in:st=0:d={}", mix.fades.fade_in.min(mix.length));
+    }
+    if mix.fades.fade_out > 0.0 {
+        let d = mix.fades.fade_out.min(mix.length);
+        fades += &format!(",afade=t=out:st={}:d={d}", mix.length - d);
+    }
+    graph += &format!("{}amix=inputs={}:duration=first:normalize=0{fades}[a]", parts.concat(), parts.len());
     Ok(graph)
 }

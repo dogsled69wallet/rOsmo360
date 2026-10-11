@@ -32,6 +32,33 @@ pub struct Project {
     pub sound: Sound,
     #[serde(default, skip_serializing_if = "Music::is_empty")]
     pub music: Music,
+    /// Fades from black at the start and to black at the end.
+    #[serde(default, skip_serializing_if = "Fades::is_none")]
+    pub fades: Fades,
+}
+
+/// The edit's fades from black at its start and to black at its end, in
+/// seconds, picture and sound together.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fades {
+    #[serde(default, rename = "in", skip_serializing_if = "is_zero")]
+    pub fade_in: f64,
+    #[serde(default, rename = "out", skip_serializing_if = "is_zero")]
+    pub fade_out: f64,
+}
+
+impl Fades {
+    pub fn is_none(&self) -> bool {
+        *self == Fades::default()
+    }
+
+    /// How far faded to black at edit time `t` of an edit `length` long,
+    /// 0..1.
+    pub fn black(&self, t: f64, length: f64) -> f64 {
+        let from = |d: f64, x: f64| if d > 0.0 { 1.0 - (x / d).clamp(0.0, 1.0) } else { 0.0 };
+        from(self.fade_in, t).max(from(self.fade_out, length - t))
+    }
 }
 
 /// The clips' own sound, as one track of the mix.
@@ -267,6 +294,9 @@ pub struct Cut {
     /// (picture and sound); the edit is that much shorter.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub crossfade: f64,
+    /// Its colour effects' keyframes, clip time, apart from the camera's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<crate::grade::EffectKey>,
 }
 
 impl Cut {
@@ -316,6 +346,12 @@ pub fn settle_crossfades(cuts: &mut [Cut]) {
 }
 
 impl Project {
+    /// How far faded to black cut `n` is at clip time `t`, 0..1.
+    pub fn black_at(&self, n: usize, t: f64) -> f64 {
+        let at = offsets(&self.cuts)[n] + t - self.cuts[n].start;
+        self.fades.black(at, self.duration())
+    }
+
     pub fn load(path: &Path) -> Result<Project> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut project: Project = serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
@@ -349,6 +385,12 @@ impl Project {
                 bail!("a volume point isn't a number");
             }
             keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+        }
+        for cut in &mut project.cuts {
+            if cut.effects.iter().any(|k| !k.t.is_finite() || k.grade.values().iter().any(|v| !v.is_finite())) {
+                bail!("an effect keyframe isn't a number");
+            }
+            cut.effects.sort_by(|a, b| a.t.total_cmp(&b.t));
         }
         Ok(project)
     }
@@ -398,7 +440,8 @@ pub fn keyframed(cuts: &[Cut], n: usize, t: f64) -> Option<(&Keyframes, f64)> {
 /// cut's clip at `t`, so a cut that holds an earlier cut's following view
 /// goes on following in its own footage.
 pub fn camera_at(cuts: &[Cut], n: usize, t: f64, aim: Aim) -> Camera {
-    keyframed(cuts, n, t).and_then(|(k, at)| k.camera_at(at, &held(aim, at == t, t))).unwrap_or_else(|| View::home(Projection::Perspective).camera())
+    let camera = keyframed(cuts, n, t).and_then(|(k, at)| k.camera_at(at, &held(aim, at == t, t))).unwrap_or_else(|| View::home(Projection::Perspective).camera());
+    Camera { grade: crate::grade::grade_at(&cuts[n].effects, t), ..camera }
 }
 
 /// `aim` for reading keyframes from `keyframed`: as asked in the cut's own

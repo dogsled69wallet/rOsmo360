@@ -48,6 +48,8 @@ struct Uniforms {
     field: [[f32; 4]; CELLS_PHI * CELLS_ALPHA / 4],
     /// Disagreement cut strength per azimuth bin, four per vector.
     cut: [[f32; 4]; CELLS_PHI / 4],
+    /// Colour effects (`Grade::uniforms`).
+    grade: [[f32; 4]; 3],
 }
 
 /// Numbers rigs and frames so each is uploaded once however often it is drawn.
@@ -328,6 +330,7 @@ impl Pipeline {
         let steps = rig_from_view.len().min(RS_STEPS_MAX);
         u.misc = [steps as f32, srgb as u8 as f32, origin[0], origin[1]];
         u.lenses = l.lens_u;
+        u.grade = camera.grade.uniforms();
         for (k, m) in rig_from_view.iter().take(steps).enumerate() {
             u.views[k * 3..k * 3 + 3].copy_from_slice(&rows(*m));
         }

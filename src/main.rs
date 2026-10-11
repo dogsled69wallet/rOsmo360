@@ -2,6 +2,7 @@ mod align;
 mod cache;
 mod dissolve;
 mod exposure;
+mod grade;
 mod ffmpeg;
 mod imu;
 mod player;
@@ -172,6 +173,11 @@ enum Cmd {
         /// for the other editor's transitions.
         #[arg(long, default_value_t = 0.0, requires = "clips")]
         handles: f64,
+        /// With --clips, apply the cuts' colour effects too (the whole edit
+        /// always has them; left off, the clips are as shot, to grade in
+        /// the other editor).
+        #[arg(long, requires = "clips")]
+        graded: bool,
         /// Stitch from the low-resolution proxy (LRF): a quick, soft draft.
         #[arg(long)]
         draft: bool,
@@ -631,7 +637,11 @@ impl Pipeline {
             Shot::Equirect(width) => stitch::equirect(&self.lenses, frames, width, self.only, &views, &seam),
             Shot::View { camera, size: (w, h) } => {
                 let ray = |x: f64, y: f64| stitch::apply(camera.user, camera.ray(w as f64 / h as f64, [x / w as f64 * 2.0 - 1.0, y / h as f64 * 2.0 - 1.0]));
-                stitch::render(&self.lenses, frames, (w, h), ray, self.only, &views, &seam)
+                let mut frame = stitch::render(&self.lenses, frames, (w, h), ray, self.only, &views, &seam);
+                if !camera.grade.is_neutral() {
+                    grade_frame(&mut frame, &camera.grade);
+                }
+                frame
             }
         }
     }
@@ -720,7 +730,7 @@ pub enum Target {
     /// external editor, and a WAV per music clip. Each runs `handles` seconds
     /// longer either side where its clip has the footage, for that editor's
     /// own transitions.
-    Clips { dir: PathBuf, name: String, handles: f64 },
+    Clips { dir: PathBuf, name: String, handles: f64, graded: bool },
 }
 
 /// Renders `project` as `out` says, with sound, and returns the files
@@ -802,7 +812,7 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
         // The whole edit gets its mix; a file per cut is for another editor,
         // so its sound is left as recorded and the music goes beside it.
         let length: f64 = cuts.clone().map(|n| (plan[n].2 - if n > cuts.start { overlap[n] } else { 0 }) as f64 / fps).sum();
-        let mix = ffmpeg::Mix { sound_db: project.sound.volume, music: &project.music, length };
+        let mix = ffmpeg::Mix { sound_db: project.sound.volume, music: &project.music, length, fades: project.fades };
         let mix = matches!(out.target, Target::One(_)).then_some(&mix);
         let mut encoder = ffmpeg::Encoder::new(&path, out.size, fps, &sound, mix, out.format)?;
         let mut sink = dissolve::Dissolve::new(&mut encoder);
@@ -812,9 +822,24 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
             sink.cut(frames, head, tail)?;
             let size = out.size;
             let mut tick = |n: usize| progress(done + n, total);
+            // Framed by its keyframes and graded by its effects (in the whole
+            // edit, faded to black at its ends; clips graded only if asked).
+            let (whole, graded) = match out.target {
+                Target::One(_) => (true, true),
+                Target::Clips { graded, .. } => (false, graded),
+            };
+            let camera = |t: f64| {
+                let mut c = project::camera_at(&project.cuts, n, t, &|f, t| pipelines[i].aim(f, t));
+                if !graded {
+                    c.grade = Default::default();
+                } else if whole {
+                    c.grade.black = project.black_at(n, t);
+                }
+                c
+            };
             let result = match &mut gpu {
-                Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut sink, |t| project::camera_at(&project.cuts, n, t, &|f, t| pipelines[i].aim(f, t)), size, &mut tick),
-                None => encode(&pipelines[i], start, Some(frames), &mut sink, |t| Shot::View { camera: project::camera_at(&project.cuts, n, t, &|f, t| pipelines[i].aim(f, t)), size }, &mut tick),
+                Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut sink, camera, size, &mut tick),
+                None => encode(&pipelines[i], start, Some(frames), &mut sink, |t| Shot::View { camera: camera(t), size }, &mut tick),
             };
             if let Err(e) = result {
                 drop(sink);
@@ -929,7 +954,7 @@ fn main() -> Result<()> {
             encoder.finish()?;
             eprintln!("wrote {}", output.display());
         }
-        Cmd::Export { input, framing, start, duration, resolution, aspect, size, output, format, clips, handles, draft, cpu, opts } => {
+        Cmd::Export { input, framing, start, duration, resolution, aspect, size, output, format, clips, handles, graded, draft, cpu, opts } => {
             let name = input.file_stem().map_or_else(|| "export".to_owned(), |s| s.to_string_lossy().into_owned());
             let project = if is_project(&input) {
                 if framing.reframe.is_some() || framing.view.is_some() || start.is_some() || duration.is_some() {
@@ -940,12 +965,12 @@ fn main() -> Result<()> {
                 // One clip is a project of one cut.
                 let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
                 let (start, end) = span(&input, start, duration, Some(&reframe))?;
-                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0 }], ..Default::default() }
+                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new() }], ..Default::default() }
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
             let target = if clips {
-                Target::Clips { dir: output.unwrap_or_else(|| PathBuf::from(&name)), name, handles }
+                Target::Clips { dir: output.unwrap_or_else(|| PathBuf::from(&name)), name, handles, graded }
             } else {
                 Target::One(output.unwrap_or_else(|| PathBuf::from(format!("clip.{}", format.extension()))))
             };
@@ -1076,6 +1101,22 @@ fn encode(p: &Pipeline, start: f64, total: Option<usize>, encoder: &mut dyn ffmp
         }
     }
     Ok(())
+}
+
+/// Grades a rendered frame on the CPU, as the shader does on the GPU.
+fn grade_frame(frame: &mut stitch::Frame, grade: &grade::Grade) {
+    let (w, h) = (frame.width, frame.height);
+    let aspect = w as f64 / h as f64;
+    frame.rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        for (x, px) in row.chunks_exact_mut(3).enumerate() {
+            // Pixel centres, as the shader's fragment positions.
+            let at = [(x as f64 + 0.5) / w as f64 * 2.0 - 1.0, (y as f64 + 0.5) / h as f64 * 2.0 - 1.0];
+            let out = grade.apply([px[0], px[1], px[2]].map(|v| v as f64 / 255.0), at, aspect);
+            for (p, v) in px.iter_mut().zip(out) {
+                *p = (v * 255.0).round() as u8;
+            }
+        }
+    });
 }
 
 fn save_png(path: &Path, f: &stitch::Frame) -> Result<()> {

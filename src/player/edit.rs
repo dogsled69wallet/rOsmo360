@@ -8,19 +8,20 @@
 //! through the overlap the earlier cut is the one located, the later one
 //! dissolving in over it.
 
-use crate::project::{Cut, Music, Sound};
+use crate::project::{Cut, Fades, Music, Sound};
 
 /// The shortest a split or trim may leave a cut, in seconds.
 pub const MIN_CUT: f64 = 0.2;
 
 /// What undo brings back: everything an edit changes.
-type Snapshot = (Vec<Cut>, Music, Sound);
+type Snapshot = (Vec<Cut>, Music, Sound, Fades);
 
 #[derive(Default)]
 pub struct Edit {
     pub cuts: Vec<Cut>,
     pub music: Music,
     pub sound: Sound,
+    pub fades: Fades,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     /// Counts changes, so the app can tell whether the edit was saved.
@@ -71,12 +72,12 @@ impl Edit {
     }
 
     fn snapshot(&self) -> Snapshot {
-        (self.cuts.clone(), self.music.clone(), self.sound)
+        (self.cuts.clone(), self.music.clone(), self.sound, self.fades)
     }
 
-    fn restore(&mut self, (cuts, music, sound): Snapshot) -> Snapshot {
+    fn restore(&mut self, (cuts, music, sound, fades): Snapshot) -> Snapshot {
         let now = self.snapshot();
-        (self.cuts, self.music, self.sound) = (cuts, music, sound);
+        (self.cuts, self.music, self.sound, self.fades) = (cuts, music, sound, fades);
         now
     }
 
@@ -105,10 +106,11 @@ impl Edit {
 
     /// Starts over with `cuts` and their music and mix (an opened or new
     /// project), forgetting undo.
-    pub fn replace(&mut self, cuts: Vec<Cut>, music: Music, sound: Sound) {
+    pub fn replace(&mut self, cuts: Vec<Cut>, music: Music, sound: Sound, fades: Fades) {
         self.cuts = cuts;
         self.music = music;
         self.sound = sound;
+        self.fades = fades;
         self.undo.clear();
         self.redo.clear();
         self.version += 1;
@@ -172,7 +174,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn cut(name: &str, start: f64, end: f64) -> Cut {
-        Cut { input: PathBuf::from(name), start, end, keyframes: Default::default(), stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0 }
+        Cut { input: PathBuf::from(name), start, end, keyframes: Default::default(), stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new() }
     }
 
     fn edit() -> Edit {
