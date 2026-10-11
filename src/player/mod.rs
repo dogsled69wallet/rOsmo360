@@ -11,6 +11,7 @@ pub mod render;
 mod settings;
 mod source;
 mod thumbs;
+mod music;
 mod timeline;
 
 use crate::ffmpeg::{self, Hwaccel};
@@ -269,6 +270,21 @@ enum Message {
     ExportCancel,
     /// Starts (or stops) drawing a box over a subject to track its colour.
     PickColour,
+    /// Pick a song for the music track.
+    AddMusic,
+    MusicPicked(Option<PathBuf>),
+    /// A song's waveform, read off the UI thread.
+    Waveform(PathBuf, Result<Arc<music::Waveform>, String>),
+    SelectMusic(usize),
+    /// Music clip `i` dragged to start at this edit time.
+    MusicMove(usize, f64),
+    /// Music clip `i`'s in (`true`) or out edge dragged to this song time.
+    MusicTrim(usize, bool, f64),
+    /// The mix: the clips' sound and the music track, in dB.
+    SoundLevel(f64),
+    MusicLevel(f64),
+    /// A level slider let go.
+    LevelDone,
     /// Start an empty edit (asking first if there are unsaved changes).
     NewProject,
     /// A redraw while clips load, for the loading bar.
@@ -352,6 +368,10 @@ struct App {
     library: Vec<Media>,
     /// Each clip's timeline thumbnails by clip time, as they arrive.
     thumbs: std::collections::HashMap<PathBuf, Vec<(f64, image::Handle)>>,
+    /// Songs' waveforms, and the music clip selected on its lane.
+    waveforms: std::collections::HashMap<PathBuf, Arc<music::Waveform>>,
+    selected_music: Option<usize>,
+    music: music::Player,
     edit: edit::Edit,
     /// The cut being played, and the one selected on the timeline.
     current: usize,
@@ -429,6 +449,9 @@ impl App {
             logo: image::Handle::from_bytes(LOGO),
             library: Vec::new(),
             thumbs: Default::default(),
+            waveforms: Default::default(),
+            selected_music: None,
+            music: Default::default(),
             edit: edit::Edit::default(),
             current: 0,
             selected: None,
@@ -489,12 +512,48 @@ impl App {
     /// Handles `message`, then saves the settings if it changed any.
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
+        self.follow_music();
         let now = self.settings();
         if now != self.saved_settings {
             now.save();
             self.saved_settings = now;
         }
         task
+    }
+
+    /// Keeps the music in step with the edit: playing where playback is, at
+    /// its level, or stopped while playback is.
+    fn follow_music(&mut self) {
+        let listen = self.volume();
+        let (playing, t) = match &self.clip {
+            // Only while the clock runs: waiting for its first frame it stands
+            // still, and music started then took it as drift and restarted
+            // over and over until the picture came.
+            Some(c) if self.current < self.edit.cuts.len() => (c.playback.running(), self.edit.edit_time(self.current, c.playback.now())),
+            _ => (false, 0.0),
+        };
+        self.music.follow(&self.edit.music, t, self.edit.duration(), listen, playing);
+    }
+
+    /// The clips' sound at the speakers: the listening volume and its level
+    /// in the mix.
+    fn clip_volume(&self) -> f32 {
+        self.volume() * music::gain(self.edit.sound.volume)
+    }
+
+    /// Reads `path`'s waveform for the music lane, unless it has it.
+    fn load_waveform(&self, path: &Path) -> Task<Message> {
+        if self.waveforms.contains_key(path) {
+            return Task::none();
+        }
+        let path = path.to_owned();
+        Task::perform(
+            blocking({
+                let path = path.clone();
+                move || music::Waveform::read(&path).map(Arc::new).map_err(|e| format!("{e:#}"))
+            }),
+            move |r| Message::Waveform(path.clone(), r),
+        )
     }
 
     /// What the speakers get: nothing while muted, so unmuting restores
@@ -532,7 +591,7 @@ impl App {
             Aspect::Free => None,
             Aspect::Ratio(w, h) => Some(crate::view::Aspect(w.into(), h.into())),
         };
-        Project { aspect, cuts: self.edit.cuts.clone() }
+        Project { aspect, cuts: self.edit.cuts.clone(), sound: self.edit.sound, music: self.edit.music.clone() }
     }
 
     /// Renders the edit to `path` on its own thread with the export the
@@ -781,7 +840,12 @@ impl App {
     }
 
     fn unsaved(&self) -> bool {
-        self.edit.version != self.saved_version && !self.edit.cuts.is_empty()
+        self.edit.version != self.saved_version && self.has_edit()
+    }
+
+    /// Whether there is anything to save: cuts, or music to fill.
+    fn has_edit(&self) -> bool {
+        !self.edit.cuts.is_empty() || !self.edit.music.clips.is_empty()
     }
 
     /// Parses the clip and probes the decoder off the UI thread.
@@ -874,7 +938,8 @@ impl App {
                 // Back to the start screen with an empty edit. Loaded clips
                 // stay in the library, so adding them again is instant; one
                 // still loading finishes there without becoming a cut.
-                self.edit.replace(Vec::new());
+                self.edit.replace(Vec::new(), Default::default(), Default::default());
+                self.selected_music = None;
                 self.saved_version = self.edit.version;
                 self.project = None;
                 self.clip = None;
@@ -939,22 +1004,34 @@ impl App {
                 self.clip = None;
                 self.current = 0;
                 self.selected = None;
-                self.queue.extend(cuts.iter().map(|c| (c.input.clone(), false)));
-                self.edit.replace(cuts);
-                self.saved_version = if missing.is_empty() { self.edit.version } else { 0 };
-                self.project = Some(path);
-                if self.loading.is_none() {
-                    return self.open_next();
+                // Music that's gone is left out the same way.
+                let mut music = project.music;
+                let (here, gone): (Vec<_>, Vec<_>) = music.clips.into_iter().partition(|c| c.input.exists());
+                music.clips = here;
+                if !gone.is_empty() {
+                    let names: Vec<_> = gone.iter().map(|c| c.input.display().to_string()).collect();
+                    let said = self.error.take().map_or(String::new(), |e| e + ". ");
+                    self.error = Some(format!("{said}Left out missing music: {}", names.join(", ")));
                 }
+                let waves: Vec<_> = music.clips.iter().map(|c| self.load_waveform(&c.input)).collect();
+                self.queue.extend(cuts.iter().map(|c| (c.input.clone(), false)));
+                let complete = missing.is_empty() && gone.is_empty();
+                self.edit.replace(cuts, music, project.sound);
+                self.saved_version = if complete { self.edit.version } else { 0 };
+                self.project = Some(path);
+                self.selected_music = None;
+                let next = if self.loading.is_none() { self.open_next() } else { Task::none() };
+                return Task::batch(waves.into_iter().chain([next]));
             }
             Message::SaveProject(as_new) => {
-                if self.edit.cuts.is_empty() {
+                if !self.has_edit() {
                     return Task::none();
                 }
                 if let (Some(path), false) = (&self.project, as_new) {
                     return self.update(Message::SaveProjectTo(Some(path.clone())));
                 }
-                let first = &self.edit.cuts[0].input;
+                // Named after the first clip, or the song a project starts from.
+                let first = self.edit.cuts.first().map(|c| &c.input).or(self.edit.music.clips.first().map(|c| &c.input)).unwrap();
                 let dir = self.project.as_ref().unwrap_or(first).parent().map(Path::to_owned);
                 let name = self.project.as_ref().and_then(|p| p.file_name()).map_or_else(
                     || format!("{}_edit.json", first.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()),
@@ -1120,7 +1197,77 @@ impl App {
                 self.dragging = false;
                 self.with_playback(Playback::scrub_end);
             }
-            Message::Select(i) => self.selected = Some(i),
+            Message::Select(i) => {
+                self.selected = Some(i);
+                self.selected_music = None;
+            }
+            Message::AddMusic => {
+                let dir = self.project.as_ref().and_then(|p| p.parent().map(Path::to_owned));
+                return Task::perform(
+                    async move {
+                        let mut dialog = rfd::AsyncFileDialog::new()
+                            .set_title("Add music")
+                            .add_filter("Music", &["mp3", "MP3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma"]);
+                        if let Some(dir) = dir {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog.pick_file().await.map(|f| f.path().to_owned())
+                    },
+                    Message::MusicPicked,
+                );
+            }
+            Message::MusicPicked(None) => {}
+            Message::MusicPicked(Some(path)) => {
+                // Its length comes with the waveform; until then a stand-in
+                // that the waveform corrects.
+                let duration = ffmpeg::duration(&path).unwrap_or(60.0);
+                self.edit.checkpoint();
+                // One song for now: it replaces the one there, from the start.
+                self.edit.music.clips = vec![crate::project::MusicClip { input: path.clone(), at: 0.0, start: 0.0, end: duration, fade_in: 0.0, fade_out: 0.0 }];
+                self.selected_music = Some(0);
+                self.selected = None;
+                return self.load_waveform(&path);
+            }
+            Message::Waveform(path, Ok(wave)) => {
+                self.waveforms.insert(path, wave);
+            }
+            Message::Waveform(path, Err(e)) => self.error = Some(format!("Can't read {}: {e}", path.display())),
+            Message::SelectMusic(i) => {
+                self.selected_music = Some(i);
+                self.selected = None;
+            }
+            Message::MusicMove(i, at) => {
+                self.begin_drag();
+                if let Some(c) = self.edit.music.clips.get_mut(i) {
+                    c.at = at.max(0.0);
+                }
+            }
+            Message::MusicTrim(i, in_edge, t) => {
+                self.begin_drag();
+                let song = self.edit.music.clips.get(i).and_then(|c| self.waveforms.get(&c.input)).map_or(f64::INFINITY, |w| w.duration);
+                if let Some(c) = self.edit.music.clips.get_mut(i) {
+                    if in_edge {
+                        // The song stays put on the edit: trimming its start
+                        // moves where the clip begins, not what plays when.
+                        let start = t.clamp((c.start - c.at).max(0.0), c.end - edit::MIN_CUT);
+                        c.at += start - c.start;
+                        c.start = start;
+                    } else {
+                        c.end = t.clamp(c.start + edit::MIN_CUT, song);
+                    }
+                }
+            }
+            Message::SoundLevel(db) => {
+                self.begin_drag();
+                self.edit.sound.volume = db;
+                let v = self.clip_volume();
+                self.with_playback(|p| p.set_volume(v));
+            }
+            Message::MusicLevel(db) => {
+                self.begin_drag();
+                self.edit.music.volume = db;
+            }
+            Message::LevelDone => self.dragging = false,
             Message::Trim(i, start, t) => {
                 let Some(clip_len) = self.edit.cuts.get(i).and_then(|c| self.library.iter().find(|m| m.input == c.input)).map(|m| m.duration) else {
                     return Task::none();
@@ -1334,12 +1481,13 @@ impl App {
             },
             Message::Mute => {
                 self.muted = !self.muted;
-                let v = self.volume();
+                let v = self.clip_volume();
                 self.with_playback(|p| p.set_volume(v));
             }
             Message::Volume(v) => {
                 self.volume = v;
                 self.muted = false;
+                let v = self.clip_volume();
                 self.with_playback(|p| p.set_volume(v));
             }
             Message::ResetView => self.free_look().reset(),
@@ -1485,7 +1633,7 @@ impl App {
                 let Some(media) = self.library.iter().find(|m| m.input == cut.input) else { return };
                 let mut media = media.clone();
                 media.osv_size = self.opts.osv_size;
-                let mut playback = Playback::new(media, self.volume(), self.full_on_pause);
+                let mut playback = Playback::new(media, self.clip_volume(), self.full_on_pause);
                 playback.jump(t, play);
                 self.clip = Some(Clip { playback, shown: None });
             }
@@ -1560,7 +1708,7 @@ impl App {
     }
 
     fn tick(&mut self) {
-        let volume = self.volume();
+        let volume = self.clip_volume();
         let Some(c) = &mut self.clip else { return };
         if let Some((frame, fix)) = c.playback.tick() {
             c.shown = Some(Arc::new(Shown::new(frame, fix)));
@@ -1643,14 +1791,14 @@ impl App {
 
     /// The stretch of edit time the timeline shows: (start, span).
     fn timeline_window(&self) -> (f64, f64) {
-        let d = self.edit.duration();
+        let d = self.edit.frame();
         let span = (d / self.timeline_zoom).max(TIMELINE_SPAN.min(d));
         (self.timeline_start.clamp(0.0, (d - span).max(0.0)), span)
     }
 
     /// The closest zoom: `TIMELINE_SPAN` seconds across.
     fn timeline_most_zoom(&self) -> f64 {
-        (self.edit.duration() / TIMELINE_SPAN).max(1.0)
+        (self.edit.frame() / TIMELINE_SPAN).max(1.0)
     }
 
     /// Zooms the timeline keeping `anchor` in place: by default the playhead
@@ -1695,6 +1843,13 @@ impl App {
             Key::Named(Named::ArrowDown) => self.free_look().pitch -= step,
             Key::Named(Named::Home) => self.free_look().reset(),
             Key::Named(Named::Delete | Named::Backspace) if mods.shift() => return self.update(Message::DeleteCut),
+            Key::Named(Named::Delete | Named::Backspace) if self.selected_music.is_some() => {
+                let i = self.selected_music.take().unwrap();
+                if i < self.edit.music.clips.len() {
+                    self.edit.checkpoint();
+                    self.edit.music.clips.remove(i);
+                }
+            }
             Key::Named(Named::Delete | Named::Backspace) => return self.update(Message::KeyDelete),
             Key::Character(c) => match c {
                 "o" | "O" if mods.command() && mods.shift() => return self.update(Message::OpenProject),
@@ -1782,13 +1937,21 @@ impl App {
         let open_hint = if self.edit.cuts.is_empty() { "Open clips (Ctrl+O)" } else { "Add clips to the edit as cuts (Ctrl+O)" };
         let error = self.error.as_ref().map(|e| text(e.clone()).style(text::danger));
         let Some(clip) = &self.clip else {
-            let status: Element<'_, Message> = match &self.loading {
-                Some(_) => self.loading_bar(280.0),
-                None => text("Open DJI Osmo 360 .OSV clips, or a saved project, to start.").into(),
+            // Music first: the song is chosen and sets the length to fill.
+            let song = self.edit.music.clips.first().map(|c| {
+                let name = c.input.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+                format!("Music: {name} ({}). Add clips to fill it.", clock(self.edit.music.end()))
+            });
+            let status: Element<'_, Message> = match (&self.loading, song) {
+                (Some(_), _) => self.loading_bar(280.0),
+                (None, Some(song)) => text(song).into(),
+                (None, None) => text("Open DJI Osmo 360 .OSV clips, or a saved project, to start. Or start from a song.").into(),
             };
+            let idle = self.loading.is_none();
             let buttons = row![
-                labelled_button(ADD_CLIP, "Open clips…", (self.loading.is_none()).then_some(Message::Open)),
-                labelled_button(OPEN_PROJECT, "Open project…", (self.loading.is_none()).then_some(Message::OpenProject)),
+                labelled_button(ADD_CLIP, "Open clips…", idle.then_some(Message::Open)),
+                labelled_button(OPEN_PROJECT, "Open project…", idle.then_some(Message::OpenProject)),
+                labelled_button(ADD_MUSIC, "Add music…", idle.then_some(Message::AddMusic)),
             ]
             .spacing(12);
             let start = center(column![self.logo(), status, buttons].push(error).spacing(16).align_x(Alignment::Center));
@@ -1821,6 +1984,11 @@ impl App {
         let top = row![
             tip(icon_button(NEW_PROJECT, Some(Message::NewProject)), text("Start a new, empty project (Ctrl+N)"), tooltip::Position::Bottom),
             tip(icon_button(ADD_CLIP, Some(Message::Open)), text(open_hint), tooltip::Position::Bottom),
+            tip(
+                icon_button(ADD_MUSIC, Some(Message::AddMusic)),
+                text(if self.edit.music.clips.is_empty() { "Add music under the edit" } else { "Replace the music" }),
+                tooltip::Position::Bottom,
+            ),
             tip(icon_button(OPEN_PROJECT, Some(Message::OpenProject)), text("Open a saved edit (Ctrl+Shift+O)"), tooltip::Position::Bottom),
             tip(
                 icon_button(SAVE, self.unsaved().then_some(Message::SaveProject(false))),
@@ -1892,9 +2060,25 @@ impl App {
             })
             .collect();
         let (timeline_start, timeline_span) = self.timeline_window();
+        let music = self
+            .edit
+            .music
+            .clips
+            .iter()
+            .map(|c| timeline::MusicBlock {
+                label: c.input.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned()),
+                from: c.at,
+                start: c.start,
+                len: c.end - c.start,
+                wave: self.waveforms.get(&c.input).cloned(),
+            })
+            .collect();
         let timeline = timeline::Timeline {
             blocks,
-            duration: self.edit.duration(),
+            music,
+            selected_music: self.selected_music,
+            video: self.edit.duration(),
+            duration: self.edit.frame(),
             start: timeline_start,
             span: timeline_span,
             position: self.position(),
@@ -1989,6 +2173,32 @@ impl App {
             labelled("Projection", pick_list(&Projection::ALL[..], Some(shown_view.projection), Message::Projection)),
             labelled("Playback source", pick_list(sources, Some(source), Message::Source)),
             labelled("FOV", slider(lo..=hi, shown_view.fov, Message::Fov).width(120)),
+            tip(
+                labelled(
+                    "Clip sound",
+                    row![
+                        slider(crate::project::OFF_DB..=6.0, self.edit.sound.volume, Message::SoundLevel).step(0.5).on_release(Message::LevelDone).width(100),
+                        text(db_label(self.edit.sound.volume)).width(70),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                ),
+                text("The clips' own sound in the mix, and in the export"),
+                tooltip::Position::Top,
+            ),
+            tip(
+                labelled(
+                    "Music",
+                    row![
+                        slider(crate::project::OFF_DB..=6.0, self.edit.music.volume, Message::MusicLevel).step(0.5).on_release(Message::LevelDone).width(100),
+                        text(db_label(self.edit.music.volume)).width(70),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                ),
+                text("The music track in the mix, and in the export"),
+                tooltip::Position::Top,
+            ),
             toggler(self.rolling_shutter).label("Rolling shutter").on_toggle(Message::RollingShutter),
             tip(
                 toggler(self.full_on_pause).label("Full res when paused").on_toggle(Message::FullOnPause),
@@ -2055,8 +2265,9 @@ const KEY_ADD: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
 const KEY_DELETE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M10 2 18 10 10 18 2 10z"/><path d="m16 16 6 6M22 16l-6 6" stroke-linecap="round"/></svg>"#;
 
 /// File icons: a page with a plus (new project), a film strip with a plus
-/// (open or add clips), an open folder (open a project), a diskette (save)
-/// and one with a pencil (save as).
+/// (open or add clips), a note with a plus (add music), an open folder (open
+/// a project), a diskette (save) and one with a pencil (save as).
+const ADD_MUSIC: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l10-2v9"/><circle cx="6" cy="18" r="3"/><path d="M19 15v6M16 18h6"/></svg>"#;
 const NEW_PROJECT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4M9 15h6M12 18v-6"/></svg>"#;
 const ADD_CLIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="14" height="18" rx="2"/><path d="M6 3v18M12 3v18M2 8h4M2 16h4M12 8h4M12 16h4M20 9v6M17 12h6"/></svg>"#;
 const OPEN_PROJECT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>"#;
@@ -2091,6 +2302,11 @@ fn tip<'a>(content: impl Into<Element<'a, Message>>, hint: iced::widget::Text<'a
 
 fn icon_button<'a>(icon: &'static [u8], on_press: Option<Message>) -> Element<'a, Message> {
     button(svg(svg::Handle::from_memory(icon)).width(20).height(20)).padding(5).on_press_maybe(on_press).into()
+}
+
+/// A mix level for its slider: the bottom of the range is silence.
+fn db_label(db: f64) -> String {
+    if db <= crate::project::OFF_DB { "off".to_owned() } else { format!("{db:+.1} dB") }
 }
 
 /// A status icon, dimmed towards the background so it stays out of the

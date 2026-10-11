@@ -270,6 +270,12 @@ impl Playback {
         }
     }
 
+    /// Whether the clock is running: playing, and not waiting for the first
+    /// frame (and the sound with it) after a start or seek.
+    pub fn running(&self) -> bool {
+        self.playing && !self.sound_waits
+    }
+
     /// The playback clock: where playback is now, between frames too.
     pub fn now(&self) -> f64 {
         self.clock()

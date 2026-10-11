@@ -6,6 +6,11 @@
 //! timeline: moving a cut keeps its camera moves, and trimming one keeps
 //! each keyframe on the same moment of footage. Keyframes outside the cut's
 //! in and out points are kept, so extending the cut again brings them back.
+//!
+//! Music is the other way round: its clips sit at times on the edit, so
+//! cutting the video to the music leaves the music where it is. It is cut
+//! on its own lane, and the edit ends with the last video cut, the music
+//! faded out there if it runs on.
 
 use crate::stab::Mode;
 use crate::view::{Aim, Aspect, Camera, Keyframes, Projection, View};
@@ -19,7 +24,86 @@ pub struct Project {
     /// The picture's shape, width:height.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aspect: Option<Aspect>,
+    /// None yet when a project starts from its music.
+    #[serde(default)]
     pub cuts: Vec<Cut>,
+    /// The clips' own sound in the mix.
+    #[serde(default, skip_serializing_if = "Sound::is_default")]
+    pub sound: Sound,
+    #[serde(default, skip_serializing_if = "Music::is_empty")]
+    pub music: Music,
+}
+
+/// The clips' own sound, as one track of the mix.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sound {
+    /// Level in dB; 0 is as recorded.
+    #[serde(default)]
+    pub volume: f64,
+}
+
+impl Sound {
+    fn is_default(&self) -> bool {
+        *self == Sound::default()
+    }
+}
+
+/// The music track: clips of songs placed on the edit's timeline.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Music {
+    /// The track's level in dB; 0 is as the files are.
+    #[serde(default)]
+    pub volume: f64,
+    #[serde(default)]
+    pub clips: Vec<MusicClip>,
+}
+
+impl Music {
+    pub fn is_empty(&self) -> bool {
+        self.clips.is_empty() && self.volume == 0.0
+    }
+
+    /// Where the last clip ends on the edit, in seconds.
+    pub fn end(&self) -> f64 {
+        self.clips.iter().map(|c| c.at + c.end - c.start).fold(0.0, f64::max)
+    }
+}
+
+/// A stretch of a song at a place on the edit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MusicClip {
+    /// The file; a relative path is relative to the project file.
+    pub input: PathBuf,
+    /// Where it starts on the edit, in seconds.
+    pub at: f64,
+    /// In and out points in the song, in seconds.
+    #[serde(rename = "in")]
+    pub start: f64,
+    #[serde(rename = "out")]
+    pub end: f64,
+    /// Fades at its own start and end, in seconds.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fade_in: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fade_out: f64,
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// Music running on past the last cut fades out over this long before it.
+pub const END_FADE: f64 = 3.0;
+
+/// A level at or below this is off: the sliders' bottom is silence.
+pub const OFF_DB: f64 = -40.0;
+
+/// A mix level in dB as a gain factor.
+pub fn gain(db: f64) -> f64 {
+    if db <= OFF_DB { 0.0 } else { 10f64.powf(db / 20.0) }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,7 +132,8 @@ impl Project {
     pub fn load(path: &Path) -> Result<Project> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut project: Project = serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
-        if project.cuts.is_empty() {
+        // Music alone is a start: its length is the frame to fill.
+        if project.cuts.is_empty() && project.music.clips.is_empty() {
             bail!("{} has no cuts", path.display());
         }
         let dir = path.parent().unwrap_or(Path::new(""));
@@ -60,6 +145,12 @@ impl Project {
             for track in cut.keyframes.tracks_mut() {
                 *track = dir.join(&*track);
             }
+        }
+        for (n, clip) in project.music.clips.iter_mut().enumerate() {
+            if clip.end <= clip.start || clip.at < 0.0 {
+                bail!("music clip {} is empty or starts before the edit", n + 1);
+            }
+            clip.input = dir.join(&clip.input);
         }
         Ok(project)
     }
@@ -77,6 +168,11 @@ impl Project {
                 if let Ok(rel) = track.strip_prefix(dir) {
                     *track = rel.to_owned();
                 }
+            }
+        }
+        for clip in &mut project.music.clips {
+            if let Ok(rel) = clip.input.strip_prefix(dir) {
+                clip.input = rel.to_owned();
             }
         }
         std::fs::write(path, serde_json::to_string_pretty(&project)? + "\n").with_context(|| format!("writing {}", path.display()))
@@ -146,6 +242,28 @@ mod tests {
         assert!(text.contains(r#""input": "a.OSV""#) && text.contains(r#""follow": "friend.csv""#));
         assert_eq!(Project::load(&saved).unwrap(), p);
         std::fs::write(&path, r#"{"cuts": [{"input": "a.OSV", "in": 5, "out": 2}]}"#).unwrap();
+        assert!(Project::load(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn music_sits_on_the_edit_relative_to_the_file() {
+        let dir = std::env::temp_dir().join(format!("rosmo360-music-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edit.json");
+        // Music alone is a project: the song is the frame to fill.
+        std::fs::write(&path, r#"{"music": {"volume": -3, "clips": [{"input": "song.mp3", "at": 2, "in": 60, "out": 200, "fade_in": 1.5}]}}"#).unwrap();
+        let p = Project::load(&path).unwrap();
+        assert_eq!((p.cuts.len(), p.sound.volume, p.music.volume), (0, 0.0, -3.0));
+        assert_eq!(p.music.clips[0].input, dir.join("song.mp3"));
+        assert_eq!(p.music.end(), 142.0);
+        p.save(&dir.join("again.json")).unwrap();
+        let text = std::fs::read_to_string(dir.join("again.json")).unwrap();
+        assert!(text.contains(r#""input": "song.mp3""#) && !text.contains("fade_out") && !text.contains("sound"));
+        assert_eq!(Project::load(&dir.join("again.json")).unwrap(), p);
+        // Without music or sound settings nothing is written for them.
+        assert!(!serde_json::to_string(&Project::default()).unwrap().contains("music"));
+        std::fs::write(&path, r#"{"music": {"clips": [{"input": "song.mp3", "at": 0, "in": 9, "out": 9}]}}"#).unwrap();
         assert!(Project::load(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }

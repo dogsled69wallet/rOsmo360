@@ -4,11 +4,15 @@
 //! cut's keyframes as diamonds (shaped by their ease): click the bar to seek,
 //! click a diamond to jump to it, drag one to retime it.
 //!
+//! Under the seek bar is the music lane: the music track's clips with their
+//! waveforms, moved and trimmed like cuts, and a line where the video ends
+//! (music beyond it fades out in the export).
+//!
 //! It shows a window of the edit: the wheel zooms around the pointer, Shift
 //! or a sideways wheel pans, and when zoomed in a scrollbar at the bottom
 //! shows and moves the window.
 
-use super::{Message, thumbs};
+use super::{Message, music, thumbs};
 use crate::view::Ease;
 use iced::alignment::Vertical;
 use iced::mouse;
@@ -25,10 +29,14 @@ const BAR: f32 = 8.0;
 /// The cut row's height, and the gap between cut blocks.
 const CUTS: f32 = 40.0;
 const GAP: f32 = 2.0;
+/// The seek bar's row and the music lane's, under the cuts.
+const SEEK: f32 = 28.0;
+const MUSIC: f32 = 24.0;
+const MUSIC_TOP: f32 = CUTS + SEEK;
 /// The scrollbar's row at the bottom, and the bar's thickness.
 const SCROLL: f32 = 8.0;
 const SCROLL_BAR: f32 = 5.0;
-pub const HEIGHT: f32 = 76.0;
+pub const HEIGHT: f32 = CUTS + SEEK + MUSIC + SCROLL;
 /// A press on a cut that moves less than this is a click, not a drag.
 const DRAG_FROM: f32 = 4.0;
 
@@ -61,8 +69,23 @@ impl Block {
     }
 }
 
+/// A music clip as the music lane shows it.
+pub struct MusicBlock {
+    pub label: String,
+    /// Where it starts on the edit, its in point in the song, and its length.
+    pub from: f64,
+    pub start: f64,
+    pub len: f64,
+    /// The song's waveform, once read.
+    pub wave: Option<Arc<music::Waveform>>,
+}
+
 pub struct Timeline {
     pub blocks: Vec<Block>,
+    pub music: Vec<MusicBlock>,
+    pub selected_music: Option<usize>,
+    /// Where the video ends; `duration` runs on to the music's end if later.
+    pub video: f64,
     pub duration: f64,
     /// The stretch of edit time shown: from `start`, `span` seconds.
     pub start: f64,
@@ -87,6 +110,11 @@ pub enum Drag {
     Move { cut: usize, x0: f32, moved: bool, to: usize },
     /// Dragging the scrollbar, which was at `start` when pressed at `x0`.
     Scroll { x0: f32, start: f64 },
+    /// Moving music clip `clip`, which started at `at` when pressed at `x0`.
+    MusicMove { clip: usize, x0: f32, at: f64, per_px: f64 },
+    /// Trimming music clip `clip`'s in (`start`) or out edge, at song time
+    /// `from` when pressed.
+    MusicTrim { clip: usize, start: bool, x0: f32, from: f64, per_px: f64 },
 }
 
 #[derive(Default)]
@@ -156,6 +184,25 @@ impl Timeline {
         }
     }
 
+    fn music_at(&self, x: f32, b: Rectangle) -> Option<usize> {
+        self.music.iter().position(|m| x >= self.x(m.from, b) && x <= self.x(m.from + m.len, b))
+    }
+
+    /// Whether `x` is on music clip `i`'s in edge (`Some(true)`) or out edge.
+    fn music_edge_at(&self, i: usize, x: f32, b: Rectangle) -> Option<bool> {
+        let m = &self.music[i];
+        let (l, r) = (self.x(m.from, b), self.x(m.from + m.len, b));
+        if r - l < 3.0 * PICK {
+            Some(x - l < r - x)
+        } else if x - l <= PICK {
+            Some(true)
+        } else if r - x <= PICK {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// Where a moved cut would land: before the first cut whose middle is
     /// right of `x`.
     fn drop_at(&self, x: f32, b: Rectangle) -> usize {
@@ -177,6 +224,67 @@ impl Timeline {
         // Zoomed in, what is outside the window is drawn outside the widget;
         // canvases don't clip, so the container does.
         iced::widget::container(layers).clip(true).into()
+    }
+
+    /// The music lane: its clips with their waveforms and handles, and where
+    /// the video ends, the music past it dimmed (it fades out there).
+    fn draw_music(&self, frame: &mut Frame, theme: &Theme, b: Rectangle) {
+        let palette = theme.extended_palette();
+        let (top, h) = (MUSIC_TOP + 2.0, MUSIC - 4.0);
+        let lane = Path::rounded_rectangle(Point::new(self.x(0.0, b), top), Size::new((self.x(self.duration, b) - self.x(0.0, b)).max(0.0), h), 4.0.into());
+        frame.fill(&lane, palette.background.weak.color.scale_alpha(0.5));
+        for (i, m) in self.music.iter().enumerate() {
+            let (l, r) = (self.x(m.from, b) + GAP / 2.0, self.x(m.from + m.len, b) - GAP / 2.0);
+            if r < 0.0 || l > b.width {
+                continue;
+            }
+            let block = Path::rounded_rectangle(Point::new(l, top), Size::new((r - l).max(1.0), h), 4.0.into());
+            let selected = Some(i) == self.selected_music;
+            frame.fill(&block, if selected { palette.success.weak.color } else { palette.success.base.color.scale_alpha(0.55) });
+            // The waveform: per two pixels, the loudest peak under them.
+            if let Some(w) = &m.wave {
+                let per_px = m.len / (r - l).max(1.0) as f64;
+                let bars = Path::new(|p| {
+                    let mut x = l.max(0.0);
+                    while x < r.min(b.width) {
+                        let (t0, t1) = (m.start + (x - l) as f64 * per_px, m.start + (x + 2.0 - l) as f64 * per_px);
+                        let (i0, i1) = ((t0 / music::WAVE_STEP) as usize, ((t1 / music::WAVE_STEP) as usize).max((t0 / music::WAVE_STEP) as usize + 1));
+                        let peak = w.peaks.get(i0..i1.min(w.peaks.len())).map_or(0.0, |s| s.iter().fold(0.0f32, |a, &v| a.max(v)));
+                        let bh = (peak * (h - 4.0)).max(1.0);
+                        p.rectangle(Point::new(x, top + h / 2.0 - bh / 2.0), Size::new(1.5, bh));
+                        x += 2.0;
+                    }
+                });
+                frame.fill(&bars, palette.background.base.text.scale_alpha(0.7));
+            }
+            if selected {
+                frame.stroke(&block, Stroke::default().with_width(2.0).with_color(palette.primary.strong.color));
+            }
+            for x in [l + 4.0, r - 4.0] {
+                frame.fill(&Path::rounded_rectangle(Point::new(x - 1.0, top + 4.0), Size::new(2.0, h - 8.0), 1.0.into()), iced::Color::from_rgba(1.0, 1.0, 1.0, 0.8));
+            }
+            // On a dark tag, as on the cuts, so it reads over the waveform.
+            if r - l > m.label.chars().count() as f32 * 6.0 + 28.0 {
+                let tag = Path::rounded_rectangle(Point::new(l + 9.0, top + 2.5), Size::new(m.label.chars().count() as f32 * 5.5 + 8.0, h - 5.0), 3.0.into());
+                frame.fill(&tag, iced::Color::from_rgba(0.0, 0.0, 0.0, 0.6));
+                frame.fill_text(Text {
+                    content: m.label.clone(),
+                    position: Point::new(l + 13.0, top + h / 2.0),
+                    color: iced::Color::WHITE,
+                    size: 11.0.into(),
+                    align_y: Vertical::Center,
+                    ..Default::default()
+                });
+            }
+        }
+        // Past the video's end the music fades out in the export: dim it,
+        // and mark the end.
+        if self.duration > self.video + 1e-6 {
+            let x = self.x(self.video, b);
+            let to = self.x(self.duration, b);
+            frame.fill(&Path::rectangle(Point::new(x, top), Size::new((to - x).max(0.0), h)), iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55));
+            frame.fill(&Path::rectangle(Point::new(x - 1.0, MUSIC_TOP), Size::new(2.0, MUSIC)), palette.background.base.text.scale_alpha(0.8));
+        }
     }
 
     /// A cut block's left and right edges.
@@ -282,6 +390,15 @@ impl canvas::Program<Message> for Marks {
                         None => *drag = Drag::Move { cut, x0: p.x, moved: false, to: cut },
                     }
                     Message::Select(cut)
+                } else if p.y >= MUSIC_TOP {
+                    let clip = self.music_at(p.x, bounds)?;
+                    let m = &self.music[clip];
+                    let per_px = self.span / Timeline::width(bounds) as f64;
+                    *drag = match self.music_edge_at(clip, p.x, bounds) {
+                        Some(start) => Drag::MusicTrim { clip, start, x0: p.x, from: if start { m.start } else { m.start + m.len }, per_px },
+                        None => Drag::MusicMove { clip, x0: p.x, at: m.from, per_px },
+                    };
+                    Message::SelectMusic(clip)
                 } else if let Some((cut, key)) = self.key_at(p.x, bounds) {
                     *drag = Drag::Key { cut, key };
                     Message::KeyJump(cut, key)
@@ -308,6 +425,8 @@ impl canvas::Program<Message> for Marks {
                         return Some(canvas::Action::request_redraw().and_capture());
                     }
                     Drag::Scroll { x0, start } => Message::TimelinePan(*start + (x - *x0) as f64 * self.duration / Timeline::width(bounds) as f64),
+                    Drag::MusicMove { clip, x0, at, per_px } => Message::MusicMove(*clip, *at + (x - *x0) as f64 * *per_px),
+                    Drag::MusicTrim { clip, start, x0, from, per_px } => Message::MusicTrim(*clip, *start, *from + (x - *x0) as f64 * *per_px),
                 };
                 Some(canvas::Action::publish(message).and_capture())
             }
@@ -315,7 +434,9 @@ impl canvas::Program<Message> for Marks {
                 Drag::None => None,
                 Drag::Move { cut, moved: true, to, .. } => Some(canvas::Action::publish(Message::MoveCut(cut, to)).and_capture()),
                 Drag::Move { .. } | Drag::Scroll { .. } => Some(canvas::Action::request_redraw().and_capture()),
-                Drag::Playhead | Drag::Key { .. } | Drag::Trim { .. } => Some(canvas::Action::publish(Message::ScrubDone).and_capture()),
+                Drag::Playhead | Drag::Key { .. } | Drag::Trim { .. } | Drag::MusicMove { .. } | Drag::MusicTrim { .. } => {
+                    Some(canvas::Action::publish(Message::ScrubDone).and_capture())
+                }
             },
             _ => None,
         }
@@ -358,7 +479,8 @@ impl canvas::Program<Message> for Marks {
             frame.fill(&Path::rectangle(Point::new(x - 1.5, 0.0), Size::new(3.0, CUTS)), palette.primary.strong.color);
         }
 
-        let mid = CUTS + (bounds.height - CUTS - SCROLL) / 2.0;
+        self.draw_music(&mut frame, theme, bounds);
+        let mid = CUTS + SEEK / 2.0;
         let (x0, x1) = (self.x(0.0, bounds), self.x(self.duration, bounds));
         let bar = |from: f32, to: f32| Path::rounded_rectangle(Point::new(from, mid - BAR / 2.0), Size::new((to - from).max(0.0), BAR), (BAR / 2.0).into());
         frame.fill(&bar(x0, x1), palette.background.strong.color);
@@ -394,6 +516,7 @@ impl canvas::Program<Message> for Marks {
             }
         }
         frame.fill(&Path::rectangle(Point::new(at - 1.0, 0.0), Size::new(2.0, CUTS)), palette.primary.strong.color);
+        frame.fill(&Path::rectangle(Point::new(at - 1.0, MUSIC_TOP), Size::new(2.0, MUSIC)), palette.primary.strong.color);
         frame.fill(&Path::circle(Point::new(at, mid), BAR), palette.primary.strong.color);
         if self.zoomed() {
             let y = HEIGHT - SCROLL / 2.0 - SCROLL_BAR / 2.0;
@@ -408,11 +531,18 @@ impl canvas::Program<Message> for Marks {
 
     fn mouse_interaction(&self, state: &State, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
         match state.drag {
-            Drag::Trim { .. } => mouse::Interaction::ResizingHorizontally,
+            Drag::Trim { .. } | Drag::MusicTrim { .. } => mouse::Interaction::ResizingHorizontally,
             Drag::None => {
                 let Some(p) = cursor.position_in(bounds) else { return mouse::Interaction::default() };
                 if p.y >= HEIGHT - SCROLL {
                     return if self.zoomed() { mouse::Interaction::Grab } else { mouse::Interaction::default() };
+                }
+                if p.y >= MUSIC_TOP {
+                    return match self.music_at(p.x, bounds) {
+                        Some(i) if self.music_edge_at(i, p.x, bounds).is_some() => mouse::Interaction::ResizingHorizontally,
+                        Some(_) => mouse::Interaction::Grab,
+                        None => mouse::Interaction::default(),
+                    };
                 }
                 if p.y >= CUTS {
                     return if self.key_at(p.x, bounds).is_some() { mouse::Interaction::Grab } else { mouse::Interaction::Pointer };

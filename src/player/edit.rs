@@ -1,19 +1,25 @@
-//! The timeline's edit: cuts played one after another, with undo. Plain
-//! data, so the edits can be checked without a window.
+//! The timeline's edit: cuts played one after another, the music under them
+//! and the mix, with undo. Plain data, so the edits can be checked without a
+//! window.
 //!
 //! Edit time runs along the timeline from 0 to the edit's length; each cut
 //! covers its stretch of it, and clip time is where in its own clip that is.
 
-use crate::project::Cut;
+use crate::project::{Cut, Music, Sound};
 
 /// The shortest a split or trim may leave a cut, in seconds.
 pub const MIN_CUT: f64 = 0.2;
 
+/// What undo brings back: everything an edit changes.
+type Snapshot = (Vec<Cut>, Music, Sound);
+
 #[derive(Default)]
 pub struct Edit {
     pub cuts: Vec<Cut>,
-    undo: Vec<Vec<Cut>>,
-    redo: Vec<Vec<Cut>>,
+    pub music: Music,
+    pub sound: Sound,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
     /// Counts changes, so the app can tell whether the edit was saved.
     pub version: u64,
 }
@@ -21,6 +27,12 @@ pub struct Edit {
 impl Edit {
     pub fn duration(&self) -> f64 {
         self.cuts.iter().map(|c| c.end - c.start).sum()
+    }
+
+    /// The timeline's length: the video's, or the music's while it runs on
+    /// beyond it (the frame still to fill). The export ends with the video.
+    pub fn frame(&self) -> f64 {
+        self.duration().max(self.music.end())
     }
 
     /// Where cut `i` starts on the timeline.
@@ -46,30 +58,45 @@ impl Edit {
         self.offset(i) + (clip_t - self.cuts[i].start)
     }
 
-    /// Remembers the cuts as they are, for undo; call before each change.
+    fn snapshot(&self) -> Snapshot {
+        (self.cuts.clone(), self.music.clone(), self.sound)
+    }
+
+    fn restore(&mut self, (cuts, music, sound): Snapshot) -> Snapshot {
+        let now = self.snapshot();
+        (self.cuts, self.music, self.sound) = (cuts, music, sound);
+        now
+    }
+
+    /// Remembers the edit as it is, for undo; call before each change.
     pub fn checkpoint(&mut self) {
-        self.undo.push(self.cuts.clone());
+        self.undo.push(self.snapshot());
         self.redo.clear();
         self.version += 1;
     }
 
     pub fn undo(&mut self) -> bool {
-        let Some(cuts) = self.undo.pop() else { return false };
-        self.redo.push(std::mem::replace(&mut self.cuts, cuts));
+        let Some(then) = self.undo.pop() else { return false };
+        let now = self.restore(then);
+        self.redo.push(now);
         self.version += 1;
         true
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(cuts) = self.redo.pop() else { return false };
-        self.undo.push(std::mem::replace(&mut self.cuts, cuts));
+        let Some(then) = self.redo.pop() else { return false };
+        let now = self.restore(then);
+        self.undo.push(now);
         self.version += 1;
         true
     }
 
-    /// Starts over with `cuts` (an opened project), forgetting undo.
-    pub fn replace(&mut self, cuts: Vec<Cut>) {
+    /// Starts over with `cuts` and their music and mix (an opened or new
+    /// project), forgetting undo.
+    pub fn replace(&mut self, cuts: Vec<Cut>, music: Music, sound: Sound) {
         self.cuts = cuts;
+        self.music = music;
+        self.sound = sound;
         self.undo.clear();
         self.redo.clear();
         self.version += 1;

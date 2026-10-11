@@ -723,6 +723,9 @@ pub enum Target {
 /// `progress(done, total)` hears of every frame; an error from it (a
 /// cancel) stops the export and removes the unfinished file.
 fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progress: &mut dyn FnMut(usize, usize) -> Result<()>) -> Result<Vec<PathBuf>> {
+    if project.cuts.is_empty() {
+        bail!("nothing to export yet: the project has music but no video cuts");
+    }
     let (pipelines, of_cut) = cut_pipelines(project, opts, out.draft)?;
     // The shader always draws both lenses, so `--only` needs the CPU.
     let mut gpu = if out.cpu || opts.only.is_some() {
@@ -774,7 +777,12 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
     let mut written = Vec::with_capacity(files.len());
     for (path, cuts) in files {
         let sound: Vec<_> = plan[cuts.clone()].iter().map(|&(i, start, frames)| ffmpeg::Sound { input: &pipelines[i].input, start, duration: Some(frames as f64 / fps) }).collect();
-        let mut encoder = ffmpeg::Encoder::new(&path, out.size, fps, &sound, out.format)?;
+        // The whole edit gets its mix; a file per cut is for another editor,
+        // so its sound is left as recorded and the music out.
+        let length: f64 = plan[cuts.clone()].iter().map(|p| p.2 as f64 / fps).sum();
+        let mix = ffmpeg::Mix { sound_db: project.sound.volume, music_db: project.music.volume, music: &project.music.clips, length };
+        let mix = matches!(out.target, Target::One(_)).then_some(&mix);
+        let mut encoder = ffmpeg::Encoder::new(&path, out.size, fps, &sound, mix, out.format)?;
         for (n, &(i, start, frames)) in cuts.clone().zip(&plan[cuts]) {
             let size = out.size;
             let mut tick = |n: usize| progress(done + n, total);
@@ -867,7 +875,7 @@ fn main() -> Result<()> {
             let p = Pipeline::new(&input, &opts, stab::Mode::Off)?;
             let start = p.snap(start);
             let total = duration.map(|d| (d * p.fps).round() as usize);
-            let mut encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &[ffmpeg::Sound { input: &input, start, duration }], ffmpeg::Format::Mp4)?;
+            let mut encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &[ffmpeg::Sound { input: &input, start, duration }], None, ffmpeg::Format::Mp4)?;
             let began = Instant::now();
             let mut tick = |n: usize| {
                 if n.is_multiple_of(10) {
@@ -891,7 +899,7 @@ fn main() -> Result<()> {
                 // One clip is a project of one cut.
                 let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
                 let (start, end) = span(&input, start, duration, Some(&reframe))?;
-                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None }] }
+                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None }], ..Default::default() }
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);

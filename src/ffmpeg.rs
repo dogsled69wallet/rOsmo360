@@ -338,13 +338,35 @@ pub struct Sound<'a> {
     pub duration: Option<f64>,
 }
 
+/// What a whole edit's sound gets on top of joining its clips' stretches:
+/// their level, and the music track.
+pub struct Mix<'a> {
+    /// The clips' sound, dB.
+    pub sound_db: f64,
+    /// The music track, dB, and its clips.
+    pub music_db: f64,
+    pub music: &'a [crate::project::MusicClip],
+    /// The edit's length: music running on is cut here, faded out over
+    /// `project::END_FADE`.
+    pub length: f64,
+}
+
+impl Mix<'_> {
+    /// Whether it changes anything.
+    fn matters(&self) -> bool {
+        self.sound_db != 0.0 || !self.music.is_empty()
+    }
+}
+
 impl Encoder {
     /// The sound is `audio`'s stretches back to back. Each stretch should
     /// last exactly as long as the frames written for it, so later cuts stay
     /// in sync. Several stretches are joined only if every clip has sound.
     /// No `-shortest`: the sound already ends with the frames, and with the
     /// frames arriving slower than the sound it cut the last frame off.
-    pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio: &[Sound<'_>], format: Format) -> Result<Self> {
+    /// With `mix`, the joined sound is set to its level and the music mixed
+    /// in.
+    pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio: &[Sound<'_>], mix: Option<&Mix<'_>>, format: Format) -> Result<Self> {
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24"]).args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"]);
         for s in audio {
@@ -354,8 +376,12 @@ impl Encoder {
             }
             cmd.arg("-i").arg(s.input);
         }
+        // The music's inputs, before any output option.
+        let graph = mix.filter(|m| m.matters()).map(|m| mixed(&mut cmd, audio, m)).transpose()?;
         cmd.args(["-map", "0:v"]);
-        if let [_] = audio {
+        if let Some(graph) = graph {
+            cmd.args(["-filter_complex", &graph, "-map", "[a]"]);
+        } else if let [_] = audio {
             cmd.args(["-map", "1:a:0?"]);
         } else if audio.iter().all(|s| has_audio(s.input).unwrap_or(false)) {
             // Same camera, but resample anyway: concat needs matching formats.
@@ -394,4 +420,52 @@ impl Encoder {
         }
         Ok(())
     }
+}
+
+/// The filter graph for `Encoder::new` with a mix, adding the music's inputs
+/// to `cmd`: the clips' stretches joined (or silence where they have none)
+/// at their level, and each music clip trimmed to its stretch and to the
+/// edit, faded, placed at its time and at the track's level, all mixed over
+/// the edit's length.
+fn mixed(cmd: &mut Command, audio: &[Sound<'_>], mix: &Mix<'_>) -> Result<String> {
+    let stereo = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
+    let mut graph = String::new();
+    if !audio.is_empty() && audio.iter().all(|s| has_audio(s.input).unwrap_or(false)) {
+        for i in 1..=audio.len() {
+            graph += &format!("[{i}:a:0]{stereo}[c{i}];");
+        }
+        let inputs: String = (1..=audio.len()).map(|i| format!("[c{i}]")).collect();
+        graph += &format!("{inputs}concat=n={}:v=0:a=1,volume={}[s];", audio.len(), crate::project::gain(mix.sound_db));
+    } else {
+        if !audio.is_empty() {
+            eprintln!("not every clip has sound; exporting the music alone");
+        }
+        graph += &format!("anullsrc=r=48000:cl=stereo,atrim=duration={}[s];", mix.length);
+    }
+    let mut parts = vec!["[s]".to_owned()];
+    for clip in mix.music {
+        // What's left of the edit from where it starts.
+        let room = mix.length - clip.at;
+        let len = (clip.end - clip.start).min(room);
+        if len <= 0.0 {
+            continue;
+        }
+        let input = audio.len() + parts.len();
+        cmd.args(["-ss", &clip.start.to_string(), "-t", &len.to_string()]).arg("-i").arg(&clip.input);
+        let mut chain = format!("[{input}:a:0]{stereo}");
+        if clip.fade_in > 0.0 {
+            chain += &format!(",afade=t=in:st=0:d={}", clip.fade_in.min(len));
+        }
+        // Cut off by the edit's end: fade out there instead of its own fade.
+        let fade_out = if clip.end - clip.start > room { crate::project::END_FADE } else { clip.fade_out };
+        if fade_out > 0.0 {
+            let d = fade_out.min(len);
+            chain += &format!(",afade=t=out:st={}:d={d}", len - d);
+        }
+        let delay = (clip.at * 1000.0).round();
+        graph += &format!("{chain},adelay=delays={delay}:all=1,volume={}[m{input}];", crate::project::gain(mix.music_db));
+        parts.push(format!("[m{input}]"));
+    }
+    graph += &format!("{}amix=inputs={}:duration=first:normalize=0[a]", parts.concat(), parts.len());
+    Ok(graph)
 }
