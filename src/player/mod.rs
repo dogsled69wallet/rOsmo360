@@ -1367,7 +1367,8 @@ impl App {
                     let mode = self.clip.as_ref().map_or(self.opts.stabilize, |c| c.playback.media.stab.mode());
                     let next = match mode {
                         Mode::Off => Mode::Horizon,
-                        Mode::Horizon => Mode::Lock,
+                        Mode::Horizon => Mode::Level,
+                        Mode::Level => Mode::Lock,
                         Mode::Lock => Mode::Off,
                     };
                     return self.update(Message::Stab(next));
@@ -1658,8 +1659,6 @@ fn labelled<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Elem
     row![text(label), widget.into()].spacing(6).align_y(Alignment::Center).into()
 }
 
-/// A cut's name on the timeline: its clip, length, and stabilisation when
-/// that isn't horizon (the usual).
 /// A cut's names on the timeline, longest first, for the block to show the
 /// first that fits: its clip, length, stabilisation when that isn't horizon
 /// (the usual), and note.
@@ -1668,6 +1667,7 @@ fn cut_labels(c: &Cut, default: Mode) -> Vec<String> {
     match c.stabilize.unwrap_or(default) {
         Mode::Horizon => {}
         Mode::Off => label += " · unstabilised",
+        Mode::Level => label += " · level",
         Mode::Lock => label += " · world lock",
     }
     match c.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {

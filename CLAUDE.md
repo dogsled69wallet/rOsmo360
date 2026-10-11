@@ -14,7 +14,8 @@ Working and verified on real footage:
   - Disagreement cut: where the lenses still disagree after alignment, cut to the lens owning that side of the seam instead of blending, so what can't be aligned (the hand on the stick) is solid rather than see-through.
 - **Stabilisation** from the camera's ~1 kHz fused attitude:
   - `horizon`: level horizon, heading follows smoothed camera heading.
-  - `lock`: world-locked to the clip's starting orientation.
+  - `level`: level horizon, heading fixed at the clip's start, so keyframe yaw is a world direction (`scan`'s heading). On 0037's 87° pan the sun held its longitude in every tile. It does what the planned `yaw_world` was for, a whole cut at a time.
+  - `lock`: world-locked to the clip's starting orientation, tilt included.
   - Per-sensor-row rolling-shutter correction (about 18 ms readout).
 - **CLI**:
   - `rig`: dump calibration JSON.
@@ -54,8 +55,8 @@ Not done yet, roughly in priority order:
    - Each cut's volume, and mute.
    - **Windows as a supported platform** (target set by the user, 2026-10-11; see item 3 for the groundwork). The user has Windows only as a VM, so testing there likely means no GPU passthrough: wgpu may get only a software adapter (WARP), so the player would be slow and export falls back to the CPU stitcher (`render::Gpu::new` refuses CPU adapters). Decided (2026-10-11): a `.zip` (rosmo360.exe, an `ffmpeg/` folder with ffmpeg.exe, ffprobe.exe and their licence; the app looks there first) beside the Linux assets. Bundling is mere aggregation (separate programs over pipes), so MIT/Apache stays; ship a plain GPL build (x264 is needed for MP4 export; never a nonfree build), its licence text, and its source archive attached to each release. Treat "works in the VM" as the bar for correctness, not speed. Real-GPU testing on Windows would need someone else's machine.
    - Done: export as separate clips (`--clips`, `--handles`; the player's Clips checkbox) and the DaVinci Resolve format (`--format resolve`; the Resolve checkbox). Maybe later: an EDL/FCPXML beside the clips so an editor rebuilds the cut order, and handles in the player.
-7. **Framing automation (a future release, agreed with the user 2026-10-10).** Asked for by the claudeVideoEdit editor; in this order:
-   1. Preview bugs: `preview 0036 -s 440 -d 30 --every 0.5` fails while `-d 29.9` works (likely the tile count at the end boundary: 61 with both ends; get the exact error first), and "Broken pipe" from ffmpeg when we stop reading early (stop it cleanly or silence that).
+7. **Version 0.2.8: framing automation, and a Flatpak (moved ahead of 0.3 by the user, 2026-10-11).** Asked for by the claudeVideoEdit editor; in this order (then the Flatpak as a fifth release file):
+   1. ~~Preview bugs~~: not reproducible (2026-10-11). `preview 0036 -s 440 -d 30 --every 0.5` (with or without `--tile 270 --columns 10`) writes 60 tiles cleanly on 0.2.0 and 0.2.7, with no ffmpeg messages. Most likely the editor's runs were cut off by our dev work (rosmo360 processes stopped by name, or the binary replaced while running), which makes ffmpeg print "Broken pipe". Never stop rosmo360 by name while another session may use it.
    2. `yaw_world` on keyframes (the tool subtracts the smoothed heading in horizon mode, so a view stays on a landmark while the camera turns), and a **level** stabilisation mode: level horizon with the heading fixed in the world (unlike `lock`, which also keeps the starting tilt).
    3. Follow mode in keyframes, e.g. `{"t": 30, "follow": "stick", "offset_pitch": 30, "fov": 110}`, blending with fixed keyframes, plus a Follow picker in the player. The first source is `stick`: the operator is down the stick (rig +y) from the IMU attitude alone, so the third-person shot needs no vision and works straight below the camera.
    4. A `track` command for a colour, as a second follow source (`"follow": "track.csv"`). Track on sphere directions or in a perspective view around the last position, not on the equirect (it stretches at the poles).
@@ -96,7 +97,7 @@ Player keys:
 - Drag: look. Right-drag or Q/E: roll. ↑/↓: pitch. Shift+←/→: yaw.
 - Scroll: zoom.
 - Space: play/pause. ←/→: seek ±5 s. `,` `.`: frame step.
-- S: stabilisation mode. R: rolling shutter. P: projection. M: mute.
+- S: stabilisation mode (off → horizon → level → lock). R: rolling shutter. P: projection. M: mute.
 - Ctrl+O: open. Seek bar: drag to scrub.
 - 0: reset view. F: fullscreen.
 - Ctrl+O / Add clip…: append clips (several at once) as cuts. C: split the cut at the playhead. Drag a cut's edge to trim it, drag the cut to move it. Shift+Del: delete the selected cut. Ctrl+Z / Ctrl+Shift+Z: undo / redo. Ctrl+S / Ctrl+Shift+S / Ctrl+Shift+O: save / save as / open a project (`project::Project` JSON, the file `export` reads; clips under the project's folder are stored relative). `play edit.json` opens one. Closing the window or opening another project with unsaved changes asks Save / Don't save / Cancel (rfd message dialog; `exit_on_close_request` is off and `window::close_requests` drives it). Export… renders the edit with the CLI's `export` on a thread (progress and Cancel in the top bar), at the picked resolution, in the aspect lock's shape (16:9 when free), with the player's stabilisation and rolling-shutter settings.

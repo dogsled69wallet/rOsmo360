@@ -4,7 +4,8 @@
 //!
 //! Angles are in degrees. Yaw turns right, pitch looks up, roll tilts
 //! clockwise. With stabilisation on, yaw 0 is straight ahead (`horizon`
-//! follows the camera's heading, `lock` holds the clip's first heading), and
+//! follows the camera's heading, `level` and `lock` hold the clip's first
+//! heading, so there yaw is a direction in the world), and
 //! the equirect's longitude and latitude are the yaw and pitch to look there.
 
 use crate::stitch::{M3, mat_mul};

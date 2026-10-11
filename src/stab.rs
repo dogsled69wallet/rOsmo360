@@ -39,12 +39,17 @@ pub enum Mode {
     Off,
     /// Level horizon, heading follows the camera's smoothed heading.
     Horizon,
-    /// Fully world-locked to the orientation at the start of the clip.
+    /// Level horizon, heading fixed where the camera pointed at the start
+    /// of the clip: yaw is a direction in the world (`scan`'s heading), so a
+    /// view stays on a landmark while the camera turns.
+    Level,
+    /// Fully world-locked to the orientation at the start of the clip,
+    /// tilt included.
     Lock,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 3] = [Mode::Off, Mode::Horizon, Mode::Lock];
+    pub const ALL: [Mode; 4] = [Mode::Off, Mode::Horizon, Mode::Level, Mode::Lock];
 }
 
 impl std::fmt::Display for Mode {
@@ -52,6 +57,7 @@ impl std::fmt::Display for Mode {
         f.write_str(match self {
             Mode::Off => "Off",
             Mode::Horizon => "Horizon",
+            Mode::Level => "Level",
             Mode::Lock => "World lock",
         })
     }
@@ -109,6 +115,10 @@ impl Stabilizer {
         match self.mode {
             Mode::Off => self.world_from_rig(t_ms),
             Mode::Lock => self.world_from_rig(self.quats[0].0),
+            Mode::Level => {
+                let r = self.world_from_rig(self.quats[0].0);
+                self.levelled([r[0][2], r[1][2], r[2][2]])
+            }
             Mode::Horizon => {
                 // Average the rig's forward axis over the window, then level it.
                 let n = 32;
@@ -120,14 +130,19 @@ impl Stabilizer {
                         fwd[i] += r[i][2];
                     }
                 }
-                let down = [0.0, 0.0, self.world_down];
-                fwd[2] = 0.0;
-                let fwd = normalise(fwd);
-                let right = cross(down, fwd);
-                // Columns are the view's x (right), y (down), z (forward) in world.
-                transpose([right, down, fwd])
+                self.levelled(fwd)
             }
         }
+    }
+
+    /// A level world_from_view looking along `fwd` flattened onto the horizon.
+    fn levelled(&self, mut fwd: [f64; 3]) -> M3 {
+        let down = [0.0, 0.0, self.world_down];
+        fwd[2] = 0.0;
+        let fwd = normalise(fwd);
+        let right = cross(down, fwd);
+        // Columns are the view's x (right), y (down), z (forward) in world.
+        transpose([right, down, fwd])
     }
 
     /// `rig_from_view` at `steps` instants spread over the frame's readout,
@@ -207,4 +222,36 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 fn normalise(v: [f64; 3]) -> [f64; 3] {
     let n = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);
     v.map(|x| x / n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_holds_the_starting_heading() {
+        // A camera turning 90° about world z (up) over a second, tilted 30°.
+        let quat = |yaw: f64| {
+            let (y, t) = ((yaw / 2.0).to_radians(), (15.0f64).to_radians());
+            // Yaw about z, then tilt about x.
+            let (qz, qx) = ([y.cos(), 0.0, 0.0, y.sin()], [t.cos(), t.sin(), 0.0, 0.0]);
+            [
+                qz[0] * qx[0] - qz[3] * 0.0 - qz[1] * qx[1],
+                qz[0] * qx[1] + qz[1] * qx[0],
+                qz[3] * qx[1],
+                qz[3] * qx[0],
+            ]
+        };
+        let quats: Vec<_> = (0..=10).map(|k| (k as f64 * 100.0, quat(9.0 * k as f64))).collect();
+        let level = Stabilizer::new(&quats, Mode::Level, ImuAxes::X180, -1.0, 0.0);
+        let horizon = Stabilizer::new(&quats, Mode::Horizon, ImuAxes::X180, -1.0, 0.0);
+        let (a, b) = (level.world_from_view(0.0), level.world_from_view(1000.0));
+        assert!(a.iter().flatten().zip(b.iter().flatten()).all(|(x, y)| (x - y).abs() < 1e-9));
+        // Level: the view's down is the world's (z up, so down is −z).
+        assert!((a[2][1] + 1.0).abs() < 1e-9);
+        // Horizon turned with the camera, by its 90°.
+        let (h0, h1) = (horizon.world_from_view(0.0), horizon.world_from_view(1000.0));
+        let cos = h0[0][2] * h1[0][2] + h0[1][2] * h1[1][2];
+        assert!(cos.abs() < 1e-6, "{cos}");
+    }
 }

@@ -24,7 +24,8 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
   - fades each lens out smoothly where DJI's masks hide the selfie stick, so sun glare in one lens leaves no line in the sky.
 - **Stabilisation** from the camera's built-in 1 kHz motion data, with rolling-shutter correction:
   - **Horizon**: a level horizon that follows where you point the camera.
-  - **World lock**: the view stays fixed in the world.
+  - **Level**: a level horizon that stays pointing one way in the world while the camera turns.
+  - **World lock**: the view stays fixed in the world, tilt included.
 - **Free look**: drag to look around, scroll to zoom, and roll the view.
 - **Projections**: little planet (the default, like DJI Studio), perspective and flat equirectangular.
 - **Smooth playback** from the low-resolution proxy (`.LRF`), switching to the full-resolution frame when paused. On a fast GPU it can stream the full-resolution `.OSV` directly.
@@ -153,7 +154,7 @@ Angles are in degrees: yaw turns right, pitch looks up. With stabilisation on (h
 
 Exports are 1080p by default (1920 × 1080, or 1080 × 1920 for 9:16), a good quality for sharing online. `-r` picks `720p`, `1080p`, `1440p` or `2160p` (`4k`), meaning the short side in pixels. `-a` sets the shape (`16:9`, `9:16`, `1:1`, `4:5`, …) when the reframe file doesn't, and `--size 1234x567` gives an exact size.
 
-To join cuts from one or more clips, write a project file and export it. Each cut has its own keyframes, in clip time, and may set its own `stabilize` (`off`, `horizon` or `lock`; otherwise `--stabilize`, horizon by default) and a `note`, which the player's timeline shows on the cut. Relative paths are relative to the project file:
+To join cuts from one or more clips, write a project file and export it. Each cut has its own keyframes, in clip time, and may set its own `stabilize` (`off`, `horizon`, `level` or `lock`; otherwise `--stabilize`, horizon by default) and a `note`, which the player's timeline shows on the cut. Relative paths are relative to the project file:
 
 ```json
 {

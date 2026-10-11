@@ -127,7 +127,8 @@ Perspective and little planet are one family. A keyframed move can morph smoothl
 The camera records its own motion about a thousand times a second, and rOsmo360 uses that to steady the picture.
 
 - **Horizon** (the default) keeps the horizon level and follows where the camera points, smoothed. It looks like a steady camera operator.
-- **World lock** holds the view still in the world, wherever the camera turns. A mountain stays put while the camera spins. It keeps the clip's starting orientation, including any tilt it started with.
+- **Level** keeps the horizon level like Horizon, but holds the direction the camera pointed when the clip started, instead of following it. A mountain stays put while the camera turns, and the picture stays level even if the camera started tilted. Use it for a view that should stay on one thing while you turn around.
+- **World lock** also holds the view still in the world, but keeps the clip's starting orientation exactly, including any tilt it started with.
 - **Off** shows the picture as the camera saw it.
 
 Press **S**, or use the **Stabilisation** picker. **Each cut keeps its own mode**: the picker changes the cut that's playing, and new cuts get the mode you used last. On the timeline, a cut that isn't on horizon says so in its label, for example "world lock".
@@ -323,7 +324,7 @@ With the mouse: drag in the view to look around, right-drag to roll, scroll to z
 - **Clips load slowly the first time.** Each clip is checked for its calibration and motion data, and the GPU decoder is tested once. Video on a spinning hard drive is slower to start and scrub than on an SSD.
 - **The paused picture keeps changing sharpness.** Turn off **Full res when paused** while keyframing.
 - **Something close to the camera looks doubled or cut at the edges.** That's the seam where the two lenses meet. rOsmo360 lines up close subjects and cuts cleanly where it can't, but a hand or face very close to the seam can still show it, most of all next to the selfie stick, where the two lenses overlap least. Turn the view so close subjects sit away from the sides of the camera.
-- **"World lock" starts tilted.** It holds the clip's first orientation. Start the cut where the camera is level, or use horizon.
+- **"World lock" starts tilted.** It holds the clip's first orientation. Use **Level** instead: it holds the direction but keeps the horizon level.
 - **No sound.** Check the speaker button isn't muted. On Linux, sound goes through ALSA, which PipeWire and PulseAudio both provide.
 - **Export says it's stitching on the CPU.** No usable GPU was found, so it falls back to the slower CPU stitcher. Update your GPU drivers. The result looks the same.
 - **Your settings** (stabilisation, playback source, rolling shutter, full res when paused, volume, export resolution and aspect) are remembered between runs, in `~/.config/rosmo360/settings.json` on Linux.
