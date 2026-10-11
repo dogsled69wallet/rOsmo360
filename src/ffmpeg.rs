@@ -336,6 +336,8 @@ pub struct Sound<'a> {
     pub input: &'a Path,
     pub start: f64,
     pub duration: Option<f64>,
+    /// Volume points in clip time, applied only in a mix.
+    pub volume: &'a [crate::project::VolumeKey],
 }
 
 /// Writes `duration` seconds of `input`'s sound from `start` to `output` as
@@ -394,7 +396,8 @@ impl Encoder {
             cmd.arg("-i").arg(s.input);
         }
         // The music's inputs, before any output option.
-        let graph = mix.filter(|m| m.matters()).map(|m| mixed(&mut cmd, audio, m)).transpose()?;
+        let points = audio.iter().any(|s| !s.volume.is_empty());
+        let graph = mix.filter(|m| m.matters() || points).map(|m| mixed(&mut cmd, audio, m)).transpose()?;
         cmd.args(["-map", "0:v"]);
         if let Some(graph) = graph {
             cmd.args(["-filter_complex", &graph, "-map", "[a]"]);
@@ -439,23 +442,23 @@ impl Encoder {
     }
 }
 
-/// The music track's level as a `volume` filter on edit time: fixed, or
-/// with volume points the same line the player follows (straight in dB
-/// between points), worked out per audio frame (~20 ms).
-fn level_filter(music: &crate::project::Music) -> String {
-    let keys = &music.keyframes;
+/// `base` dB and the line through volume points `keys` as a `volume`
+/// filter, the same line the player follows (straight in dB between
+/// points), worked out per audio frame (~20 ms). `t` is the expression
+/// for the points' time from the stream's.
+fn level_filter(base: f64, keys: &[crate::project::VolumeKey], t: &str) -> String {
     if keys.is_empty() {
-        return format!("volume={}", crate::project::gain(music.volume));
+        return format!("volume={}", crate::project::gain(base));
     }
     // dB at `t`: nested ifs from the last stretch back to the first.
     let mut db = format!("{}", keys[keys.len() - 1].volume);
     for w in keys.windows(2).rev() {
         let (a, b) = (w[0], w[1]);
-        db = format!("if(lt(t,{}),{}+({})*(t-{})/{},{db})", b.t, a.volume, b.volume - a.volume, a.t, (b.t - a.t).max(1e-9));
+        db = format!("if(lt({t},{}),{}+({})*({t}-{})/{},{db})", b.t, a.volume, b.volume - a.volume, a.t, (b.t - a.t).max(1e-9));
     }
-    db = format!("if(lt(t,{}),{},{db})", keys[0].t, keys[0].volume);
+    db = format!("if(lt({t},{}),{},{db})", keys[0].t, keys[0].volume);
     let off = crate::project::OFF_DB;
-    format!("volume=eval=frame:volume='if(lte({0}+{db},{off}),0,pow(10,({0}+{db})/20))'", music.volume)
+    format!("volume=eval=frame:volume='if(lte({base}+{db},{off}),0,pow(10,({base}+{db})/20))'")
 }
 
 /// The filter graph for `Encoder::new` with a mix, adding the music's inputs
@@ -467,8 +470,10 @@ fn mixed(cmd: &mut Command, audio: &[Sound<'_>], mix: &Mix<'_>) -> Result<String
     let stereo = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
     let mut graph = String::new();
     if !audio.is_empty() && audio.iter().all(|s| has_audio(s.input).unwrap_or(false)) {
-        for i in 1..=audio.len() {
-            graph += &format!("[{i}:a:0]{stereo}[c{i}];");
+        for (i, sound) in (1..).zip(audio) {
+            // Its volume points, in clip time: the stretch's time starts at 0.
+            let level = if sound.volume.is_empty() { String::new() } else { format!(",{}", level_filter(0.0, sound.volume, &format!("(t+{})", sound.start))) };
+            graph += &format!("[{i}:a:0]{stereo}{level}[c{i}];");
         }
         let inputs: String = (1..=audio.len()).map(|i| format!("[c{i}]")).collect();
         graph += &format!("{inputs}concat=n={}:v=0:a=1,volume={}[s];", audio.len(), crate::project::gain(mix.sound_db));
@@ -509,7 +514,7 @@ fn mixed(cmd: &mut Command, audio: &[Sound<'_>], mix: &Mix<'_>) -> Result<String
             chain += &format!(",afade=t=out:st={}:d={cross_out}:curve=qsin", len - cross_out);
         }
         let delay = (clip.at * 1000.0).round();
-        graph += &format!("{chain},adelay=delays={delay}:all=1,{}[m{input}];", level_filter(mix.music));
+        graph += &format!("{chain},adelay=delays={delay}:all=1,{}[m{input}];", level_filter(mix.music.volume, &mix.music.keyframes, "t"));
         parts.push(format!("[m{input}]"));
     }
     graph += &format!("{}amix=inputs={}:duration=first:normalize=0[a]", parts.concat(), parts.len());

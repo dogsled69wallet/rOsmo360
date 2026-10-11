@@ -47,6 +47,13 @@ const SNAP: f32 = 8.0;
 const VOLUME_TOP: f64 = 6.0;
 const VOLUME_BOTTOM: f64 = crate::project::OFF_DB;
 const POINT: f32 = 4.0;
+/// Where a volume line runs: its top and height. The music's over the music
+/// lane, a cut's sound over its block.
+type Lane = (f32, f32);
+const MUSIC_LANE: Lane = (MUSIC_TOP + 4.0, MUSIC - 8.0);
+const CUT_LANE: Lane = (4.0, CUTS - 8.0);
+const MUSIC_LINE: iced::Color = iced::Color::from_rgb(1.0, 0.78, 0.25);
+const SOUND_LINE: iced::Color = iced::Color::from_rgb(0.35, 0.85, 1.0);
 
 /// One cut as the timeline shows it.
 pub struct Block {
@@ -63,6 +70,8 @@ pub struct Block {
     pub keys: Vec<(usize, f64, Ease, bool)>,
     /// Thumbnails of its clip by clip time, in order (see `thumbs`).
     pub thumbs: Vec<(f64, Handle)>,
+    /// Its sound's volume points, clip time (some may lie outside the cut).
+    pub sound: Vec<crate::project::VolumeKey>,
 }
 
 impl Block {
@@ -96,6 +105,8 @@ pub struct Timeline {
     /// track's level), and the one selected.
     pub volume: Vec<crate::project::VolumeKey>,
     pub selected_volume: Option<usize>,
+    /// The cut sound point selected: (cut, point).
+    pub selected_sound: Option<(usize, usize)>,
     /// Where the video ends; `duration` runs on to the music's end if later.
     pub video: f64,
     pub duration: f64,
@@ -129,6 +140,8 @@ pub enum Drag {
     MusicTrim { clip: usize, start: bool, x0: f32, from: f64, per_px: f64 },
     /// Dragging music volume point `key`.
     Volume { key: usize },
+    /// Dragging cut `cut`'s sound point `key`.
+    Sound { cut: usize, key: usize },
 }
 
 #[derive(Default)]
@@ -219,24 +232,32 @@ impl Timeline {
         }
     }
 
-    /// The music lane's volume line: dB to y and back.
-    fn volume_y(db: f64) -> f32 {
-        let (top, h) = (MUSIC_TOP + 4.0, MUSIC - 8.0);
-        top + ((VOLUME_TOP - db.clamp(VOLUME_BOTTOM, VOLUME_TOP)) / (VOLUME_TOP - VOLUME_BOTTOM)) as f32 * h
+    /// A volume line's dB to y on `lane` (its top and height) and back.
+    fn volume_y(lane: Lane, db: f64) -> f32 {
+        lane.0 + ((VOLUME_TOP - db.clamp(VOLUME_BOTTOM, VOLUME_TOP)) / (VOLUME_TOP - VOLUME_BOTTOM)) as f32 * lane.1
     }
 
-    /// y on the music lane to dB, snapping to 0 within a few pixels.
-    fn volume_db(y: f32) -> f64 {
-        if (y - Self::volume_y(0.0)).abs() < 3.0 {
+    /// y on `lane` to dB, snapping to 0 within a few pixels.
+    fn volume_db(lane: Lane, y: f32) -> f64 {
+        if (y - Self::volume_y(lane, 0.0)).abs() < 3.0 {
             return 0.0;
         }
-        let (top, h) = (MUSIC_TOP + 4.0, MUSIC - 8.0);
-        (VOLUME_TOP - ((y - top) / h) as f64 * (VOLUME_TOP - VOLUME_BOTTOM)).clamp(VOLUME_BOTTOM, VOLUME_TOP)
+        (VOLUME_TOP - ((y - lane.0) / lane.1) as f64 * (VOLUME_TOP - VOLUME_BOTTOM)).clamp(VOLUME_BOTTOM, VOLUME_TOP)
     }
 
-    /// The volume point under `p`, if any.
+    /// The music volume point under `p`, if any.
     fn volume_at(&self, p: Point, b: Rectangle) -> Option<usize> {
-        self.volume.iter().position(|k| (self.x(k.t, b) - p.x).abs() <= PICK && (Self::volume_y(k.volume) - p.y).abs() <= PICK)
+        self.volume.iter().position(|k| (self.x(k.t, b) - p.x).abs() <= PICK && (Self::volume_y(MUSIC_LANE, k.volume) - p.y).abs() <= PICK)
+    }
+
+    /// A cut's sound point under `p`, if any: (cut, point).
+    fn sound_at(&self, p: Point, b: Rectangle) -> Option<(usize, usize)> {
+        self.blocks.iter().enumerate().find_map(|(ci, c)| {
+            let k = c.sound.iter().position(|k| {
+                k.t >= c.start && k.t <= c.start + c.len && (self.x(c.from + k.t - c.start, b) - p.x).abs() <= PICK && (Self::volume_y(CUT_LANE, k.volume) - p.y).abs() <= PICK
+            })?;
+            Some((ci, k))
+        })
     }
 
     /// Edit times a music clip's edges snap to, but for music clip `clip`'s
@@ -365,44 +386,29 @@ impl Timeline {
         self.draw_volume(frame, b);
     }
 
-    /// The music's volume line over its lane, its points, and the selected
-    /// point's level. Only once there are points: a flat line at the top of
-    /// every lane would only be in the way.
+    /// The music's volume line over its lane, once there are points: a flat
+    /// line along every lane would only be in the way.
     fn draw_volume(&self, frame: &mut Frame, b: Rectangle) {
-        if self.volume.is_empty() {
-            return;
-        }
-        let colour = iced::Color::from_rgb(1.0, 0.78, 0.25);
-        let (x0, x1) = (self.x(0.0, b), self.x(self.duration, b));
-        let line = Path::new(|p| {
-            p.move_to(Point::new(x0, Self::volume_y(self.volume[0].volume)));
-            for k in &self.volume {
-                p.line_to(Point::new(self.x(k.t, b), Self::volume_y(k.volume)));
+        let (Some(first), Some(last)) = (self.volume.first(), self.volume.last()) else { return };
+        let points: Vec<_> = self.volume.iter().map(|k| (self.x(k.t, b), k.volume)).collect();
+        let ends = ((self.x(0.0, b), first.volume), (self.x(self.duration, b), last.volume));
+        draw_line(frame, b, MUSIC_LANE, MUSIC_LINE, ends, &points, self.selected_volume);
+    }
+
+    /// Each cut's sound line over its block, for cuts with points: the
+    /// points within the cut, and the line from its in to its out point.
+    fn draw_sound(&self, frame: &mut Frame, b: Rectangle) {
+        for (ci, c) in self.blocks.iter().enumerate() {
+            if c.sound.is_empty() {
+                continue;
             }
-            p.line_to(Point::new(x1, Self::volume_y(self.volume[self.volume.len() - 1].volume)));
-        });
-        frame.stroke(&line, Stroke::default().with_width(1.5).with_color(colour));
-        for (i, k) in self.volume.iter().enumerate() {
-            let at = Point::new(self.x(k.t, b), Self::volume_y(k.volume));
-            let selected = Some(i) == self.selected_volume;
-            let dot = Path::circle(at, if selected { POINT + 1.0 } else { POINT });
-            frame.fill(&dot, if selected { iced::Color::WHITE } else { colour });
-            frame.stroke(&dot, Stroke::default().with_width(1.0).with_color(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.6)));
-            if selected {
-                let label = if k.volume <= VOLUME_BOTTOM { "off".to_owned() } else { format!("{:+.1} dB", k.volume) };
-                let (w, h) = (label.len() as f32 * 6.0 + 8.0, 14.0);
-                let left = if at.x + 8.0 + w > b.width { at.x - 8.0 - w } else { at.x + 8.0 };
-                let top = (at.y - h / 2.0).clamp(MUSIC_TOP, MUSIC_TOP + MUSIC - h);
-                frame.fill(&Path::rounded_rectangle(Point::new(left, top), Size::new(w, h), 3.0.into()), iced::Color::from_rgba(0.0, 0.0, 0.0, 0.7));
-                frame.fill_text(Text {
-                    content: label,
-                    position: Point::new(left + 4.0, top + h / 2.0),
-                    color: iced::Color::WHITE,
-                    size: 11.0.into(),
-                    align_y: Vertical::Center,
-                    ..Default::default()
-                });
-            }
+            let (l, r) = self.block_x(c, b);
+            let end = c.start + c.len;
+            let at = |t: f64| crate::project::volume_at(&c.sound, t);
+            // Points outside the cut aren't drawn; their indices still count.
+            let points: Vec<_> = c.sound.iter().map(|k| if k.t >= c.start && k.t <= end { (self.x(c.from + k.t - c.start, b), k.volume) } else { (f32::NAN, k.volume) }).collect();
+            let selected = self.selected_sound.filter(|s| s.0 == ci).map(|s| s.1);
+            draw_line(frame, b, CUT_LANE, SOUND_LINE, ((l, at(c.start)), (r, at(end))), &points, selected);
         }
     }
 
@@ -446,6 +452,46 @@ impl canvas::Program<Message> for Pictures {
             });
         }
         vec![frame.into_geometry()]
+    }
+}
+
+/// A volume line on `lane` from `ends.0` to `ends.1` (x, dB) through
+/// `points` (x, dB; NaN x for one not shown), the `selected` one labelled
+/// with its level.
+fn draw_line(frame: &mut Frame, b: Rectangle, lane: Lane, colour: iced::Color, ends: ((f32, f64), (f32, f64)), points: &[(f32, f64)], selected: Option<usize>) {
+    let y = |db| Timeline::volume_y(lane, db);
+    let line = Path::new(|p| {
+        p.move_to(Point::new(ends.0.0, y(ends.0.1)));
+        for &(x, db) in points.iter().filter(|p| !p.0.is_nan()) {
+            p.line_to(Point::new(x, y(db)));
+        }
+        p.line_to(Point::new(ends.1.0, y(ends.1.1)));
+    });
+    frame.stroke(&line, Stroke::default().with_width(1.5).with_color(colour));
+    for (i, &(x, db)) in points.iter().enumerate() {
+        if x.is_nan() {
+            continue;
+        }
+        let at = Point::new(x, y(db));
+        let chosen = Some(i) == selected;
+        let dot = Path::circle(at, if chosen { POINT + 1.0 } else { POINT });
+        frame.fill(&dot, if chosen { iced::Color::WHITE } else { colour });
+        frame.stroke(&dot, Stroke::default().with_width(1.0).with_color(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.6)));
+        if chosen {
+            let label = if db <= VOLUME_BOTTOM { "off".to_owned() } else { format!("{db:+.1} dB") };
+            let (w, h) = (label.len() as f32 * 6.0 + 8.0, 14.0);
+            let left = if at.x + 8.0 + w > b.width { at.x - 8.0 - w } else { at.x + 8.0 };
+            let top = (at.y - h / 2.0).clamp(lane.0 - 4.0, lane.0 + lane.1 + 4.0 - h);
+            frame.fill(&Path::rounded_rectangle(Point::new(left, top), Size::new(w, h), 3.0.into()), iced::Color::from_rgba(0.0, 0.0, 0.0, 0.7));
+            frame.fill_text(Text {
+                content: label,
+                position: Point::new(left + 4.0, top + h / 2.0),
+                color: iced::Color::WHITE,
+                size: 11.0.into(),
+                align_y: Vertical::Center,
+                ..Default::default()
+            });
+        }
     }
 }
 
@@ -499,6 +545,16 @@ impl canvas::Program<Message> for Marks {
                     let start = if p.x >= l && p.x <= r { self.start } else { self.start + (p.x - (l + r) / 2.0) as f64 * per_px };
                     *drag = Drag::Scroll { x0: p.x, start };
                     Message::TimelinePan(start)
+                } else if p.y < CUTS && let Some((cut, key)) = self.sound_at(p, bounds) {
+                    *drag = Drag::Sound { cut, key };
+                    Message::SoundKeySelect(cut, key)
+                } else if p.y < CUTS && state.ctrl {
+                    // A sound point on the cut where clicked, dragged on.
+                    let cut = self.block_at(p.x, bounds)?;
+                    let c = &self.blocks[cut];
+                    let t = c.start + self.t(p.x, bounds) - c.from;
+                    *drag = Drag::Sound { cut, key: c.sound.partition_point(|k| k.t <= t) };
+                    Message::SoundKeyAdd(cut, t, Timeline::volume_db(CUT_LANE, p.y))
                 } else if p.y < CUTS {
                     let cut = self.block_at(p.x, bounds)?;
                     let c = &self.blocks[cut];
@@ -517,7 +573,7 @@ impl canvas::Program<Message> for Marks {
                     // A new point where clicked, dragged on from there.
                     let t = self.t(p.x, bounds);
                     *drag = Drag::Volume { key: self.volume.partition_point(|k| k.t <= t) };
-                    Message::VolumeAdd(t, Timeline::volume_db(p.y))
+                    Message::VolumeAdd(t, Timeline::volume_db(MUSIC_LANE, p.y))
                 } else if p.y >= MUSIC_TOP {
                     let clip = self.music_at(p.x, bounds)?;
                     let m = &self.music[clip];
@@ -558,7 +614,11 @@ impl canvas::Program<Message> for Marks {
                         let len = self.music[*clip].len;
                         Message::MusicMove(*clip, at + self.snap(*clip, &[at, at + len], *per_px), state.shift)
                     }
-                    Drag::Volume { key } => Message::VolumeMove(*key, self.t(x, bounds), Timeline::volume_db(position.y - bounds.y)),
+                    Drag::Volume { key } => Message::VolumeMove(*key, self.t(x, bounds), Timeline::volume_db(MUSIC_LANE, position.y - bounds.y)),
+                    Drag::Sound { cut, key } => {
+                        let c = &self.blocks[*cut];
+                        Message::SoundKeyMove(*cut, *key, c.start + self.t(x, bounds) - c.from, Timeline::volume_db(CUT_LANE, position.y - bounds.y))
+                    }
                     Drag::MusicTrim { clip, start, x0, from, per_px } => {
                         // Song time to edit time is fixed while trimming:
                         // either edge moves, the song stays put.
@@ -574,7 +634,7 @@ impl canvas::Program<Message> for Marks {
                 Drag::None => None,
                 Drag::Move { cut, moved: true, to, .. } => Some(canvas::Action::publish(Message::MoveCut(cut, to)).and_capture()),
                 Drag::Move { .. } | Drag::Scroll { .. } => Some(canvas::Action::request_redraw().and_capture()),
-                Drag::Playhead | Drag::Key { .. } | Drag::Trim { .. } | Drag::MusicMove { .. } | Drag::MusicTrim { .. } | Drag::Volume { .. } => {
+                Drag::Playhead | Drag::Key { .. } | Drag::Trim { .. } | Drag::MusicMove { .. } | Drag::MusicTrim { .. } | Drag::Volume { .. } | Drag::Sound { .. } => {
                     Some(canvas::Action::publish(Message::ScrubDone).and_capture())
                 }
             },
@@ -655,6 +715,7 @@ impl canvas::Program<Message> for Marks {
                 }
             }
         }
+        self.draw_sound(&mut frame, bounds);
         frame.fill(&Path::rectangle(Point::new(at - 1.0, 0.0), Size::new(2.0, CUTS)), palette.primary.strong.color);
         frame.fill(&Path::rectangle(Point::new(at - 1.0, MUSIC_TOP), Size::new(2.0, MUSIC)), palette.primary.strong.color);
         frame.fill(&Path::circle(Point::new(at, mid), BAR), palette.primary.strong.color);
@@ -692,6 +753,12 @@ impl canvas::Program<Message> for Marks {
                 }
                 if p.y >= CUTS {
                     return if self.key_at(p.x, bounds).is_some() { mouse::Interaction::Grab } else { mouse::Interaction::Pointer };
+                }
+                if self.sound_at(p, bounds).is_some() {
+                    return mouse::Interaction::Grab;
+                }
+                if state.ctrl && self.block_at(p.x, bounds).is_some() {
+                    return mouse::Interaction::Crosshair;
                 }
                 match self.block_at(p.x, bounds) {
                     Some(i) if self.edge_at(i, p.x, bounds).is_some() => mouse::Interaction::ResizingHorizontally,

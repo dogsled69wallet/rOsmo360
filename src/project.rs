@@ -258,6 +258,11 @@ pub struct Cut {
     /// assembled the edit, such as an automatic highlight pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Its sound's volume points, clip time, in dB on top of the project's
+    /// `sound` level. Pinned to the footage like the keyframes, so a shout
+    /// keeps its level wherever the cut goes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume: Vec<VolumeKey>,
 }
 
 impl Project {
@@ -284,10 +289,13 @@ impl Project {
             }
             clip.input = dir.join(&clip.input);
         }
-        if project.music.keyframes.iter().any(|k| !k.t.is_finite() || !k.volume.is_finite()) {
-            bail!("a music volume point isn't a number");
+        let keys = project.cuts.iter_mut().map(|c| &mut c.volume).chain([&mut project.music.keyframes]);
+        for keys in keys {
+            if keys.iter().any(|k| !k.t.is_finite() || !k.volume.is_finite()) {
+                bail!("a volume point isn't a number");
+            }
+            keys.sort_by(|a, b| a.t.total_cmp(&b.t));
         }
-        project.music.keyframes.sort_by(|a, b| a.t.total_cmp(&b.t));
         Ok(project)
     }
 
