@@ -1,10 +1,12 @@
 # rOsmo360 user guide
 
-rOsmo360 plays and edits 360° video from the **DJI Osmo 360**. It reads the camera's `.OSV` files directly, stitches the two lenses, keeps the horizon level, and lets you look around, cut clips together, keyframe the camera's view and export a finished video.
+rOsmo360 plays and edits 360° video from the **DJI Osmo 360**. It reads the camera's `.OSV` files directly, stitches the two lenses, keeps the horizon level, and lets you look around, cut clips together, move the camera's view with keyframes and export a finished video.
 
-This guide walks through the whole app. For building it, see the [README](../README.md).
+Part 1 walks through the app itself; everything there is done with the mouse and keyboard. Part 2 covers the command line, for batches, scripts and a few extra tools. For building rOsmo360 from source, see the [README](../README.md).
 
 **Contents**
+
+Part 1: Using rOsmo360
 
 1. [Getting started](#1-getting-started)
 2. [The window](#2-the-window)
@@ -17,11 +19,17 @@ This guide walks through the whole app. For building it, see the [README](../REA
 9. [Projects](#9-projects)
 10. [Exporting video](#10-exporting-video)
 11. [Saving photos](#11-saving-photos)
-12. [The command line](#12-the-command-line)
-13. [Keyboard shortcuts](#13-keyboard-shortcuts)
-14. [Tips and troubleshooting](#14-tips-and-troubleshooting)
+12. [Keyboard shortcuts](#12-keyboard-shortcuts)
+13. [Tips and troubleshooting](#13-tips-and-troubleshooting)
+
+Part 2: Advanced
+
+14. [The command line](#14-the-command-line)
+15. [The clip cache](#15-the-clip-cache)
 
 ---
+
+# Part 1: Using rOsmo360
 
 ## 1. Getting started
 
@@ -29,36 +37,29 @@ This guide walks through the whole app. For building it, see the [README](../REA
 
 Install `ffmpeg` from your distribution first (`sudo apt install ffmpeg`, `sudo dnf install ffmpeg` or `sudo pacman -S ffmpeg`). Then take one of the ready-made builds from the [releases page](https://github.com/ravelund/rOsmo360/releases/latest). They run on x86_64 Linux: Ubuntu 22.04, Debian 12, Fedora 36 and newer.
 
-- **Install script**: puts `rosmo360` in `~/.local/bin` and adds **rOsmo360** to your application menu.
+- **Install script**: puts rOsmo360 in your application menu. Paste this into a terminal:
 
   ```sh
   curl -fsSL https://github.com/ravelund/rOsmo360/releases/latest/download/install.sh | sh
   ```
 
-  Run it again to update. `--uninstall` removes it; your settings stay.
-- **AppImage**: download `rOsmo360-x86_64.AppImage`, make it executable (`chmod +x rOsmo360-x86_64.AppImage`) and double-click it, or run it with clips or a project after it. Wherever this guide says `rosmo360 <command>`, you can also run `./rOsmo360-x86_64.AppImage <command>`.
-
-To build it yourself instead, see the [README](../README.md#building).
+  Run it again to update. Adding `--uninstall` removes it; your settings stay.
+- **AppImage**: download `rOsmo360-x86_64.AppImage`, make it executable (in your file manager's properties, or `chmod +x rOsmo360-x86_64.AppImage`) and double-click it.
 
 ### What you need
 
-
 - Clips from the Osmo 360 (`.OSV`). Copy the `.LRF` file that the camera records next to each clip as well. It's a small preview version, and rOsmo360 uses it for smooth playback, scrubbing and thumbnails.
-- `ffmpeg` and `ffprobe` installed and on your `PATH`.
 - A GPU with up-to-date drivers (Vulkan on Linux). It decodes the video, draws the view and renders exports.
 
-Start **rOsmo360** from your application menu, or from a terminal with `rosmo360 play`. In a terminal you can also name what to open:
+### Opening clips
 
-```sh
-rosmo360 play                  # the start screen
-rosmo360 play clip.OSV         # one clip
-rosmo360 play a.OSV b.OSV      # several clips, one after another on the timeline
-rosmo360 play edit.json        # a saved project
-```
+Start **rOsmo360** from your application menu.
 
-![The start screen, with the Vibing with Ravelund logo and the buttons Open… and Open project…](guide/start.jpg)
+![The start screen: the Vibing with Ravelund logo, and the buttons Open clips… and Open project…](guide/start.jpg)
 
-On the start screen, **Open clips…** picks one or more clips and **Open project…** opens a saved edit. A bar shows how far loading has got ("Loading clip 4 of 23": a clip that several cuts use loads once). The first clip starts playing as soon as it has loaded.
+**Open clips…** picks one or more clips; **Open project…** opens a saved edit. A bar shows how far loading has got. The first time, a clip takes a while to open, longest from a network drive or a spinning disk, because rOsmo360 reads the camera's motion data from all through the file. It remembers what it read, so the same clip opens almost at once after that, in any project.
+
+The first clip starts playing as soon as it has loaded; the others load behind it.
 
 ## 2. The window
 
@@ -66,29 +67,29 @@ On the start screen, **Open clips…** picks one or more clips and **Open projec
 
 From top to bottom:
 
-1. **The top bar**: adding clips, projects, the export shape and resolution, and what is playing.
+1. **The top bar**: projects, clips, the export, and what is playing.
 
-   ![The top bar: Add clip…, Open project…, Save project, Aspect 16:9, Export…, 1080p, the clip's name, and the playback quality](guide/top-bar.png)
+   ![The top bar: icons for new project, add clips, open project, save and save as; Aspect 16:9; the export icon, 1080p, the Clips and Resolve checkboxes, the clip's name, and two dimmed status icons](guide/top-bar.png)
 
-   The buttons are icons: new project (a page with a plus), add clips (a film strip with a plus), open a project (a folder), save (a diskette; dimmed when there's nothing new to save), save as (a diskette with a pencil) and export (an arrow out of a tray). While an export or a track runs, a crossed circle cancels it.
+   The icons, from the left: **new project** (a page with a plus), **add clips** (a film strip with a plus), **open a project** (a folder), **save** (a diskette; dimmed when there's nothing new to save) and **save as** (a diskette with a pencil). Then the **Aspect** of the picture, and **export** (an arrow out of a tray) with its resolution and options. While an export or a colour track runs, its progress shows here, with a crossed circle to stop it.
 
-   On the right, two dimmed icons say what you're seeing (a film strip for the proxy, a picture for the OSV or full resolution, an hourglass while a full-resolution frame loads) and how it decodes (a lightning bolt for the GPU, a chip for software); hover over them for the details. After an export it says where the file went.
+   On the right, two dimmed icons say what you're seeing (a film strip for the quick preview version, a picture for the full video, an hourglass while a sharp paused frame loads) and how the video is decoded (a lightning bolt when the GPU does it). Messages, such as where an export went, appear beside them.
 
 2. **The view**, where you look around.
 
-3. **The transport row**: play or pause, photos (a camera saves the view, a globe the whole sphere), the time, keyframe and cut tools, timeline zoom, and sound.
+3. **The transport row**: play, photos, the time, keyframe and cut tools, timeline zoom, and sound.
 
-   ![The transport row: Play, Save view…, Save 360°…, the time, add and delete keyframe, the Ease picker, split, delete cut, undo, redo, zoom out, the zoom slider, zoom in, fit, mute and volume](guide/transport.png)
+   ![The transport row: play, save view, save 360°, the time, add and delete keyframe, the Ease and Follow pickers, the eyedropper, split, delete cut, undo, redo, the timeline zoom, mute and volume](guide/transport.png)
 
 4. **The timeline**: the cuts of your edit, with thumbnails, and below them the seek bar with the keyframes.
 
    ![The timeline: four cuts with thumbnails and labels such as "0045 · 12.0 s" and "0026 · 10.0 s · world lock", and the seek bar with keyframe marks](guide/timeline.png)
 
-5. **The settings row**: stabilisation, projection, playback source, field of view, rolling-shutter correction, full resolution when paused, reset view (a turn-back arrow) and fullscreen.
+5. **The settings row**: stabilisation, projection, playback source, field of view, rolling-shutter correction, full resolution when paused, reset view (a turn-back arrow) and fullscreen (corners).
 
-   ![The settings row: Stabilisation Horizon, Projection Perspective, Playback source Proxy (LRF), the FOV slider, Rolling shutter, Full res when paused, Reset view and Fullscreen](guide/settings.png)
+   ![The settings row: Stabilisation Horizon, Projection Perspective, Playback source Proxy (LRF), the FOV slider, Rolling shutter, Full res when paused, and the reset-view and fullscreen icons](guide/settings.png)
 
-Hover over any button to see what it does and its shortcut.
+**Hover over any button** to see what it does and its keyboard shortcut.
 
 ## 3. Watching a clip
 
@@ -101,8 +102,8 @@ Hover over any button to see what it does and its shortcut.
 | Roll the view | Right-drag, or Q / E |
 | Zoom | Scroll in the view, `+` / `-`, or the **FOV** slider |
 | Go back to the starting view | 0 or Home, or the turn-back arrow |
-| Fullscreen | F, or the corners button; Esc leaves it |
-| Mute | M, or the speaker button; the slider sets the volume |
+| Fullscreen | F, or the corners icon; Esc leaves it |
+| Mute | M, or the speaker icon; the slider sets the volume |
 
 **Playback source.** Clips play from the `.LRF` proxy by default. It decodes quickly, so playback and scrubbing stay smooth on most computers. On a fast GPU you can play the `.OSV` itself, scaled to 1920 px or at its full 3840 px. If there's no `.LRF`, the `.OSV` is used.
 
@@ -149,21 +150,21 @@ An *edit* is a row of *cuts*, each a stretch of one clip, played one after anoth
 - **Delete**: select it and press **Shift+Delete**, or 🗑.
 - **Undo / redo**: Ctrl+Z and Ctrl+Shift+Z (or Ctrl+Y).
 
-Playback runs through the cuts in order. At the end of one cut it carries on into the next, even when the next one comes from a different clip.
+Playback runs through the cuts in order, straight on from one into the next, even when the next one comes from a different clip: rOsmo360 gets the next cut ready a few seconds ahead, so the change is smooth.
 
-Each cut shows thumbnails of its footage, the view straight ahead. They fill in a moment after a clip loads; a long clip takes a few seconds.
+Each cut shows thumbnails of its footage, the view straight ahead. They fill in a moment after a clip loads; a long clip takes a few seconds the first time.
 
-A cut's label shows its clip and length, its stabilisation when it differs, and its note when there's room. Notes come from the project file (`"note": "summit arrival"`), so whoever put the edit together can say what each cut is for; the player shows them but doesn't edit them yet.
+A cut's label shows its clip and length, its stabilisation when it differs, and its note when there's room. Notes come from the project file, so whoever put the edit together can say what each cut is for; the player shows them but doesn't edit them yet.
 
 ### Zooming the timeline
 
 With a long edit, short cuts and close keyframes get narrow. Zoom in:
 
 - **Scroll** on the timeline to zoom around the mouse pointer.
-- **Ctrl+=** / **Ctrl+−**, or the 🔍 buttons and the slider between them, zoom around the playhead.
-- **Ctrl+0**, or ⟷, shows the whole edit again.
+- **Ctrl+=** / **Ctrl+−**, or the magnifier icons and the slider between them, zoom around the playhead.
+- **Ctrl+0**, or the arrows-to-both-ends icon, shows the whole edit again.
 
-![The timeline zoomed in on the first cut: many thumbnails of the rock tower, the seek bar with two keyframe squares, and a scrollbar underneath](guide/timeline-zoomed.png)
+![The timeline zoomed in on the end of the first cut and the start of the second: thumbnails of the rock tower and the rock dome, the seek bar with two keyframe squares, and a scrollbar underneath](guide/timeline-zoomed.png)
 
 When zoomed in, a scrollbar appears under the seek bar. Drag it, use Shift+scroll, or scroll sideways on a touchpad to move along. While playing, the timeline scrolls along to keep the playhead in sight.
 
@@ -172,7 +173,7 @@ When zoomed in, a scrollbar appears under the seek bar. Drag it, use Shift+scrol
 A **keyframe** remembers a view at a moment of a cut: where it looks (yaw, pitch, roll), the zoom, and the projection. Between keyframes the view moves smoothly from one to the next. That's how you make pans, slow zooms and morphs into a little planet.
 
 1. Go to the moment where the move should start, and frame the view.
-2. Press **K**, or the ◆+ button. A mark appears on the seek bar.
+2. Press **K**, or the diamond-with-a-plus icon. A mark appears on the seek bar.
 3. Go to where the move should end, frame the new view, and press **K** again.
 4. Play it back.
 
@@ -181,7 +182,7 @@ More:
 - **Update a keyframe**: go to it and press K again with the new view.
 - **Jump between keyframes**: `[` and `]`, or click a mark.
 - **Retime a keyframe**: drag its mark along the seek bar.
-- **Delete a keyframe**: go to it and press **Delete**, or the ◆× button.
+- **Delete a keyframe**: go to it and press **Delete**, or the crossed-diamond icon.
 
 **Following and looking.** After you play, seek or change a keyframe, the view follows the keyframes. As soon as you look around by hand, you take over from the view they showed, until the next play or seek. So you can always look around freely without changing anything; only K saves a view.
 
@@ -208,7 +209,7 @@ Two common patterns:
 
 ### Follow: a third-person shot
 
-A keyframe can **follow the selfie stick** instead of looking in a fixed direction. The stick points at whoever holds it, so the view keeps you in the picture as you walk, turn and move the stick, like a drone following from above and behind. rOsmo360 knows where the stick points from the camera's own motion data, so it needs no picture analysis and keeps working even when the stick points straight down.
+A keyframe can **follow the selfie stick** instead of looking in a fixed direction. The stick points at whoever holds it, so the view keeps you in the picture as you walk, turn and move the stick, like a drone following from above and behind. rOsmo360 knows where the stick points from the camera's own motion data, so it keeps working even when the stick points straight down.
 
 1. Frame the shot you want around yourself: for example tilt the view up a little from the stick so the trail ahead shows too, and widen it (FOV 100 or so).
 2. Press **K**, then choose **Stick** in the **Follow** picker. The view stays as it is: the keyframe now keeps it as an offset from the stick. Its mark on the seek bar gets a ring.
@@ -217,10 +218,10 @@ A keyframe can **follow the selfie stick** instead of looking in a fixed directi
 To follow **someone or something else**, such as a friend in a red jacket, track it by its colour:
 
 1. Pause where the subject is in view, at the keyframe that should start following it.
-2. Click the **eyedropper** button next to the Follow picker, or choose **Colour track** in the picker, and draw a box over the subject. A box over a good patch of the colour works better than a thin edge.
-3. rOsmo360 takes the box's colour, tracks it from there to the end of the cut (the top bar shows **Tracking** with a crossed circle to stop it), saves the track next to the project, and makes the keyframe follow it with the subject in the middle. The top bar says in how many moments it found the colour.
+2. Click the **eyedropper** icon next to the Follow picker, or choose **Colour track** in the picker, and drag a box over the subject. A box over a good patch of the colour works better than a thin edge. Esc cancels.
+3. rOsmo360 takes the box's colour and tracks it from there to the end of the cut (the top bar shows **Tracking** with its progress), saves the track next to the project, and makes the keyframe follow it with the subject in the middle. The top bar then says in how many moments it found the colour.
 
-Pick something with a strong colour that nothing big nearby shares: sky, grass, rock and snow won't track. Small things that swing, like legs, follow less steadily than a jacket. Tracks can also be made on the command line ([`rosmo360 track`](#12-the-command-line)).
+Pick something with a strong colour that nothing big nearby shares: sky, grass, rock and snow won't track. Small things that swing, like legs, follow less steadily than a jacket.
 
 ## 8. Framing: the aspect lock
 
@@ -235,20 +236,20 @@ Exports and saved views take the same shape. With **Free**, exports are 16:9.
 A project saves the edit: the cuts, their keyframes and stabilisation, and the aspect lock.
 
 - **Save**: Ctrl+S, or the diskette. **Save as**: Ctrl+Shift+S, or the diskette with a pencil.
-- **Open**: Ctrl+Shift+O, or the folder. You can also give the file to `rosmo360 play edit.json`.
-- **New**: Ctrl+N, or the page with a plus at the left of the top bar, starts an empty project without closing the window. Clips you had open stay loaded, so adding them again is instant.
+- **Open**: Ctrl+Shift+O, or the folder.
+- **New**: Ctrl+N, or the page with a plus, starts an empty project without closing the window. Clips you had open stay loaded, so adding them again is instant.
 
 The window title shows the project's name, with a dot (•) when there are unsaved changes. If you close the window, open another project or start a new one with unsaved changes, rOsmo360 asks whether to **Save**, **Don't save** or **Cancel**.
 
-Projects are small JSON files. Clips in the project's folder, or in folders inside it, are saved by relative path, so you can move the whole folder, or copy it to another computer, and the project still finds its clips. If a clip is missing when you open a project, its cuts are left out and you're told which.
+Clips in the project's folder, or in folders inside it, are remembered by relative path, so you can move the whole folder, or copy it to another computer, and the project still finds its clips. If a clip is missing when you open a project, its cuts are left out and you're told which.
 
 A project starts playing as soon as its first cut's clip has loaded; the others load behind it, with the bar in the top bar. If playback reaches a cut whose clip isn't in yet, it waits there.
 
 ## 10. Exporting video
 
-1. Pick the resolution next to the export button (an arrow out of a tray): 720p, 1080p (the default, good for sharing online), 1440p or 2160p (4K). It's the short side of the picture, so 1080p is 1920 × 1080 for 16:9, or 1080 × 1920 for 9:16.
+1. Pick the resolution next to the export icon (an arrow out of a tray): 720p, 1080p (the default, good for sharing online), 1440p or 2160p (4K). It's the short side of the picture, so 1080p is 1920 × 1080 for 16:9, or 1080 × 1920 for 9:16.
 2. Set the shape with the **Aspect** picker.
-3. Click the export button and choose where to save the MP4.
+3. Click the export icon and choose where to save the MP4.
 
 The export renders the whole edit at full resolution, with the sound joined across the cuts. Each cut uses its own keyframes and stabilisation, and the export follows the rolling-shutter setting. Progress shows in the top bar, with a crossed circle to stop it; a cancelled export leaves no half-finished file.
 
@@ -265,57 +266,12 @@ Both are remembered, and they combine: Clips and Resolve together give one `.mov
 
 Pause, then:
 
-- **Save view** (the camera) saves what you see as a PNG, 3840 px on the long side, in the aspect lock's shape.
-- **Save 360°** (the globe) saves the whole sphere as a 7680 × 3840 equirectangular PNG. Most photo sites and viewers that support 360° photos can show it.
+- **Save view** (the camera icon) saves what you see as a PNG, 3840 px on the long side, in the aspect lock's shape.
+- **Save 360°** (the globe icon) saves the whole sphere as a 7680 × 3840 equirectangular PNG. Most photo sites and viewers that support 360° photos can show it.
 
 Both are rendered from fresh full-resolution frames, which takes a few seconds.
 
-## 12. The command line
-
-Everything the player exports can also be made from a terminal, which is handy for batches or scripts. `rosmo360 --help` and `rosmo360 <command> --help` list all the options.
-
-**Export** a project, or a clip with a fixed or keyframed view:
-
-```sh
-rosmo360 export edit.json -o edit.mp4                         # a project saved from the player
-rosmo360 export clip.OSV -s 30 -d 8 --view 40,-10 -a 9:16 -o reel.mp4
-rosmo360 export clip.OSV --reframe moves.json -r 2160p -o reel.mp4
-rosmo360 export edit.json --draft -o draft.mp4                # quick and soft, from the proxies
-rosmo360 export edit.json --clips --handles 1 -o clips/        # a file per cut, with 1 s extra either side
-rosmo360 export edit.json --format resolve -o edit.mov         # for DaVinci Resolve on Linux
-```
-
-`--handles` adds footage before and after each clip, where the camera recorded it, so another editor has room for its own transitions.
-
-**Preview** an edit or a clip as one image. For a project you get a row per cut, each tile framed as the export will frame it:
-
-```sh
-rosmo360 preview edit.json --every 2 -o check.png
-rosmo360 preview clip.OSV -o sheet.png                        # 24 moments of a clip, the whole sphere
-```
-
-![A contact sheet of a four-cut project: rows of small framed views of a ridge, a rock tower, a boulder slope, a lake valley turning into an upward little planet, and a boulder field, each labelled with its cut number and time](guide/contact-sheet.jpg)
-
-**Track a subject by colour**, for keyframes to follow (see [Follow](#follow-a-third-person-shot)):
-
-```sh
-rosmo360 track clip.OSV --colour "#c8302a" -s 40 -d 20 > friend.csv
-```
-
-Then give a keyframe `"follow": "friend.csv"` in the project file. Read the colour off a preview or a saved photo. If something else nearby has the same colour, add `--near YAW,PITCH` with where the subject is at the start, as shown on a `--stabilize level` preview.
-
-**Find good moments**: `rosmo360 scan clip.OSV > scan.csv` gives, per second, where the camera points, how fast it turns or shakes, and how loud it is. Add `--image` for three columns from the picture: how much of the sky is open (`sky`), how high the skyline is around you (`skyline`, in degrees: near 0 on a summit, higher in a valley) and in how many directions you can see out to the horizon (`open`). Sort by `open` to find the panoramas. It needs the `.LRF` proxy and takes a little longer: about 20 s for a 13-minute clip. `rosmo360 info clip.OSV` prints the clip's length, frame rate and recording time.
-
-**Stitch** whole clips or frames to equirectangular video or images, for other 360° tools:
-
-```sh
-rosmo360 render clip.OSV -s 48 -d 12 -w 3840 --stabilize horizon -o out.mp4
-rosmo360 stitch clip.OSV -t 10 -w 4096 --stabilize horizon -o frame.png
-```
-
-The [README](../README.md#usage) describes the project and reframe file formats.
-
-## 13. Keyboard shortcuts
+## 12. Keyboard shortcuts
 
 | Key | Action |
 |---|---|
@@ -342,20 +298,96 @@ The [README](../README.md#usage) describes the project and reframe file formats.
 | Ctrl+= / Ctrl+− | Zoom the timeline in / out |
 | Ctrl+0 | Show the whole edit on the timeline |
 | Ctrl+O | Add clips |
+| Ctrl+N | New project |
 | Ctrl+S / Ctrl+Shift+S | Save the project / save as |
 | Ctrl+Shift+O | Open a project |
-| Ctrl+N | New project |
+| Esc | Cancel drawing a colour box |
 
 With the mouse: drag in the view to look around, right-drag to roll, scroll to zoom. On the timeline, click to seek, click a keyframe mark to jump to it, drag a mark to retime it, drag a cut to move it or its edges to trim it, and scroll to zoom.
 
-## 14. Tips and troubleshooting
+## 13. Tips and troubleshooting
 
-- **Playback stutters.** Use the **Proxy (LRF)** source; it needs far less than the full `.OSV`. If a clip has no `.LRF`, copy it from the camera's card; DJI records one next to every clip.
-- **Clips load slowly the first time.** Each clip is read for its calibration and motion data, which are spread through the file: from a network share that can take most of a minute for a long clip. rOsmo360 keeps what it read, and the timeline's thumbnails, in a cache, so the next time the clip opens in a fraction of a second, in any project and from the command line too. It recognises a clip by its contents, so moving or renaming footage doesn't matter, and a changed file is read afresh. Video on a spinning hard drive is still slower to start and scrub than on an SSD.
-- **The cache** is in `~/.cache/rosmo360` on Linux (`%LOCALAPPDATA%\rosmo360` on Windows), about 1.5 MB a minute of footage. To keep it elsewhere, say on a disk meant for media, run `rosmo360 cache move /mnt/media/rosmo360-cache`: it moves what's cached and stays there from then on (`rosmo360 cache move --default` goes back). `rosmo360 cache add ~/Videos/Hike` caches every clip in a folder ahead of time, so even the first open is quick; run it after copying a card (`--force` reads every clip afresh, even those already cached). `rosmo360 cache` shows where the cache is and its size; `rosmo360 cache clear` empties it, and `rosmo360 cache clear --older-than 90` removes only what no clip has used for 90 days. It's always safe to clear. `--no-cache` on any command reads clips afresh and caches nothing.
+- **Playback stutters.** Use the **Proxy (LRF)** source; it needs far less than the full `.OSV`. If a clip has no `.LRF`, copy it from the camera's card; DJI records one next to every clip. Footage on an SSD plays and scrubs more smoothly than on a spinning disk or a network drive.
+- **Clips open slowly the first time.** That's rOsmo360 reading the camera's motion data; the second time the clip opens almost at once. To have a whole card ready before you start, see [the clip cache](#15-the-clip-cache).
 - **The paused picture keeps changing sharpness.** Turn off **Full res when paused** while keyframing.
 - **Something close to the camera looks doubled or cut at the edges.** That's the seam where the two lenses meet. rOsmo360 lines up close subjects and cuts cleanly where it can't, but a hand or face very close to the seam can still show it, most of all next to the selfie stick, where the two lenses overlap least. Turn the view so close subjects sit away from the sides of the camera.
 - **"World lock" starts tilted.** It holds the clip's first orientation. Use **Level** instead: it holds the direction but keeps the horizon level.
-- **No sound.** Check the speaker button isn't muted. On Linux, sound goes through ALSA, which PipeWire and PulseAudio both provide.
+- **No sound.** Check the speaker icon isn't showing muted (mute is remembered between runs). On Linux, sound goes through ALSA, which PipeWire and PulseAudio both provide.
 - **Export says it's stitching on the CPU.** No usable GPU was found, so it falls back to the slower CPU stitcher. Update your GPU drivers. The result looks the same.
-- **Your settings** (stabilisation, playback source, rolling shutter, full res when paused, volume, export resolution and aspect) are remembered between runs, in `~/.config/rosmo360/settings.json` on Linux.
+- **Your settings** (stabilisation, playback source, rolling shutter, full res when paused, volume and mute, export resolution and options, and aspect) are remembered between runs.
+
+---
+
+# Part 2: Advanced
+
+## 14. The command line
+
+Everything the player does can also be done from a terminal, which is handy for batches and scripts, and a few tools exist only there. `rosmo360 --help` and `rosmo360 <command> --help` list every option. If you use the AppImage, write `./rOsmo360-x86_64.AppImage` where these say `rosmo360`.
+
+**Open** the player with something loaded:
+
+```sh
+rosmo360 play                  # the start screen
+rosmo360 play clip.OSV         # one clip
+rosmo360 play a.OSV b.OSV      # several clips, one after another on the timeline
+rosmo360 play edit.json        # a saved project
+```
+
+**Export** a project, or a clip with a fixed or keyframed view:
+
+```sh
+rosmo360 export edit.json -o edit.mp4                         # a project saved from the player
+rosmo360 export clip.OSV -s 30 -d 8 --view 40,-10 -a 9:16 -o reel.mp4
+rosmo360 export clip.OSV --reframe moves.json -r 2160p -o reel.mp4
+rosmo360 export edit.json --draft -o draft.mp4                # quick and soft, from the proxies
+rosmo360 export edit.json --clips --handles 1 -o clips/        # a file per cut, with 1 s extra either side
+rosmo360 export edit.json --format resolve -o edit.mov         # for DaVinci Resolve on Linux
+```
+
+`--handles` adds footage before and after each clip, where the camera recorded it, so another editor has room for its own transitions.
+
+**Preview** an edit or a clip as one image. For a project you get a row per cut, each tile framed as the export will frame it:
+
+```sh
+rosmo360 preview edit.json --every 2 -o check.png
+rosmo360 preview clip.OSV -o sheet.png                        # 24 moments of a clip, the whole sphere
+```
+
+![A contact sheet of a four-cut project: rows of small framed views of a ridge, a rock tower, a boulder slope, a lake valley turning into an upward little planet, and a boulder field, each labelled with its cut number and time](guide/contact-sheet.jpg)
+
+**Track a subject by colour**, the command-line version of the eyedropper (see [Follow](#follow-a-third-person-shot)):
+
+```sh
+rosmo360 track clip.OSV --colour "#c8302a" -s 40 -d 20 > friend.csv
+```
+
+Then give a keyframe `"follow": "friend.csv"` in the project file. Read the colour off a preview or a saved photo. If something else nearby has the same colour, add `--near YAW,PITCH` with where the subject is at the start, as shown on a `--stabilize level` preview.
+
+**Find good moments**: `rosmo360 scan clip.OSV > scan.csv` gives, per second, where the camera points, how fast it turns or shakes, and how loud it is. Add `--image` for three columns from the picture: how much of the sky is open (`sky`), how high the skyline is around you (`skyline`, in degrees: near 0 on a summit, higher in a valley) and in how many directions you can see out to the horizon (`open`). Sort by `open` to find the panoramas. It needs the `.LRF` proxy and takes a little longer: about 20 s for a 13-minute clip. `rosmo360 info clip.OSV` prints the clip's length, frame rate and recording time.
+
+**Stitch** whole clips or frames to equirectangular video or images, for other 360° tools:
+
+```sh
+rosmo360 render clip.OSV -s 48 -d 12 -w 3840 --stabilize horizon -o out.mp4
+rosmo360 stitch clip.OSV -t 10 -w 4096 --stabilize horizon -o frame.png
+```
+
+Projects are small JSON files you can also write or change by hand; the [README](../README.md#usage) describes the project and reframe formats, including cut notes (`"note": "summit arrival"`), per-cut stabilisation and following keyframes.
+
+## 15. The clip cache
+
+What rOsmo360 reads from a clip the first time, the calibration, the motion data and the timeline's thumbnails, is kept in a cache, so the next time the clip opens in a fraction of a second, in any project and from the command line too. (One 7-minute clip on a network share: 46 s the first time, 0.4 s after.) It recognises a clip by its contents, so moving or renaming footage doesn't matter, and a changed file is read afresh.
+
+```sh
+rosmo360 cache                                  # where it is, how many clips, how big
+rosmo360 cache add ~/Videos/Hike                # cache every clip in a folder ahead of time
+rosmo360 cache add ~/Videos/Hike --force        # read them all afresh, even those cached
+rosmo360 cache move /mnt/media/rosmo360-cache   # keep it elsewhere from now on
+rosmo360 cache move --default                   # back to the usual place
+rosmo360 cache clear                            # empty it
+rosmo360 cache clear --older-than 90            # only what no clip has used for 90 days
+```
+
+- **Where**: `~/.cache/rosmo360` on Linux (`%LOCALAPPDATA%\rosmo360` on Windows), about 1.5 MB per minute of footage. `cache move` moves what's cached to the new folder, say on a disk meant for media, and remembers it. Setting `ROSMO360_CACHE=/some/folder` overrides that for one run or a script.
+- **Ahead of time**: run `cache add` after copying a card, and even the first open is quick. It skips clips already cached, so it's cheap to run again.
+- **Safe to clear**: anything removed is simply read again the next time it's needed. `--no-cache` on any command reads clips afresh and caches nothing.
