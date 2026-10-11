@@ -339,6 +339,8 @@ A project saves the edit: the cuts, their keyframes, stabilisation, crossfades, 
 - **Open**: Ctrl+Shift+O, or the folder.
 - **New**: Ctrl+N, or the page with a plus, starts an empty project without closing the window. Clips you had open stay loaded, so adding them again is instant.
 
+**A project saves keyframes, not where you happen to be looking.** If you frame a cut by dragging the view but set no keyframe, the project doesn't keep that view: it opens looking straight ahead again. Press **K** to keyframe the view you want before saving; one keyframe at the start of the first cut is enough to frame cuts after it that have none (see [Keyframes](#7-keyframes-moving-the-camera)).
+
 The window title shows the project's name, with a dot (•) when there are unsaved changes. If you close the window, open another project or start a new one with unsaved changes, rOsmo360 asks whether to **Save**, **Don't save** or **Cancel**.
 
 Clips in the project's folder, or in folders inside it, are remembered by relative path, so you can move the whole folder, or copy it to another computer, and the project still finds its clips. If a clip is missing when you open a project, its cuts are left out and you're told which.
@@ -415,6 +417,7 @@ With the mouse: drag in the view to look around, right-drag to roll, scroll to z
 - **"World lock" starts tilted.** It holds the clip's first orientation. Use **Level** instead: it holds the direction but keeps the horizon level.
 - **No sound.** Check the speaker icon isn't showing muted (mute is remembered between runs). On Linux, sound goes through ALSA, which PipeWire and PulseAudio both provide.
 - **Export says it's stitching on the CPU.** No usable GPU was found, so it falls back to the slower CPU stitcher. Update your GPU drivers. The result looks the same.
+- **A saved project opens looking straight ahead.** The view you framed had no keyframe, and only keyframes are saved. Press **K** on the view you want, then save.
 - **Your settings** (stabilisation, playback source, rolling shutter, full res when paused, volume and mute, export resolution and options, and aspect) are remembered between runs.
 
 ---
