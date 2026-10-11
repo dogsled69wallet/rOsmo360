@@ -4064,6 +4064,7 @@ dependencies = [
  "serde",
  "serde_json",
  "telemetry-parser",
+ "zbus",
 ]
 
 [[package]]

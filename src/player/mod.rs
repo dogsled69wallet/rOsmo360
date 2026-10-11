@@ -2807,28 +2807,90 @@ const SPEAKER_MUTED: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox
 /// The OS's own colours (KDE colour scheme, GTK/portal, Windows, macOS), so
 /// the player looks like the rest of the desktop; iced's dark theme where
 /// they can't be read.
+///
+/// The desktop portal's light/dark choice and accent win over native-theme's
+/// own reading: in a Flatpak it can't see gsettings, kdeglobals or GTK's
+/// settings, and on desktops it has no reader for (Hyprland) it guesses from
+/// them, so it landed on light there. With no answer from the portal, a
+/// Flatpak goes dark, as the native build does.
 fn system_theme() -> Theme {
-    match native_theme_iced::from_system() {
-        Ok((theme, ..)) => theme,
+    let sys = match native_theme::SystemTheme::from_system() {
+        Ok(sys) => sys,
         Err(e) => {
             eprintln!("using the default theme: {e}");
-            Theme::Dark
+            return Theme::Dark;
         }
+    };
+    let (scheme, accent) = portal_appearance();
+    let dark = scheme.unwrap_or_else(|| std::env::var_os("FLATPAK_ID").is_some() || sys.mode.is_dark());
+    let mut resolved = if dark { sys.dark } else { sys.light };
+    if let Some([r, g, b]) = accent {
+        resolved.defaults.accent_color = native_theme_iced::Rgba::from_f32(r as f32, g as f32, b as f32, 1.0);
     }
+    native_theme_iced::to_theme(&resolved, &sys.name)
 }
 
-/// A message whenever the OS theme changes. The watcher calls back on its
-/// own thread; a channel hands that to iced.
+/// The XDG desktop portal's `color-scheme` (dark or light; `None` for no
+/// preference) and `accent-color`, read over D-Bus, giving up after a second
+/// so a missing or slow portal doesn't hold up the window.
+#[cfg(target_os = "linux")]
+fn portal_appearance() -> (Option<bool>, Option<[f64; 3]>) {
+    use zbus::zvariant::{OwnedValue, Value};
+    fn read(key: &str) -> Option<OwnedValue> {
+        let connection = zbus::blocking::Connection::session().ok()?;
+        let reply = connection
+            .call_method(
+                Some("org.freedesktop.portal.Desktop"),
+                "/org/freedesktop/portal/desktop",
+                Some("org.freedesktop.portal.Settings"),
+                "ReadOne",
+                &("org.freedesktop.appearance", key),
+            )
+            .ok()?;
+        let value: OwnedValue = reply.body().deserialize().ok()?;
+        // Some portals wrap the value in a second variant.
+        match &*value {
+            Value::Value(inner) => inner.try_to_owned().ok(),
+            _ => Some(value),
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let scheme = read("color-scheme").and_then(|v| u32::try_from(v).ok()).and_then(|v| match v {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        });
+        let accent = read("accent-color")
+            .and_then(|v| <(f64, f64, f64)>::try_from(v).ok())
+            .map(|(r, g, b)| [r, g, b])
+            .filter(|c| c.iter().all(|v| (0.0..=1.0).contains(v)));
+        let _ = tx.send((scheme, accent));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or((None, None))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn portal_appearance() -> (Option<bool>, Option<[f64; 3]>) {
+    (None, None)
+}
+
+/// A message whenever the OS theme changes, from native-theme's watcher or
+/// the desktop portal's (native-theme watches nothing on some desktops, such
+/// as Hyprland, nor in a Flatpak). The watchers call back on threads of their
+/// own; a channel hands that to iced.
 fn theme_changes() -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::{SinkExt, StreamExt};
     iced::stream::channel(1, async |mut output: iced::futures::channel::mpsc::Sender<Message>| {
         let (tx, mut rx) = iced::futures::channel::mpsc::unbounded();
-        let _watch = match native_theme::watch::on_theme_change(move |_| {
+        let portal = tx.clone();
+        watch_portal(move || {
+            let _ = portal.unbounded_send(());
+        });
+        let _watch = native_theme::watch::on_theme_change(move |_| {
             let _ = tx.unbounded_send(());
-        }) {
-            Ok(w) => w,
-            Err(e) => return eprintln!("not following theme changes: {e}"),
-        };
+        })
+        .inspect_err(|e| eprintln!("following theme changes through the desktop portal only: {e}"));
         while rx.next().await.is_some() {
             if output.send(Message::ThemeChanged).await.is_err() {
                 break;
@@ -2836,6 +2898,37 @@ fn theme_changes() -> impl iced::futures::Stream<Item = Message> {
         }
     })
 }
+
+/// Calls `changed` whenever the desktop portal's appearance settings change,
+/// on a thread of its own, for as long as the portal is there.
+#[cfg(target_os = "linux")]
+fn watch_portal(changed: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || {
+        let watch = || -> zbus::Result<()> {
+            let connection = zbus::blocking::Connection::session()?;
+            let proxy = zbus::blocking::Proxy::new(
+                &connection,
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings",
+            )?;
+            for signal in proxy.receive_signal("SettingChanged")? {
+                if let Ok((namespace, ..)) = signal.body().deserialize::<(String, String, zbus::zvariant::OwnedValue)>()
+                    && namespace == "org.freedesktop.appearance"
+                {
+                    changed();
+                }
+            }
+            Ok(())
+        };
+        if let Err(e) = watch() {
+            eprintln!("not watching the desktop portal: {e}");
+        }
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn watch_portal(_changed: impl Fn() + Send + 'static) {}
 
 fn labelled<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     row![text(label), widget.into()].spacing(6).align_y(Alignment::Center).into()

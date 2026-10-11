@@ -33,7 +33,7 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Sound**, in sync with the picture, with mute and volume.
 - **Save photos** of a paused frame: the view as framed, at 3840 px on the long side, or the whole 360° sphere at 7680 × 3840.
 - **Aspect lock** (16:9, 9:16, 4:3, 1:1, 2:1) for framing shots; saved views and exports take the same shape.
-- **Looks native**: follows your desktop's colour theme (KDE, GNOME, Windows, macOS), including live changes. Your settings are remembered between runs.
+- **Looks native**: follows your desktop's colour theme and accent (KDE, GNOME, Hyprland and others through the desktop portal, Windows, macOS), including live changes, in the Flatpak too. Your settings are remembered between runs.
 
 ### Editing
 
