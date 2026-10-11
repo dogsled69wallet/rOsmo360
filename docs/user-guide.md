@@ -212,7 +212,13 @@ A keyframe can **follow the selfie stick** instead of looking in a fixed directi
 2. Press **K**, then choose **Stick** in the **Follow** picker. The view stays as it is: the keyframe now keeps it as an offset from the stick. Its mark on the seek bar gets a ring.
 3. Play. Keyframes you add after it follow too, until you set one back to **Fixed**. A move from a following keyframe to a fixed one, or back, eases over as usual.
 
-To follow **someone or something else**, such as a friend in a red jacket, track it by colour on the command line first ([`rosmo360 track`](#12-the-command-line)) and put the track in the project. The Follow picker then lists it next to Stick, and you use it the same way.
+To follow **someone or something else**, such as a friend in a red jacket, track it by its colour:
+
+1. Pause where the subject is in view, at the keyframe that should start following it.
+2. Click the **eyedropper** button next to the Follow picker, or choose **Colour track** in the picker, and draw a box over the subject. A box over a good patch of the colour works better than a thin edge.
+3. rOsmo360 takes the box's colour, tracks it from there to the end of the cut (the top bar shows **Tracking** with **Cancel**), saves the track next to the project, and makes the keyframe follow it with the subject in the middle. The top bar says in how many moments it found the colour.
+
+Pick something with a strong colour that nothing big nearby shares: sky, grass, rock and snow won't track. Small things that swing, like legs, follow less steadily than a jacket. Tracks can also be made on the command line ([`rosmo360 track`](#12-the-command-line)).
 
 ## 8. Framing: the aspect lock
 

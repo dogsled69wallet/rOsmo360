@@ -13,14 +13,15 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 /// Samples are averaged in the world with Gaussian weights of this σ in
-/// seconds. On 0025, following the holder's shirt, a ±0.25 s box average
-/// stepped each time a sample (every 0.1 s) came into reach: frame-to-frame
-/// change of the aim's speed was 2.09° RMS, against 0.25° for the stick.
-/// With σ 0.25 s it is 0.17°; 0.4 s gained little more (0.14°) and would
-/// loosen the framing on quick moves.
-const SMOOTH: f64 = 0.25;
-/// Further than this from any sample the track says nothing (it was lost).
-const MAX_GAP: f64 = 1.0;
+/// seconds. A ±0.25 s box average stepped as each 0.1 s sample came into
+/// reach (on 0025, following the holder's shirt, the aim's frame-to-frame
+/// change of speed was 2.09° RMS, against 0.25° for the stick). Small or
+/// swinging subjects are noisier still: walking legs (blue trousers, 0.1-0.4%
+/// of the sphere against the shirt's 1-2%) moved 2.7° between samples, and
+/// at σ 0.25 s the view turned 1.4°/frame RMS against the stick's 0.8°. At
+/// 0.5 s that is 0.53°, while the view stays within a median 3-5° (at most
+/// ~12°) of the barely smoothed aim.
+const SMOOTH: f64 = 0.5;
 /// Search this far (degrees) around where the subject was last.
 const RADIUS: f64 = 30.0;
 /// A match covering less of the sphere than this is noise, not the subject.
@@ -42,9 +43,14 @@ impl Colour {
             bail!("colour {s:?} should look like #ff7a1a");
         }
         let c = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map(|v| v as f64 / 255.0).with_context(|| format!("colour {s:?}"));
-        let (hue, sat, val) = hsv([c(0)?, c(2)?, c(4)?]);
+        Colour::from_rgb([c(0)?, c(2)?, c(4)?], tolerance)
+    }
+
+    /// From display RGB (0..1), such as a picked area's median.
+    pub fn from_rgb(rgb: [f64; 3], tolerance: f64) -> Result<Colour> {
+        let (hue, sat, val) = hsv(rgb);
         if sat < 0.25 {
-            bail!("colour {s:?} is too grey to track; pick a saturated one");
+            bail!("{} is too grey to track; pick something with a stronger colour", hex(rgb));
         }
         Ok(Colour { hue, sat, val, tolerance })
     }
@@ -59,6 +65,20 @@ impl Colour {
         let dh = (h - self.hue + 180.0).rem_euclid(360.0) - 180.0;
         dh.abs() <= self.tolerance && s >= (0.5 * self.sat).max(0.25) && v >= (0.4 * self.val).max(0.15) && v <= 1.6 * self.val
     }
+}
+
+/// Display RGB (0..1) as "#rrggbb".
+pub fn hex(rgb: [f64; 3]) -> String {
+    let [r, g, b] = rgb.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// Where a track starts looking.
+pub enum Near {
+    /// Yaw and pitch of a level view, as `--near` takes them.
+    Level(f64, f64),
+    /// A direction in the rig, as the player's picked area gives it.
+    Rig([f64; 3]),
 }
 
 /// Hue in degrees, saturation and value 0..1.
@@ -165,26 +185,29 @@ impl Track {
     /// Where the subject is in the view at clip time `t` (seconds): its
     /// samples averaged in the world (so the camera's own turning doesn't
     /// smear it) with Gaussian weights over time, so the view glides instead
-    /// of stepping each time a sample comes into reach. Nothing more than
-    /// `MAX_GAP` from any sample.
+    /// of stepping each time a sample comes into reach. Before the first
+    /// sample, after the last or in a long gap it holds the nearest one in
+    /// the world: when it said nothing there, a keyframe following it looked
+    /// straight ahead instead, and a move towards it jumped 27° in one frame
+    /// once it spoke (0025, a track picked at 18.6 s, from 17.6 s on).
     pub fn aim(&self, stab: &Stabilizer, t: f64, readout_ms: f64) -> Option<(f64, f64)> {
         let s = &self.samples;
-        let i = s.partition_point(|p| p.0 < t);
-        let nearest = [i.checked_sub(1), (i < s.len()).then_some(i)].into_iter().flatten().map(|j| (s[j].0 - t).abs()).fold(f64::INFINITY, f64::min);
-        if nearest > MAX_GAP {
-            return None;
-        }
         let (lo, hi) = (s.partition_point(|p| p.0 < t - 3.0 * SMOOTH), s.partition_point(|p| p.0 <= t + 3.0 * SMOOTH));
+        let near = if hi > lo {
+            &s[lo..hi]
+        } else {
+            let i = s.partition_point(|p| p.0 < t).min(s.len() - 1);
+            let j = if i > 0 && (s[i - 1].0 - t).abs() < (s[i].0 - t).abs() { i - 1 } else { i };
+            &s[j..=j]
+        };
         let mut world = [0.0; 3];
-        for &(ts, d) in &s[lo..hi] {
-            let w = (-0.5 * ((ts - t) / SMOOTH).powi(2)).exp();
+        for &(ts, d) in near {
+            // Held alone, a far sample keeps its weight: it is all there is.
+            let w = if near.len() == 1 { 1.0 } else { (-0.5 * ((ts - t) / SMOOTH).powi(2)).exp() };
             let v = stab.to_world(ts * 1000.0, d);
             for k in 0..3 {
                 world[k] += w * v[k];
             }
-        }
-        if world == [0.0; 3] {
-            return None;
         }
         Some(stab.view_angles(t * 1000.0, readout_ms, world))
     }

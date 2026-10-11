@@ -66,11 +66,6 @@ impl std::fmt::Display for Mode {
 /// The stick's direction is averaged over this many ms either side, so
 /// hand shake doesn't shake a view that follows it.
 const STICK_SMOOTH_MS: f64 = 250.0;
-/// Straight below (or above) the camera a followed direction's yaw means
-/// nothing and swings wildly as it wobbles past; this much of the view's
-/// forward axis (per unit length) is mixed into its horizontal part, so
-/// there the yaw eases towards straight ahead instead.
-const STICK_NADIR_BIAS: f64 = 0.08;
 
 #[derive(Clone)]
 pub struct Stabilizer {
@@ -201,12 +196,18 @@ impl Stabilizer {
     }
 
     /// World direction `w` as view yaw and pitch in degrees at frame time
-    /// `t_ms`, for a view to look at it. Straight below or above, where yaw
-    /// means nothing and swings wildly, it leans towards straight ahead.
+    /// `t_ms`, for a view to look at it.
+    ///
+    /// Near straight below, sideways wobble turns into large yaw swings
+    /// that spin the picture; smoothing over time (`w` comes averaged) is
+    /// what calms them. Leaning the yaw towards straight ahead there made it
+    /// worse: with the subject behind the camera it flipped half way round
+    /// (up to 53° in one frame on 0025), and even the stick turned 0.90°/frame
+    /// RMS with it against 0.77° without.
     pub fn view_angles(&self, t_ms: f64, readout_ms: f64, w: [f64; 3]) -> (f64, f64) {
         let d = normalise(apply(transpose(self.world_from_view(t_ms + readout_ms / 2.0)), w));
         // View x right, y down, z forward: yaw turns right, pitch looks up.
-        (d[0].atan2(d[2] + STICK_NADIR_BIAS).to_degrees(), (-d[1]).clamp(-1.0, 1.0).asin().to_degrees())
+        (d[0].atan2(d[2]).to_degrees(), (-d[1]).clamp(-1.0, 1.0).asin().to_degrees())
     }
 
     /// The camera's pose at `t_ms`: its heading in degrees, turning the same

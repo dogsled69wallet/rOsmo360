@@ -243,10 +243,10 @@ impl fmt::Display for Follow {
     }
 }
 
-/// Where each `Follow` points in the frame being drawn, as view yaw and
-/// pitch in degrees; `None` where that can't be told (no attitude data, a
-/// track that is missing or lost there).
-pub type Aim<'a> = &'a dyn Fn(&Follow) -> Option<(f64, f64)>;
+/// Where each `Follow` points at a clip time, as view yaw and pitch in
+/// degrees; `None` where that can't be told (no attitude data, a track that
+/// is missing or lost there). Editing asks only at the keyframe's own time.
+pub type Aim<'a> = &'a dyn Fn(&Follow, f64) -> Option<(f64, f64)>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Keyframe {
@@ -260,20 +260,20 @@ pub struct Keyframe {
 }
 
 impl Keyframe {
-    /// The view it shows in the frame being drawn.
-    fn view_with(&self, aim: Aim) -> View {
+    /// The view it shows at clip time `t`.
+    fn view_with(&self, aim: Aim, t: f64) -> View {
         match &self.follow {
             None => self.view,
             Some(f) => {
-                let (yaw, pitch) = aim(f).unwrap_or((0.0, 0.0));
+                let (yaw, pitch) = aim(f, t).unwrap_or((0.0, 0.0));
                 View { yaw: yaw + self.view.yaw, pitch: (pitch + self.view.pitch).clamp(-90.0, 90.0), ..self.view }
             }
         }
     }
 
-    /// `view` (as shown) stored the way this keyframe keeps it.
+    /// `view` (as shown at its time) stored the way this keyframe keeps it.
     fn store(&self, view: View, aim: Aim) -> View {
-        match self.follow.as_ref().and_then(|f| aim(f)) {
+        match self.follow.as_ref().and_then(|f| aim(f, self.t)) {
             Some((yaw, pitch)) => View { yaw: view.yaw - yaw, pitch: view.pitch - pitch, ..view },
             None => view,
         }
@@ -373,7 +373,7 @@ impl Keyframes {
         let k = &self.0;
         let i = k.partition_point(|f| f.t <= t);
         let held = |f: &Keyframe| {
-            let v = f.view_with(aim);
+            let v = f.view_with(aim, t);
             (v, v.projection.planet())
         };
         if i == 0 || i == k.len() {
@@ -387,14 +387,19 @@ impl Keyframes {
             Ease::Hold => return Some(held(a)),
         };
         let lerp = |p: f64, q: f64| p + (q - p) * u;
-        let (mut va, mut vb) = (a.view_with(aim), b.view_with(aim));
-        // Where the stick points is known only modulo a turn: take the turn
-        // nearest the fixed keyframe's yaw, or the move would spin round.
-        let turn_near = |y: f64, to: f64| to + (y - to + 180.0).rem_euclid(360.0) - 180.0;
-        match (a.follow.is_some(), b.follow.is_some()) {
-            (true, false) => va.yaw = turn_near(va.yaw, vb.yaw),
-            (false, true) => vb.yaw = turn_near(vb.yaw, va.yaw),
-            _ => {}
+        let (va, mut vb) = (a.view_with(aim, t), b.view_with(aim, t));
+        // Where a followed subject is is known only modulo a turn, so a move
+        // to or from a following keyframe takes the shorter way round from
+        // what one keyframe shows at its time to what the other shows at
+        // its own, and keeps to that side throughout. Choosing per frame
+        // flipped sides mid-move whenever the subject wobbled across half a
+        // turn away (a fixed view ahead, the holder behind), so the view
+        // swung back and forth. Two fixed keyframes keep their yaws as
+        // written: 0 → 360 is a full turn on purpose.
+        if a.follow.is_some() || b.follow.is_some() {
+            let half = |y: f64| (y + 180.0).rem_euclid(360.0) - 180.0;
+            let turn = half(b.view_with(aim, b.t).yaw - a.view_with(aim, a.t).yaw);
+            vb.yaw = va.yaw + turn + half(vb.yaw - va.yaw - turn);
         }
         let zoom = |v: View| (v.fov.to_radians() / 2.0).tan().ln();
         let near = if u < 0.5 { va } else { vb };
@@ -446,7 +451,7 @@ impl Keyframes {
     /// Makes keyframe `i` follow `follow` (or stop following), keeping the
     /// view it shows now, per `aim`.
     pub fn set_follow(&mut self, i: usize, follow: Option<Follow>, aim: Aim) {
-        let shown = self.0[i].view_with(aim);
+        let shown = self.0[i].view_with(aim, self.0[i].t);
         self.0[i].follow = follow;
         self.0[i].view = self.0[i].store(shown, aim);
     }
@@ -627,13 +632,13 @@ mod tests {
         assert_eq!((k[1].follow.clone(), k[1].view.pitch, k[1].view.fov), (Some(Follow::Stick), 30.0, 110.0));
         assert_eq!(k[2].follow, None);
         // The stick behind and below: yaw 170, pitch −60.
-        let aim = |_: &Follow| Some((170.0, -60.0));
+        let aim = |_: &Follow, _| Some((170.0, -60.0));
         let v = k.view_at(1.0, &aim).unwrap();
         assert_eq!((v.yaw, v.pitch), (170.0, -30.0));
         // Half way from the stick at −170° to the fixed 170° it turns the
         // short way, through 180°, not back through 0°.
-        let half = k.view_at(3.0, &|_| Some((-170.0, -60.0))).unwrap();
-        assert!((half.yaw - 180.0).abs() < 1e-9, "{}", half.yaw);
+        let half = k.view_at(3.0, &|_, _| Some((-170.0, -60.0))).unwrap();
+        assert!(((half.yaw - 180.0).rem_euclid(360.0)).abs() < 1e-9, "{}", half.yaw);
         let back: Keyframes = serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
         assert_eq!(back, k);
         assert!(serde_json::from_str::<Keyframes>(r#"[{"t": 0, "follow": "stick", "yaw": 3}]"#).is_err());
@@ -651,14 +656,24 @@ mod tests {
     }
 
     #[test]
+    fn a_move_to_a_subject_half_a_turn_away_keeps_its_side() {
+        // From a view ahead to a subject behind that wobbles across 180°:
+        // the move must turn one way all through, not flip sides.
+        let k: Keyframes = serde_json::from_str(r#"[{"t": 0, "yaw": 0}, {"t": 6, "follow": "stick"}]"#).unwrap();
+        let aim = |_: &Follow, t: f64| Some((if t == 6.0 { 170.0 } else { 175.0 + 10.0 * (t * 9.0).sin() }, 0.0));
+        let yaws: Vec<f64> = (0..=60).map(|i| k.view_at(i as f64 / 10.0, &aim).unwrap().yaw).collect();
+        assert!(yaws.windows(2).all(|w| (w[1] - w[0]).abs() < 15.0), "{yaws:?}");
+    }
+
+    #[test]
     fn edits_keyframes() {
         let mut k = Keyframes::default();
         let v = |yaw| View { yaw, ..View::home(Projection::Perspective) };
-        assert_eq!(k.set(2.0, v(10.0), 0.01, &|_| None), 0);
-        assert_eq!(k.set(1.0, v(0.0), 0.01, &|_| None), 0);
-        assert_eq!(k.set(2.005, v(20.0), 0.01, &|_| None), 1);
+        assert_eq!(k.set(2.0, v(10.0), 0.01, &|_, _| None), 0);
+        assert_eq!(k.set(1.0, v(0.0), 0.01, &|_, _| None), 0);
+        assert_eq!(k.set(2.005, v(20.0), 0.01, &|_, _| None), 1);
         assert_eq!((k.len(), k[1].view.yaw), (2, 20.0));
-        assert_eq!(k.view_at(1.5, &|_| None).unwrap().yaw, 10.0);
+        assert_eq!(k.view_at(1.5, &|_, _| None).unwrap().yaw, 10.0);
         k.retime(0, 5.0, 0.1);
         assert!((k[0].t - 1.9).abs() < 1e-9);
         k.remove(0);
@@ -669,7 +684,7 @@ mod tests {
     fn interpolates_between_keyframes() {
         let r: Reframe = serde_json::from_str(r#"{"keyframes": [{"t": 0, "yaw": 0, "ease": "linear"}, {"t": 2, "yaw": 90}]}"#).unwrap();
         let mid = View { yaw: 45.0, ..View::home(Projection::Perspective) }.camera();
-        assert!(close(r.camera_at(1.0, &|_| None).user[0], mid.user[0]));
-        assert!(close(r.camera_at(-1.0, &|_| None).user[0], r.keyframes[0].view.camera().user[0]));
+        assert!(close(r.camera_at(1.0, &|_, _| None).user[0], mid.user[0]));
+        assert!(close(r.camera_at(-1.0, &|_, _| None).user[0], r.keyframes[0].view.camera().user[0]));
     }
 }

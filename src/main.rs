@@ -676,8 +676,8 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
             let size = out.size;
             let mut tick = |n: usize| progress(done + n, total);
             let result = match &mut gpu {
-                Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut encoder, |t| project::camera_at(&project.cuts, n, t, &|f| pipelines[i].aim(f, t)), size, &mut tick),
-                None => encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: project::camera_at(&project.cuts, n, t, &|f| pipelines[i].aim(f, t)), size }, &mut tick),
+                Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut encoder, |t| project::camera_at(&project.cuts, n, t, &|f, t| pipelines[i].aim(f, t)), size, &mut tick),
+                None => encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: project::camera_at(&project.cuts, n, t, &|f, t| pipelines[i].aim(f, t)), size }, &mut tick),
             };
             if let Err(e) = result {
                 encoder.abort();
@@ -825,7 +825,7 @@ fn main() -> Result<()> {
                 None => Shot::Equirect(tile),
                 Some(r) => {
                     let view::Aspect(w, h) = r.aspect.unwrap_or(view::Aspect(16, 9));
-                    Shot::View { camera: r.camera_at(t, &|f| p.aim(f, t)), size: (tile, ((tile * h as usize / w as usize) / 2).max(8) * 2) }
+                    Shot::View { camera: r.camera_at(t, &|f, t| p.aim(f, t)), size: (tile, ((tile * h as usize / w as usize) / 2).max(8) * 2) }
                 }
             };
             let tiles = times
@@ -844,7 +844,11 @@ fn main() -> Result<()> {
             eprintln!("wrote {}: {} tiles at {}", output.display(), tiles.len(), times.iter().map(|t| format!("{:.1}", p.snap(*t))).collect::<Vec<_>>().join(" "));
         }
         Cmd::Scan { input, every } => scan(&input, every)?,
-        Cmd::Track { input, colour, tolerance, near, start, duration, every } => track(&input, &track::Colour::parse(&colour, tolerance)?, near, start, duration, every)?,
+        Cmd::Track { input, colour, tolerance, near, start, duration, every } => {
+            let near = near.map(|(yaw, pitch)| track::Near::Level(yaw, pitch));
+            let (found, rows) = track_to(&input, &track::Colour::parse(&colour, tolerance)?, near, start, duration, every, &mut std::io::stdout().lock(), &mut |_, _| Ok(()))?;
+            eprintln!("found the colour in {found} of {rows} samples");
+        }
     }
     Ok(())
 }
@@ -878,7 +882,7 @@ fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<
         .map(|shot| {
             let Some((n, i, t)) = *shot else { return Ok(stitch::Frame { width: size.0, height: size.1, rgb: vec![0; size.0 * size.1 * 3] }) };
             let p = &pipelines[i];
-            let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &Shot::View { camera: project::camera_at(&project.cuts, n, t, &|f| p.aim(f, t)), size });
+            let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &Shot::View { camera: project::camera_at(&project.cuts, n, t, &|f, t| p.aim(f, t)), size });
             sheet::label(&mut f, 4, 4, &format!("#{} {t:.1}s", n + 1));
             Ok(f)
         })
@@ -932,8 +936,20 @@ fn info(input: &Path) -> Result<()> {
     Ok(())
 }
 
-/// See `Cmd::Track`.
-fn track(input: &Path, colour: &track::Colour, near: Option<(f64, f64)>, start: Option<f64>, duration: Option<f64>, every: f64) -> Result<()> {
+/// Tracks `colour` through `input` from `start` for `duration` seconds (to
+/// the end if `None`), writing `Cmd::Track`'s CSV to `out`. `progress(done,
+/// total)` hears of each sample and cancels by failing. Returns how many of
+/// how many samples found it.
+pub fn track_to(
+    input: &Path,
+    colour: &track::Colour,
+    near: Option<track::Near>,
+    start: Option<f64>,
+    duration: Option<f64>,
+    every: f64,
+    out: &mut dyn std::io::Write,
+    progress: &mut dyn FnMut(usize, usize) -> Result<()>,
+) -> Result<(usize, usize)> {
     // Small, unstabilised (so its directions are the rig's) and from the
     // proxy: enough to find a jacket, and fast.
     const WIDTH: usize = 512;
@@ -943,11 +959,18 @@ fn track(input: &Path, colour: &track::Colour, near: Option<(f64, f64)>, start: 
     }
     p.use_proxy();
     let (start, end) = p.span(start, duration, None)?;
+    let total = ((end - start) / every).ceil().max(1.0) as usize;
     let mut stream = p.stream(start)?;
     let mut carry = Carry::default();
-    let mut last: Option<(f64, [f64; 3])> = near.map(|(yaw, pitch)| (start, track::from_level(&p.stab, start * 1000.0, p.readout_ms, yaw, pitch)));
+    let mut last: Option<(f64, [f64; 3])> = near.map(|near| {
+        let d = match near {
+            track::Near::Level(yaw, pitch) => track::from_level(&p.stab, start * 1000.0, p.readout_ms, yaw, pitch),
+            track::Near::Rig(d) => d,
+        };
+        (start, d)
+    });
     let (mut next, mut n, mut found, mut rows) = (start, 0usize, 0usize, 0usize);
-    println!("t,x,y,z,yaw,pitch,size");
+    writeln!(out, "t,x,y,z,yaw,pitch,size")?;
     while let Some(frames) = stream.next()? {
         let t = start + n as f64 / p.fps;
         n += 1;
@@ -966,15 +989,15 @@ fn track(input: &Path, colour: &track::Colour, near: Option<(f64, f64)>, start: 
         match track::find(&pic.rgb, WIDTH, colour, guess) {
             Some((d, share)) => {
                 let (yaw, pitch) = track::level_angles(&p.stab, t * 1000.0, p.readout_ms, d);
-                println!("{t:.3},{:.5},{:.5},{:.5},{yaw:.1},{pitch:.1},{:.3}", d[0], d[1], d[2], share * 100.0);
+                writeln!(out, "{t:.3},{:.5},{:.5},{:.5},{yaw:.1},{pitch:.1},{:.3}", d[0], d[1], d[2], share * 100.0)?;
                 last = Some((t, d));
                 found += 1;
             }
-            None => println!("{t:.3},,,,,,"),
+            None => writeln!(out, "{t:.3},,,,,,")?,
         }
+        progress(rows.min(total), total)?;
     }
-    eprintln!("found the colour in {found} of {rows} samples");
-    Ok(())
+    Ok((found, rows))
 }
 
 /// One CSV row per `every` seconds; see `Cmd::Scan` and the header.

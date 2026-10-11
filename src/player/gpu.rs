@@ -128,6 +128,10 @@ impl Shown {
     pub fn new(frame: Frame, fix: SeamFix) -> Self {
         Shown { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), frame, fix }
     }
+
+    pub fn frame(&self) -> &Frame {
+        &self.frame
+    }
 }
 
 /// Everything one draw needs; rebuilt by the view on every redraw.

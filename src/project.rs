@@ -104,7 +104,14 @@ pub fn keyframed(cuts: &[Cut], n: usize, t: f64) -> Option<(&Keyframes, f64)> {
 /// cut's clip at `t`, so a cut that holds an earlier cut's following view
 /// goes on following in its own footage.
 pub fn camera_at(cuts: &[Cut], n: usize, t: f64, aim: Aim) -> Camera {
-    keyframed(cuts, n, t).and_then(|(k, t)| k.camera_at(t, aim)).unwrap_or_else(|| View::home(Projection::Perspective).camera())
+    keyframed(cuts, n, t).and_then(|(k, at)| k.camera_at(at, &held(aim, at == t, t))).unwrap_or_else(|| View::home(Projection::Perspective).camera())
+}
+
+/// `aim` for reading keyframes from `keyframed`: as asked in the cut's own
+/// keyframes, else always at the cut's time `t`, as the keyframes held
+/// from an earlier cut are read at that cut's end.
+pub fn held(aim: Aim<'_>, own: bool, t: f64) -> impl Fn(&crate::view::Follow, f64) -> Option<(f64, f64)> + '_ {
+    move |f, at| aim(f, if own { at } else { t })
 }
 
 #[cfg(test)]
@@ -154,11 +161,11 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let yaw = |n, t| camera_at(&p.cuts, n, t, &|_| None).user;
+        let yaw = |n, t| camera_at(&p.cuts, n, t, &|_, _| None).user;
         assert_eq!(yaw(0, 2.0), View::home(Projection::Perspective).camera().user);
         assert_eq!(keyframed(&p.cuts, 1, 12.0).map(|k| k.1), Some(12.0));
         // The view at the earlier cut's out point, not at its last keyframe.
-        let held = p.cuts[1].keyframes.camera_at(20.0, &|_| None).unwrap().user;
+        let held = p.cuts[1].keyframes.camera_at(20.0, &|_, _| None).unwrap().user;
         assert_eq!((yaw(2, 55.0), yaw(3, 75.0)), (held, held));
     }
 }
