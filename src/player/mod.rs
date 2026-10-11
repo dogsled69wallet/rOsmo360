@@ -343,6 +343,10 @@ enum Message {
     MoveCut(usize, usize),
     /// Split the cut at the playhead.
     Split,
+    /// Cut `i`'s crossfade from the cut before dragged to this many seconds.
+    Crossfade(usize, f64),
+    /// Give the selected (or playing) cut a 1 s crossfade, or take its away.
+    ToggleCrossfade,
     /// Delete the selected cut, or the selected music clip.
     DeleteCut,
     Undo,
@@ -388,6 +392,9 @@ struct App {
     selected_volume: Option<usize>,
     selected_sound: Option<(usize, usize)>,
     music: music::Player,
+    /// Through a crossfade, the next cut playing alongside: its index and
+    /// clip.
+    incoming: Option<(usize, Clip)>,
     edit: edit::Edit,
     /// The cut being played, and the one selected on the timeline.
     current: usize,
@@ -470,6 +477,7 @@ impl App {
             selected_volume: None,
             selected_sound: None,
             music: Default::default(),
+            incoming: None,
             edit: edit::Edit::default(),
             current: 0,
             selected: None,
@@ -530,6 +538,7 @@ impl App {
     /// Handles `message`, then saves the settings if it changed any.
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
+        self.follow_crossfade();
         self.follow_music();
         let now = self.settings();
         if now != self.saved_settings {
@@ -551,10 +560,75 @@ impl App {
             _ => (false, 0.0),
         };
         self.music.follow(&self.edit.music, t, self.edit.duration(), listen, playing);
-        // The cut's own volume points move its level as it plays.
-        let v = self.clip_volume();
+        // The cut's own volume points move its level as it plays, and
+        // through a crossfade the two cuts trade places, equal power.
+        let mix = self.crossfade_mix();
+        let quarter = |x: f64| (x.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2).sin() as f32;
+        let v = self.clip_volume() * mix.map_or(1.0, |x| quarter(1.0 - x));
         if let Some(c) = &mut self.clip {
             c.playback.set_volume(v);
+        }
+        if let (Some(x), Some((i, inc))) = (mix, &self.incoming) {
+            let points = self.edit.cuts.get(*i).map_or(0.0, |c| crate::project::volume_at(&c.volume, inc.playback.now()));
+            let v = self.volume() * music::gain(self.edit.sound.volume + points) * quarter(x);
+            if let Some((_, inc)) = &mut self.incoming {
+                inc.playback.set_volume(v);
+            }
+        }
+    }
+
+    /// Keeps the cut crossfading in alongside the playing one wherever
+    /// playback is in a crossfade (played into, sought, scrubbed or paused
+    /// there): at the matching time in its own clip, playing or paused with
+    /// it. Elsewhere there's none.
+    fn follow_crossfade(&mut self) {
+        let want = (|| {
+            let from = self.edit.crossfade_from(self.current)?;
+            let (cut, t) = self.clip_now()?;
+            let next = self.edit.cuts.get(self.current + 1)?;
+            let playing = self.clip.as_ref()?.playback.playing;
+            (t >= from && t < cut.end).then(|| (self.current + 1, next.input.clone(), next.start + (t - from), playing))
+        })();
+        let Some((i, input, t, playing)) = want else {
+            self.incoming = None;
+            return;
+        };
+        match &mut self.incoming {
+            Some((j, inc)) if *j == i && inc.playback.media.input == input => {
+                let p = &mut inc.playback;
+                if p.playing != playing {
+                    if playing { p.play() } else { p.pause() }
+                }
+                // Playing, the two clocks run side by side, once it's running:
+                // waiting for its first frame (a second or more for the OSV)
+                // its clock stands still, and taking that for drift restarted
+                // it over and over, each restart opening more decoders.
+                // Paused, it follows the playhead as the playing cut does when
+                // scrubbed: a frame at a time, skipping those overtaken (a
+                // jump each time started decoders faster than they ended).
+                if playing {
+                    if p.running() && (p.now() - t).abs() > 0.25 {
+                        p.jump(t, true);
+                    }
+                } else if (p.target() - t).abs() > 1.0 / p.media.fps {
+                    p.scrub(t);
+                }
+            }
+            // Played into: the cut readied ahead, if it was.
+            _ if playing && t - self.edit.cuts[i].start < 0.25 && self.preroll.as_ref().is_some_and(|(j, inp, at, _)| (*j, inp, *at) == (i, &input, self.edit.cuts[i].start)) => {
+                let (_, _, _, mut primed) = self.preroll.take().unwrap();
+                primed.go();
+                self.incoming = Some((i, Clip { playback: primed, shown: None }));
+            }
+            _ => {
+                let Some(media) = self.library.iter().find(|m| m.input == input) else { return };
+                let mut media = media.clone();
+                media.osv_size = self.opts.osv_size;
+                media.stab.set_mode(self.edit.cuts[i].stabilize.unwrap_or(self.opts.stabilize));
+                let mut playback = Playback::new(media, 0.0, self.full_on_pause);
+                playback.jump(t, playing);
+                self.incoming = Some((i, Clip { playback, shown: None }));
+            }
         }
     }
 
@@ -1231,6 +1305,9 @@ impl App {
             Message::ScrubDone => {
                 self.dragging = false;
                 self.with_playback(Playback::scrub_end);
+                if let Some((_, inc)) = &mut self.incoming {
+                    inc.playback.scrub_end();
+                }
             }
             Message::Select(i) => {
                 self.selected = Some(i);
@@ -1398,6 +1475,17 @@ impl App {
                     self.selected = Some(at(from));
                 }
             }
+            Message::Crossfade(i, seconds) => {
+                self.begin_drag();
+                self.edit.set_crossfade(i, seconds);
+            }
+            Message::ToggleCrossfade => {
+                let i = self.selected.unwrap_or(self.current);
+                let Some(c) = self.edit.cuts.get(i) else { return Task::none() };
+                let to = if c.crossfade > 0.0 { 0.0 } else { 1.0 };
+                self.edit.checkpoint();
+                self.edit.set_crossfade(i, to);
+            }
             Message::Split if self.selected_music.is_some() => {
                 let i = self.selected_music.unwrap();
                 self.edit.checkpoint();
@@ -1448,7 +1536,7 @@ impl App {
                     return Task::none();
                 }
                 self.edit.checkpoint();
-                self.edit.cuts.remove(i);
+                self.edit.remove(i);
                 self.after_edit(self.edit.offset(i.min(self.edit.cuts.len())));
             }
             Message::Undo | Message::Redo => {
@@ -1679,7 +1767,11 @@ impl App {
 
     /// Where `follow` points in the playing clip's view at its time `t`.
     fn aim(&self, follow: &Follow, t: f64) -> Option<(f64, f64)> {
-        let media = &self.clip.as_ref()?.playback.media;
+        self.aim_in(&self.clip.as_ref()?.playback.media, follow, t)
+    }
+
+    /// Where `follow` points in `media`'s clip at `t`.
+    fn aim_in(&self, media: &Media, follow: &Follow, t: f64) -> Option<(f64, f64)> {
         match follow {
             Follow::Stick => media.stab.stick(t * 1000.0, media.readout_ms),
             Follow::Track(path) => {
@@ -1734,7 +1826,39 @@ impl App {
             rig_from_view: c.playback.rig_from_view(self.rolling_shutter),
             fov_deg: self.shown_view().fov,
             picking: self.picking.is_some(),
+            incoming: self.incoming_layer(),
         })
+    }
+
+    /// The cut crossfading in, as the view draws it over the playing one.
+    fn incoming_layer(&self) -> Option<(Arc<Rig>, Arc<Shown>, Camera, Vec<M3>, f32)> {
+        let (i, inc) = self.incoming.as_ref()?;
+        let shown = inc.shown.clone()?;
+        let p = &inc.playback;
+        let t = p.target();
+        // As `camera` frames the playing cut: by its keyframes (or those it
+        // holds from before), else the view as it is.
+        let keyed = || crate::project::keyframed(&self.edit.cuts, *i, t).and_then(|(k, at)| k.camera_at(at, &crate::project::held(&|f, t| self.aim_in(&p.media, f, t), at == t, t)));
+        let camera = if self.follow { keyed().unwrap_or_else(|| self.look.camera()) } else { self.look.camera() };
+        Some((p.media.rig.clone(), shown, camera, p.rig_from_view(self.rolling_shutter), self.crossfade_mix()? as f32))
+    }
+
+    /// Where playback is in the playing cut, by the clock `tick` changes
+    /// cuts by: playing, the clock (the frame shown lags it a little, and
+    /// going by that dropped a crossfade `tick` had just begun); paused,
+    /// where it's been put.
+    fn clip_now(&self) -> Option<(&Cut, f64)> {
+        let cut = self.edit.cuts.get(self.current)?;
+        let p = &self.clip.as_ref()?.playback;
+        Some((cut, if p.playing { p.now() } else { p.target() }.clamp(cut.start, cut.end)))
+    }
+
+    /// How far into the crossfade to the next cut playback is, 0..1, while
+    /// in one.
+    fn crossfade_mix(&self) -> Option<f64> {
+        let from = self.edit.crossfade_from(self.current)?;
+        let (cut, t) = self.clip_now()?;
+        (t >= from && t < cut.end).then(|| (t - from) / (cut.end - from))
     }
 
     /// Adds the whole clip as a cut at the end of the edit and selects it.
@@ -1742,7 +1866,7 @@ impl App {
     /// ones leave playback where it is.
     fn add_cut(&mut self, input: PathBuf, duration: f64) {
         self.edit.checkpoint();
-        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None, volume: Vec::new() });
+        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None, volume: Vec::new(), crossfade: 0.0 });
         let i = self.edit.cuts.len() - 1;
         self.selected = Some(i);
         if self.clip.is_none() {
@@ -1861,6 +1985,11 @@ impl App {
 
     fn tick(&mut self) {
         let volume = self.clip_volume();
+        if let Some((_, inc)) = &mut self.incoming
+            && let Some((frame, fix)) = inc.playback.tick()
+        {
+            inc.shown = Some(Arc::new(Shown::new(frame, fix)));
+        }
         let Some(c) = &mut self.clip else { return };
         if let Some((frame, fix)) = c.playback.tick() {
             c.shown = Some(Arc::new(Shown::new(frame, fix)));
@@ -1880,11 +2009,15 @@ impl App {
         let loaded = |input: &PathBuf| self.library.iter().find(|m| &m.input == input);
         // A next cut that starts where this one ends in the same clip (after
         // a split) just plays on: no seek, nothing to prime.
-        let carries_on = next_cut.is_some_and(|n| n.input == cut.input && (n.start - cut.end).abs() < 1.5 / p.media.fps);
+        let carries_on = next_cut.is_some_and(|n| n.input == cut.input && (n.start - cut.end).abs() < 1.5 / p.media.fps && n.crossfade == 0.0);
+        // Where the next cut comes in: this one's end, or before it by the
+        // crossfade.
+        let change = self.edit.crossfade_from(self.current).unwrap_or(cut.end);
         // In the last `PREROLL` seconds, ready the next cut so the change is
         // instant.
-        if p.now() >= cut.end - PREROLL
+        if p.now() >= change - PREROLL
             && !carries_on
+            && self.incoming.as_ref().is_none_or(|(i, _)| *i != next)
             && let Some(n) = next_cut
             && self.preroll.as_ref().is_none_or(|(i, input, start, _)| (*i, input, *start) != (next, &n.input, n.start))
             && let Some(media) = loaded(&n.input)
@@ -1900,9 +2033,21 @@ impl App {
         // picture waits through it to stay in sync).
         if let Some((i, input, at, primed)) = &mut self.preroll
             && next_cut.is_some_and(|n| (*i, &*input, *at) == (next, &n.input, n.start))
-            && primed.sound_lead().is_some_and(|lead| p.now() >= cut.end - lead)
+            && primed.sound_lead().is_some_and(|lead| p.now() >= change - lead)
         {
             primed.start_sound();
+        }
+        // A crossfade starts: the next cut plays on alongside, drawn over
+        // this one, until this one ends.
+        if change < cut.end
+            && p.now() >= change
+            && self.incoming.as_ref().is_none_or(|(i, _)| *i != next)
+            && let Some((i, input, at, mut primed)) = self.preroll.take()
+        {
+            if next_cut.is_some_and(|n| (i, &input, at) == (next, &n.input, n.start)) {
+                primed.go();
+                self.incoming = Some((next, Clip { playback: primed, shown: None }));
+            }
         }
         // At a cut's out point (or the clip's end), play on into the next cut.
         if p.now() < cut.end && !p.ended {
@@ -1922,6 +2067,13 @@ impl App {
                 self.current = next;
                 let mode = self.edit.cuts[next].stabilize.unwrap_or(self.opts.stabilize);
                 self.with_playback(|p| p.media.stab.set_mode(mode));
+            }
+            // Out of a crossfade: the cut that came in plays on.
+            Some(_) if self.incoming.as_ref().is_some_and(|(i, _)| *i == next) => {
+                let (_, incoming) = self.incoming.take().unwrap();
+                self.clip = Some(incoming);
+                self.current = next;
+                self.preroll = None;
             }
             Some(n) => {
                 let start = n.start;
@@ -2219,12 +2371,13 @@ impl App {
         let current = self.current_key();
         let aiming = current.map(|k| Aiming::of(&self.edit.cuts[self.current].keyframes[k].follow));
         let tolerance = self.tolerance();
-        let mut from = 0.0;
+        let offsets = crate::project::offsets(&self.edit.cuts);
         let blocks = self
             .edit
             .cuts
             .iter()
-            .map(|c| {
+            .zip(offsets)
+            .map(|(c, from)| {
                 let keys = c.keyframes.iter().enumerate().filter(|(_, k)| k.t >= c.start - tolerance && k.t <= c.end + tolerance).map(|(i, k)| (i, k.t, k.ease, k.follow.is_some())).collect();
                 // Only those in the cut, and one either side for its ends.
                 let thumbs = self.thumbs.get(&c.input).map_or_else(Vec::new, |all| {
@@ -2232,9 +2385,7 @@ impl App {
                     let to = (all.partition_point(|(t, _)| *t <= c.end) + 1).min(all.len());
                     all[from..to].to_vec()
                 });
-                let block = timeline::Block { labels: cut_labels(c, self.opts.stabilize), from, len: c.end - c.start, start: c.start, keys, sound: c.volume.clone(), thumbs };
-                from += c.end - c.start;
-                block
+                timeline::Block { labels: cut_labels(c, self.opts.stabilize), from, len: c.end - c.start, start: c.start, keys, sound: c.volume.clone(), thumbs, crossfade: c.crossfade }
             })
             .collect();
         let (timeline_start, timeline_span) = self.timeline_window();
@@ -2270,6 +2421,8 @@ impl App {
         // With a song selected, C splits that instead.
         let music = self.selected_music.and_then(|i| self.edit.music.clips.get(i));
         let point = self.selected_volume.is_some() || self.selected_sound.is_some();
+        // Any cut but the first can crossfade in from the one before.
+        let crossfade_cut = Some(self.selected.unwrap_or(self.current)).filter(|&i| i > 0).and_then(|i| self.edit.cuts.get(i));
         let can_split = match music {
             Some(c) => self.position() > c.at + edit::MIN_CUT && self.position() < c.ends() - edit::MIN_CUT,
             None => self.edit.cuts.get(self.current).is_some_and(|c| p.target() > c.start + edit::MIN_CUT && p.target() < c.end - edit::MIN_CUT),
@@ -2311,6 +2464,14 @@ impl App {
             tip(
                 icon_button(PICK, (self.clip.is_some() && self.tracking.is_none()).then_some(Message::PickColour)),
                 text("Track a colour: draw a box over a subject (a jacket, a tent); the keyframe here then follows it"),
+                tooltip::Position::Top,
+            ),
+            tip(
+                icon_button(CROSSFADE, crossfade_cut.map(|_| Message::ToggleCrossfade)),
+                text(match crossfade_cut {
+                    Some(c) if c.crossfade > 0.0 => "Take away this cut's crossfade (Shift-drag its start edge to change its length)",
+                    _ => "Crossfade into this cut from the one before, 1 s (Shift-drag its start edge to change its length)",
+                }),
                 tooltip::Position::Top,
             ),
             tip(icon_button(SPLIT, can_split.then_some(Message::Split)), text(if music.is_some() { "Split the selected music at the playhead (C)" } else { "Split the cut at the playhead (C)" }), tooltip::Position::Top),
@@ -2427,6 +2588,8 @@ fn credit<'a>() -> Element<'a, Message> {
 }
 
 /// Edit icons: scissors (split), a bin (delete cut), arrows (undo, redo).
+/// Two strips crossing: one picture dissolving into the next.
+const CROSSFADE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="12" height="12" rx="2"/><rect x="10" y="6" width="12" height="12" rx="2" stroke-dasharray="2 2"/></svg>"#;
 const SPLIT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.1 15.9M14.5 14.5 20 20M8.1 8.1 12 12"/></svg>"#;
 const DELETE_CUT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/></svg>"#;
 const UNDO: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>"#;
@@ -2662,6 +2825,9 @@ struct Sphere {
     fov_deg: f64,
     /// Drags draw a box to pick a colour instead of looking around.
     picking: bool,
+    /// Through a crossfade, the next cut drawn over: its rig, frame,
+    /// framing, readout views and how far in it is (0..1).
+    incoming: Option<(Arc<Rig>, Arc<Shown>, Camera, Vec<M3>, f32)>,
 }
 
 #[derive(Default)]
@@ -2759,6 +2925,7 @@ impl shader::Program<Message> for Sphere {
             shown: self.shown.clone(),
             camera: self.camera,
             rig_from_view: self.rig_from_view.clone(),
+            incoming: self.incoming.clone().map(|(rig, shown, camera, rig_from_view, mix)| gpu::Incoming { rig, shown, camera, rig_from_view, mix }),
         }
     }
 

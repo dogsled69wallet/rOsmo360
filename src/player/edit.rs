@@ -4,6 +4,9 @@
 //!
 //! Edit time runs along the timeline from 0 to the edit's length; each cut
 //! covers its stretch of it, and clip time is where in its own clip that is.
+//! A cut with a crossfade starts that much before the one before it ends;
+//! through the overlap the earlier cut is the one located, the later one
+//! dissolving in over it.
 
 use crate::project::{Cut, Music, Sound};
 
@@ -26,7 +29,7 @@ pub struct Edit {
 
 impl Edit {
     pub fn duration(&self) -> f64 {
-        self.cuts.iter().map(|c| c.end - c.start).sum()
+        crate::project::edit_length(&self.cuts)
     }
 
     /// The timeline's length: the video's, or the music's while it runs on
@@ -35,23 +38,32 @@ impl Edit {
         self.duration().max(self.music.end())
     }
 
-    /// Where cut `i` starts on the timeline.
+    /// Where cut `i` starts on the timeline (the edit's end for `i` past
+    /// the last).
     pub fn offset(&self, i: usize) -> f64 {
-        self.cuts[..i].iter().map(|c| c.end - c.start).sum()
+        match self.cuts.get(i) {
+            Some(_) => crate::project::offsets(&self.cuts[..=i])[i],
+            None => self.duration(),
+        }
     }
 
     /// The cut at edit time `t` and the clip time there. The end of the edit
     /// is the last cut's out point.
     pub fn locate(&self, t: f64) -> Option<(usize, f64)> {
-        let mut from = 0.0;
-        for (i, c) in self.cuts.iter().enumerate() {
-            let len = c.end - c.start;
-            if t < from + len || i == self.cuts.len() - 1 {
+        let offsets = crate::project::offsets(&self.cuts);
+        for (i, (c, from)) in self.cuts.iter().zip(offsets).enumerate() {
+            if t < from + c.len() || i == self.cuts.len() - 1 {
                 return Some((i, (c.start + (t - from).max(0.0)).min(c.end)));
             }
-            from += len;
         }
         None
+    }
+
+    /// Where the crossfade into the cut after cut `i` begins, clip time in
+    /// cut `i`, if it has one.
+    pub fn crossfade_from(&self, i: usize) -> Option<f64> {
+        let next = self.cuts.get(i + 1).filter(|n| n.crossfade > 0.0)?;
+        Some(self.cuts[i].end - next.crossfade)
     }
 
     pub fn edit_time(&self, i: usize, clip_t: f64) -> f64 {
@@ -112,8 +124,10 @@ impl Edit {
         }
         let mut second = c.clone();
         second.start = t;
+        second.crossfade = 0.0;
         self.cuts[i].end = t;
         self.cuts.insert(i + 1, second);
+        crate::project::settle_crossfades(&mut self.cuts);
         true
     }
 
@@ -126,6 +140,21 @@ impl Edit {
         } else {
             c.end = t.clamp(c.start + MIN_CUT, clip_len);
         }
+        crate::project::settle_crossfades(&mut self.cuts);
+    }
+
+    /// Sets the crossfade into cut `i`, within what the cuts either side
+    /// allow.
+    pub fn set_crossfade(&mut self, i: usize, seconds: f64) {
+        let max = crate::project::max_crossfade(&self.cuts, i).max(0.0);
+        if let Some(c) = self.cuts.get_mut(i) {
+            c.crossfade = seconds.clamp(0.0, max);
+        }
+    }
+
+    pub fn remove(&mut self, i: usize) {
+        self.cuts.remove(i);
+        crate::project::settle_crossfades(&mut self.cuts);
     }
 
     /// Moves cut `from` so it plays at position `to` (counted before the move).
@@ -133,6 +162,7 @@ impl Edit {
         let cut = self.cuts.remove(from);
         let to = if to > from { to - 1 } else { to };
         self.cuts.insert(to.min(self.cuts.len()), cut);
+        crate::project::settle_crossfades(&mut self.cuts);
     }
 }
 
@@ -142,7 +172,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn cut(name: &str, start: f64, end: f64) -> Cut {
-        Cut { input: PathBuf::from(name), start, end, keyframes: Default::default(), stabilize: None, note: None, volume: Vec::new() }
+        Cut { input: PathBuf::from(name), start, end, keyframes: Default::default(), stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0 }
     }
 
     fn edit() -> Edit {
@@ -157,6 +187,30 @@ mod tests {
         assert_eq!(e.locate(4.5), Some((1, 2.5)));
         assert_eq!(e.locate(9.0), Some((1, 5.0)));
         assert_eq!(e.edit_time(1, 3.0), 5.0);
+    }
+
+    #[test]
+    fn crossfades_overlap_cuts_and_stay_within_them() {
+        let mut e = edit();
+        e.set_crossfade(1, 1.0);
+        // b starts a second before a ends, and the edit is a second shorter;
+        // through the overlap a is the cut located.
+        assert_eq!((e.offset(1), e.duration()), (3.0, 6.0));
+        assert_eq!(e.locate(3.5), Some((0, 13.5)));
+        assert_eq!(e.locate(4.5), Some((1, 3.5)));
+        assert_eq!(e.crossfade_from(0), Some(13.0));
+        assert_eq!(e.edit_time(1, 2.0), 3.0);
+        // Not longer than the cuts allow, none into the first, and a trim
+        // that leaves too little shortens it.
+        e.set_crossfade(1, 9.0);
+        assert!((e.cuts[1].crossfade - 2.9).abs() < 1e-9);
+        e.set_crossfade(0, 1.0);
+        assert_eq!(e.cuts[0].crossfade, 0.0);
+        e.trim(1, false, 3.0, 9.0);
+        assert!((e.cuts[1].crossfade - 0.9).abs() < 1e-9);
+        // Moved first, it has none.
+        e.move_cut(1, 0);
+        assert_eq!((e.cuts[0].crossfade, e.duration()), (0.0, 5.0));
     }
 
     #[test]

@@ -263,6 +263,56 @@ pub struct Cut {
     /// keeps its level wherever the cut goes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volume: Vec<VolumeKey>,
+    /// Seconds it overlaps the cut before it, dissolving in from it
+    /// (picture and sound); the edit is that much shorter.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub crossfade: f64,
+}
+
+impl Cut {
+    pub fn len(&self) -> f64 {
+        self.end - self.start
+    }
+}
+
+/// The shortest stretch of a cut its crossfades leave to it alone.
+const SOLO: f64 = 0.1;
+
+/// Where each of `cuts` starts on the edit: after the one before, less the
+/// crossfade into it.
+pub fn offsets(cuts: &[Cut]) -> Vec<f64> {
+    let mut from = 0.0;
+    cuts.iter()
+        .map(|c| {
+            from -= c.crossfade;
+            let at = from;
+            from += c.len();
+            at
+        })
+        .collect()
+}
+
+/// The edit's length: the cuts' less their crossfades.
+pub fn edit_length(cuts: &[Cut]) -> f64 {
+    cuts.iter().map(|c| c.len() - c.crossfade).sum()
+}
+
+/// The longest crossfade into cut `i`: none into the first, and leaving
+/// both cuts a moment of their own with the crossfade before.
+pub fn max_crossfade(cuts: &[Cut], i: usize) -> f64 {
+    if i == 0 || i >= cuts.len() {
+        return 0.0;
+    }
+    let before = &cuts[i - 1];
+    (before.len() - before.crossfade).min(cuts[i].len()) - SOLO
+}
+
+/// Keeps every crossfade within `max_crossfade` after cuts were trimmed,
+/// moved or deleted.
+pub fn settle_crossfades(cuts: &mut [Cut]) {
+    for i in 0..cuts.len() {
+        cuts[i].crossfade = cuts[i].crossfade.clamp(0.0, max_crossfade(cuts, i).max(0.0));
+    }
 }
 
 impl Project {
@@ -289,6 +339,10 @@ impl Project {
             }
             clip.input = dir.join(&clip.input);
         }
+        if project.cuts.iter().any(|c| !c.crossfade.is_finite()) {
+            bail!("a crossfade isn't a number");
+        }
+        settle_crossfades(&mut project.cuts);
         let keys = project.cuts.iter_mut().map(|c| &mut c.volume).chain([&mut project.music.keyframes]);
         for keys in keys {
             if keys.iter().any(|k| !k.t.is_finite() || !k.volume.is_finite()) {
@@ -324,7 +378,7 @@ impl Project {
 
     /// Length of the edit in seconds.
     pub fn duration(&self) -> f64 {
-        self.cuts.iter().map(|c| c.end - c.start).sum()
+        edit_length(&self.cuts)
     }
 }
 

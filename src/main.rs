@@ -1,5 +1,6 @@
 mod align;
 mod cache;
+mod dissolve;
 mod exposure;
 mod ffmpeg;
 mod imu;
@@ -768,6 +769,16 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
     if pipelines.iter().any(|p| (p.fps - fps).abs() > 0.01) {
         eprintln!("the clips' frame rates differ; exporting at {fps:.3} fps");
     }
+    // Frames each cut shares with the one before: its crossfade, in the
+    // whole edit only (a file per cut is for another editor's own), and
+    // never more than either cut has to give.
+    let mut overlap = vec![0usize; plan.len()];
+    if matches!(out.target, Target::One(_)) {
+        for n in 1..plan.len() {
+            let room = (plan[n - 1].2 - overlap[n - 1]).min(plan[n].2).saturating_sub(1);
+            overlap[n] = ((project.cuts[n].crossfade * fps).round() as usize).min(room);
+        }
+    }
     // Each file and the cuts it holds.
     let files: Vec<(PathBuf, std::ops::Range<usize>)> = match &out.target {
         Target::One(path) => vec![(path.clone(), 0..plan.len())],
@@ -783,28 +794,37 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
         let sound: Vec<_> = cuts
             .clone()
             .zip(&plan[cuts.clone()])
-            .map(|(n, &(i, start, frames))| ffmpeg::Sound { input: &pipelines[i].input, start, duration: Some(frames as f64 / fps), volume: &project.cuts[n].volume })
+            .map(|(n, &(i, start, frames))| {
+                let crossfade = if n > cuts.start { overlap[n] as f64 / fps } else { 0.0 };
+                ffmpeg::Sound { input: &pipelines[i].input, start, duration: Some(frames as f64 / fps), volume: &project.cuts[n].volume, crossfade }
+            })
             .collect();
         // The whole edit gets its mix; a file per cut is for another editor,
         // so its sound is left as recorded and the music goes beside it.
-        let length: f64 = plan[cuts.clone()].iter().map(|p| p.2 as f64 / fps).sum();
+        let length: f64 = cuts.clone().map(|n| (plan[n].2 - if n > cuts.start { overlap[n] } else { 0 }) as f64 / fps).sum();
         let mix = ffmpeg::Mix { sound_db: project.sound.volume, music: &project.music, length };
         let mix = matches!(out.target, Target::One(_)).then_some(&mix);
         let mut encoder = ffmpeg::Encoder::new(&path, out.size, fps, &sound, mix, out.format)?;
-        for (n, &(i, start, frames)) in cuts.clone().zip(&plan[cuts]) {
+        let mut sink = dissolve::Dissolve::new(&mut encoder);
+        for (n, &(i, start, frames)) in cuts.clone().zip(&plan[cuts.clone()]) {
+            let tail = if n + 1 < cuts.end { overlap[n + 1] } else { 0 };
+            let head = if n > cuts.start { overlap[n] } else { 0 };
+            sink.cut(frames, head, tail)?;
             let size = out.size;
             let mut tick = |n: usize| progress(done + n, total);
             let result = match &mut gpu {
-                Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut encoder, |t| project::camera_at(&project.cuts, n, t, &|f, t| pipelines[i].aim(f, t)), size, &mut tick),
-                None => encode(&pipelines[i], start, Some(frames), &mut encoder, |t| Shot::View { camera: project::camera_at(&project.cuts, n, t, &|f, t| pipelines[i].aim(f, t)), size }, &mut tick),
+                Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut sink, |t| project::camera_at(&project.cuts, n, t, &|f, t| pipelines[i].aim(f, t)), size, &mut tick),
+                None => encode(&pipelines[i], start, Some(frames), &mut sink, |t| Shot::View { camera: project::camera_at(&project.cuts, n, t, &|f, t| pipelines[i].aim(f, t)), size }, &mut tick),
             };
             if let Err(e) = result {
+                drop(sink);
                 encoder.abort();
                 let _ = std::fs::remove_file(&path);
                 return Err(e);
             }
             done += frames;
         }
+        drop(sink);
         encoder.finish()?;
         written.push(path);
     }
@@ -896,7 +916,7 @@ fn main() -> Result<()> {
             let p = Pipeline::new(&input, &opts, stab::Mode::Off)?;
             let start = p.snap(start);
             let total = duration.map(|d| (d * p.fps).round() as usize);
-            let mut encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &[ffmpeg::Sound { input: &input, start, duration, volume: &[] }], None, ffmpeg::Format::Mp4)?;
+            let mut encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &[ffmpeg::Sound { input: &input, start, duration, volume: &[], crossfade: 0.0 }], None, ffmpeg::Format::Mp4)?;
             let began = Instant::now();
             let mut tick = |n: usize| {
                 if n.is_multiple_of(10) {
@@ -920,7 +940,7 @@ fn main() -> Result<()> {
                 // One clip is a project of one cut.
                 let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
                 let (start, end) = span(&input, start, duration, Some(&reframe))?;
-                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None, volume: Vec::new() }], ..Default::default() }
+                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0 }], ..Default::default() }
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
@@ -1035,7 +1055,7 @@ fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<
 /// Stitches `total` frames (or to the end) from `start` into `encoder`,
 /// framing each as `shot` says for its time. If the clip ends early, the
 /// last frame is repeated up to `total`, so the sound stays in step.
-fn encode(p: &Pipeline, start: f64, total: Option<usize>, encoder: &mut ffmpeg::Encoder, shot: impl Fn(f64) -> Shot, tick: &mut dyn FnMut(usize) -> Result<()>) -> Result<()> {
+fn encode(p: &Pipeline, start: f64, total: Option<usize>, encoder: &mut dyn ffmpeg::FrameSink, shot: impl Fn(f64) -> Shot, tick: &mut dyn FnMut(usize) -> Result<()>) -> Result<()> {
     let mut stream = p.stream(start)?;
     let mut carry = Carry::default();
     let mut last = None;

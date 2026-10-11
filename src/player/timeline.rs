@@ -72,6 +72,8 @@ pub struct Block {
     pub thumbs: Vec<(f64, Handle)>,
     /// Its sound's volume points, clip time (some may lie outside the cut).
     pub sound: Vec<crate::project::VolumeKey>,
+    /// How long it overlaps the cut before, dissolving in.
+    pub crossfade: f64,
 }
 
 impl Block {
@@ -138,6 +140,9 @@ pub enum Drag {
     /// Trimming music clip `clip`'s in (`start`) or out edge, at song time
     /// `from` when pressed.
     MusicTrim { clip: usize, start: bool, x0: f32, from: f64, per_px: f64 },
+    /// Shift-dragging cut `cut`'s start edge: its crossfade, `from` seconds
+    /// when pressed at `x0`; dragging left lengthens it.
+    Crossfade { cut: usize, x0: f32, from: f64, per_px: f64 },
     /// Dragging music volume point `key`.
     Volume { key: usize },
     /// Dragging cut `cut`'s sound point `key`.
@@ -211,6 +216,15 @@ impl Timeline {
         } else {
             None
         }
+    }
+
+    /// The cut edge under `x`: (cut, whether it's the in edge). Later cuts
+    /// first: a crossfading cut's in edge lies over the cut before it.
+    fn edge_hit(&self, x: f32, b: Rectangle) -> Option<(usize, bool)> {
+        (0..self.blocks.len()).rev().find_map(|i| {
+            let (l, r) = self.block_x(&self.blocks[i], b);
+            (x >= l - PICK && x <= r + PICK).then(|| self.edge_at(i, x, b)).flatten().map(|e| (i, e))
+        })
     }
 
     fn music_at(&self, x: f32, b: Rectangle) -> Option<usize> {
@@ -556,15 +570,25 @@ impl canvas::Program<Message> for Marks {
                     *drag = Drag::Sound { cut, key: c.sound.partition_point(|k| k.t <= t) };
                     Message::SoundKeyAdd(cut, t, Timeline::volume_db(CUT_LANE, p.y))
                 } else if p.y < CUTS {
-                    let cut = self.block_at(p.x, bounds)?;
-                    let c = &self.blocks[cut];
-                    match self.edge_at(cut, p.x, bounds) {
-                        Some(start) => {
-                            let per_px = self.span / Timeline::width(bounds) as f64;
-                            *drag = Drag::Trim { cut, start, x0: p.x, from: if start { c.start } else { c.start + c.len }, per_px };
+                    let per_px = self.span / Timeline::width(bounds) as f64;
+                    let cut = match self.edge_hit(p.x, bounds) {
+                        // Shift on a start edge: how far it overlaps the
+                        // cut before, a crossfade.
+                        Some((cut, true)) if state.shift && cut > 0 => {
+                            *drag = Drag::Crossfade { cut, x0: p.x, from: self.blocks[cut].crossfade, per_px };
+                            cut
                         }
-                        None => *drag = Drag::Move { cut, x0: p.x, moved: false, to: cut },
-                    }
+                        Some((cut, start)) => {
+                            let c = &self.blocks[cut];
+                            *drag = Drag::Trim { cut, start, x0: p.x, from: if start { c.start } else { c.start + c.len }, per_px };
+                            cut
+                        }
+                        None => {
+                            let cut = self.block_at(p.x, bounds)?;
+                            *drag = Drag::Move { cut, x0: p.x, moved: false, to: cut };
+                            cut
+                        }
+                    };
                     Message::Select(cut)
                 } else if p.y >= MUSIC_TOP && let Some(key) = self.volume_at(p, bounds) {
                     *drag = Drag::Volume { key };
@@ -614,6 +638,7 @@ impl canvas::Program<Message> for Marks {
                         let len = self.music[*clip].len;
                         Message::MusicMove(*clip, at + self.snap(*clip, &[at, at + len], *per_px), state.shift)
                     }
+                    Drag::Crossfade { cut, x0, from, per_px } => Message::Crossfade(*cut, *from + (*x0 - x) as f64 * *per_px),
                     Drag::Volume { key } => Message::VolumeMove(*key, self.t(x, bounds), Timeline::volume_db(MUSIC_LANE, position.y - bounds.y)),
                     Drag::Sound { cut, key } => {
                         let c = &self.blocks[*cut];
@@ -634,7 +659,7 @@ impl canvas::Program<Message> for Marks {
                 Drag::None => None,
                 Drag::Move { cut, moved: true, to, .. } => Some(canvas::Action::publish(Message::MoveCut(cut, to)).and_capture()),
                 Drag::Move { .. } | Drag::Scroll { .. } => Some(canvas::Action::request_redraw().and_capture()),
-                Drag::Playhead | Drag::Key { .. } | Drag::Trim { .. } | Drag::MusicMove { .. } | Drag::MusicTrim { .. } | Drag::Volume { .. } | Drag::Sound { .. } => {
+                Drag::Playhead | Drag::Key { .. } | Drag::Trim { .. } | Drag::MusicMove { .. } | Drag::MusicTrim { .. } | Drag::Volume { .. } | Drag::Sound { .. } | Drag::Crossfade { .. } => {
                     Some(canvas::Action::publish(Message::ScrubDone).and_capture())
                 }
             },
@@ -672,6 +697,18 @@ impl canvas::Program<Message> for Marks {
                     ..Default::default()
                 });
             }
+        }
+        // Crossfades: an X over each overlap, as on the music lane.
+        for c in self.blocks.iter().filter(|c| c.crossfade > 0.0) {
+            let (l, r) = (self.x(c.from, bounds), self.x(c.from + c.crossfade, bounds));
+            frame.fill(&Path::rectangle(Point::new(l, 0.0), Size::new(r - l, CUTS)), iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35));
+            let x = Path::new(|p| {
+                p.move_to(Point::new(l, CUTS));
+                p.line_to(Point::new(r, 0.0));
+                p.move_to(Point::new(l, 0.0));
+                p.line_to(Point::new(r, CUTS));
+            });
+            frame.stroke(&x, Stroke::default().with_width(1.5).with_color(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.85)));
         }
         if let Drag::Move { moved: true, to, .. } = drag {
             let t = self.blocks.get(*to).map_or(self.duration, |c| c.from);
@@ -732,7 +769,7 @@ impl canvas::Program<Message> for Marks {
 
     fn mouse_interaction(&self, state: &State, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
         match state.drag {
-            Drag::Trim { .. } | Drag::MusicTrim { .. } => mouse::Interaction::ResizingHorizontally,
+            Drag::Trim { .. } | Drag::MusicTrim { .. } | Drag::Crossfade { .. } => mouse::Interaction::ResizingHorizontally,
             Drag::None => {
                 let Some(p) = cursor.position_in(bounds) else { return mouse::Interaction::default() };
                 if p.y >= HEIGHT - SCROLL {
@@ -760,8 +797,10 @@ impl canvas::Program<Message> for Marks {
                 if state.ctrl && self.block_at(p.x, bounds).is_some() {
                     return mouse::Interaction::Crosshair;
                 }
+                if self.edge_hit(p.x, bounds).is_some() {
+                    return mouse::Interaction::ResizingHorizontally;
+                }
                 match self.block_at(p.x, bounds) {
-                    Some(i) if self.edge_at(i, p.x, bounds).is_some() => mouse::Interaction::ResizingHorizontally,
                     Some(_) => mouse::Interaction::Grab,
                     None => mouse::Interaction::default(),
                 }

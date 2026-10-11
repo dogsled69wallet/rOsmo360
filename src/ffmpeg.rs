@@ -338,6 +338,19 @@ pub struct Sound<'a> {
     pub duration: Option<f64>,
     /// Volume points in clip time, applied only in a mix.
     pub volume: &'a [crate::project::VolumeKey],
+    /// Seconds it crossfades with the stretch before, only in a mix.
+    pub crossfade: f64,
+}
+
+/// Where rendered frames go: an encoder, or something blending them first.
+pub trait FrameSink {
+    fn write(&mut self, frame: &Frame) -> Result<()>;
+}
+
+impl FrameSink for Encoder {
+    fn write(&mut self, frame: &Frame) -> Result<()> {
+        Encoder::write(self, frame)
+    }
 }
 
 /// Writes `duration` seconds of `input`'s sound from `start` to `output` as
@@ -396,7 +409,7 @@ impl Encoder {
             cmd.arg("-i").arg(s.input);
         }
         // The music's inputs, before any output option.
-        let points = audio.iter().any(|s| !s.volume.is_empty());
+        let points = audio.iter().any(|s| !s.volume.is_empty() || s.crossfade > 0.0);
         let graph = mix.filter(|m| m.matters() || points).map(|m| mixed(&mut cmd, audio, m)).transpose()?;
         cmd.args(["-map", "0:v"]);
         if let Some(graph) = graph {
@@ -475,8 +488,15 @@ fn mixed(cmd: &mut Command, audio: &[Sound<'_>], mix: &Mix<'_>) -> Result<String
             let level = if sound.volume.is_empty() { String::new() } else { format!(",{}", level_filter(0.0, sound.volume, &format!("(t+{})", sound.start))) };
             graph += &format!("[{i}:a:0]{stereo}{level}[c{i}];");
         }
-        let inputs: String = (1..=audio.len()).map(|i| format!("[c{i}]")).collect();
-        graph += &format!("{inputs}concat=n={}:v=0:a=1,volume={}[s];", audio.len(), crate::project::gain(mix.sound_db));
+        // Joined in turn: a crossfade overlaps a stretch's end with the
+        // next's start (equal power, as the music's), else end to end.
+        let mut joined = "[c1]".to_owned();
+        for (i, sound) in (2..).zip(&audio[1..]) {
+            let join = if sound.crossfade > 0.0 { format!("acrossfade=d={}:c1=qsin:c2=qsin", sound.crossfade) } else { "concat=n=2:v=0:a=1".to_owned() };
+            graph += &format!("{joined}[c{i}]{join}[j{i}];");
+            joined = format!("[j{i}]");
+        }
+        graph += &format!("{joined}volume={}[s];", crate::project::gain(mix.sound_db));
     } else {
         if !audio.is_empty() {
             eprintln!("not every clip has sound; exporting the music alone");

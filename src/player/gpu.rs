@@ -1,6 +1,10 @@
 //! The 360 view as an iced shader primitive: one pass of `shader.wgsl` over
 //! the widget's rectangle, sharing iced's wgpu device. `Pipeline` doesn't
 //! need iced: `render.rs` drives it on a device of its own for export.
+//!
+//! Through a crossfade between cuts the pipeline draws a second layer, the
+//! incoming cut, over the first with a blend constant: each layer keeps its
+//! own uniforms and pictures, so neither re-uploads while both play.
 
 use super::source::{Frame, Layout};
 use crate::align::{Aligner, CELLS_ALPHA, CELLS_PHI, Field, Strips};
@@ -142,6 +146,18 @@ pub struct Primitive {
     pub camera: Camera,
     /// rig_from_view at instants spread over the readout.
     pub rig_from_view: Vec<M3>,
+    /// Through a crossfade: the next cut, drawn over this one.
+    pub incoming: Option<Incoming>,
+}
+
+/// The cut crossfading in: its own picture and framing, and how far in it
+/// is (0..1).
+pub struct Incoming {
+    pub rig: Arc<Rig>,
+    pub shown: Arc<Shown>,
+    pub camera: Camera,
+    pub rig_from_view: Vec<M3>,
+    pub mix: f32,
 }
 
 impl std::fmt::Debug for Primitive {
@@ -157,10 +173,20 @@ struct Plane {
 
 pub struct Pipeline {
     pipeline: wgpu::RenderPipeline,
+    /// The same, blending over what's drawn by the pass's blend constant.
+    blend: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    uniforms: wgpu::Buffer,
     srgb: bool,
+    /// The cut shown, and the one crossfading in over it.
+    layers: [Layer; 2],
+    /// How far the second layer is in, if it's drawn.
+    mix: Option<f32>,
+}
+
+/// One picture's resources: uniforms, textures and what they hold.
+struct Layer {
+    uniforms: wgpu::Buffer,
     /// Per texture slot: Y plane, UV plane.
     slots: [(Plane, Plane); 2],
     masks: [Plane; 2],
@@ -224,27 +250,33 @@ impl Pipeline {
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("stitch"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(format.into())],
-            }),
-            multiview: None,
-            cache: None,
-        });
+        let make = |blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("stitch"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipeline = make(None);
+        // new × k + old × (1 − k), k the blend constant.
+        let over = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Constant, dst_factor: wgpu::BlendFactor::OneMinusConstant, operation: wgpu::BlendOperation::Add };
+        let blend = make(Some(wgpu::BlendState { color: over, alpha: over }));
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -252,28 +284,19 @@ impl Pipeline {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let layers = [0, 1].map(|_| {
+            let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("uniforms"),
+                size: std::mem::size_of::<Uniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let slots = [0, 1].map(|_| (plane(device, 2, 2, wgpu::TextureFormat::R8Unorm), plane(device, 1, 1, wgpu::TextureFormat::Rg8Unorm)));
+            let masks = [0, 1].map(|_| plane(device, 1, 1, wgpu::TextureFormat::R8Unorm));
+            let bind_group = bind(device, &layout, &uniforms, &sampler, &slots, &masks);
+            Layer { uniforms, slots, masks, bind_group, lens_u: [LensU::zeroed(); 2], rig_id: 0, shown_id: 0 }
         });
-        let slots = [0, 1].map(|_| (plane(device, 2, 2, wgpu::TextureFormat::R8Unorm), plane(device, 1, 1, wgpu::TextureFormat::Rg8Unorm)));
-        let masks = [0, 1].map(|_| plane(device, 1, 1, wgpu::TextureFormat::R8Unorm));
-        let bind_group = bind(device, &layout, &uniforms, &sampler, &slots, &masks);
-        Pipeline {
-            pipeline,
-            layout,
-            sampler,
-            uniforms,
-            srgb: format.is_srgb(),
-            slots,
-            masks,
-            bind_group,
-            lens_u: [LensU::zeroed(); 2],
-            rig_id: 0,
-            shown_id: 0,
-        }
+        Pipeline { pipeline, blend, layout, sampler, srgb: format.is_srgb(), layers, mix: None }
     }
 
     /// Gets ready to draw `shown` through `camera` into a `size` pixel
@@ -281,20 +304,30 @@ impl Pipeline {
     /// uploaded only when they change.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rig: &Rig, shown: &Shown, camera: &Camera, rig_from_view: &[M3], size: [f32; 2], origin: [f32; 2]) {
-        if self.rig_id != rig.id {
-            self.set_rig(device, queue, rig);
+        self.mix = None;
+        self.prepare_layer(0, device, queue, rig, shown, camera, rig_from_view, size, origin);
+    }
+
+    /// Gets layer `layer` ready (see `prepare_frame`).
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_layer(&mut self, layer: usize, device: &wgpu::Device, queue: &wgpu::Queue, rig: &Rig, shown: &Shown, camera: &Camera, rig_from_view: &[M3], size: [f32; 2], origin: [f32; 2]) {
+        let srgb = self.srgb;
+        let (layout, sampler) = (&self.layout, &self.sampler);
+        let l = &mut self.layers[layer];
+        if l.rig_id != rig.id {
+            l.set_rig(device, queue, rig, layout, sampler);
         }
-        if self.shown_id != shown.id {
-            self.upload(device, queue, &shown.frame, rig);
-            self.shown_id = shown.id;
+        if l.shown_id != shown.id {
+            l.upload(device, queue, &shown.frame, rig, layout, sampler);
+            l.shown_id = shown.id;
         }
         let mut u = Uniforms::zeroed();
         u.user = rows(camera.user);
         // A negative mapping means equirect; see the shader's `screen_ray`.
         u.screen = [size[0], size[1], camera.zoom as f32, camera.planet.map_or(-1.0, |d| d as f32)];
         let steps = rig_from_view.len().min(RS_STEPS_MAX);
-        u.misc = [steps as f32, self.srgb as u8 as f32, origin[0], origin[1]];
-        u.lenses = self.lens_u;
+        u.misc = [steps as f32, srgb as u8 as f32, origin[0], origin[1]];
+        u.lenses = l.lens_u;
         for (k, m) in rig_from_view.iter().take(steps).enumerate() {
             u.views[k * 3..k * 3 + 3].copy_from_slice(&rows(*m));
         }
@@ -314,7 +347,7 @@ impl Pipeline {
         for (v, bins) in u.cut.iter_mut().zip(shown.fix.field.cut.chunks_exact(4)) {
             v.copy_from_slice(bins);
         }
-        queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+        queue.write_buffer(&l.uniforms, 0, bytemuck::bytes_of(&u));
     }
 
     /// Draws the prepared frame into `target`, within `clip`.
@@ -333,11 +366,20 @@ impl Pipeline {
         });
         pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_bind_group(0, &self.layers[0].bind_group, &[]);
         pass.draw(0..3, 0..1);
+        if let Some(k) = self.mix {
+            let k = k as f64;
+            pass.set_pipeline(&self.blend);
+            pass.set_blend_constant(wgpu::Color { r: k, g: k, b: k, a: k });
+            pass.set_bind_group(0, &self.layers[1].bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
     }
+}
 
-    fn set_rig(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rig: &Rig) {
+impl Layer {
+    fn set_rig(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rig: &Rig, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler) {
         self.masks = [0, 1].map(|i| {
             let l = &rig.lenses[i];
             let [w, h] = l.calib_dim;
@@ -346,13 +388,13 @@ impl Pipeline {
             p
         });
         self.lens_u = [0, 1].map(|i| lens_uniform(&rig.lenses[i]));
-        self.bind_group = bind(device, &self.layout, &self.uniforms, &self.sampler, &self.slots, &self.masks);
+        self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.masks);
         self.rig_id = rig.id;
         self.shown_id = 0;
     }
 
     /// Uploads a frame's pictures and points each lens at its part of them.
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame, rig: &Rig) {
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame, rig: &Rig, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler) {
         let mut rebind = false;
         for (slot, pic) in frame.pictures.iter().enumerate().take(2) {
             let (y, uv) = &mut self.slots[slot];
@@ -365,7 +407,7 @@ impl Pipeline {
             write(queue, &uv.texture, pic.uv(), pic.width / 2, pic.height / 2, 2);
         }
         if rebind {
-            self.bind_group = bind(device, &self.layout, &self.uniforms, &self.sampler, &self.slots, &self.masks);
+            self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.masks);
         }
         for (i, lens) in rig.lenses.iter().enumerate().take(2) {
             let track = rig.tracks[lens.input];
@@ -390,7 +432,12 @@ impl shader::Primitive for Primitive {
 
     fn prepare(&self, p: &mut Pipeline, device: &wgpu::Device, queue: &wgpu::Queue, bounds: &Rectangle, viewport: &Viewport) {
         let px = *bounds * viewport.scale_factor();
-        p.prepare_frame(device, queue, &self.rig, &self.shown, &self.camera, &self.rig_from_view, [px.width, px.height], [px.x, px.y]);
+        let (size, origin) = ([px.width, px.height], [px.x, px.y]);
+        p.prepare_frame(device, queue, &self.rig, &self.shown, &self.camera, &self.rig_from_view, size, origin);
+        if let Some(i) = &self.incoming {
+            p.prepare_layer(1, device, queue, &i.rig, &i.shown, &i.camera, &i.rig_from_view, size, origin);
+            p.mix = Some(i.mix);
+        }
     }
 
     fn render(&self, p: &Pipeline, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, clip: &Rectangle<u32>) {

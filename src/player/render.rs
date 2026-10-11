@@ -195,7 +195,7 @@ pub fn encode(
     clip: &Clip,
     start: f64,
     total: usize,
-    encoder: &mut ffmpeg::Encoder,
+    encoder: &mut dyn ffmpeg::FrameSink,
     camera: impl Fn(f64) -> Camera,
     size: (usize, usize),
     tick: &mut dyn FnMut(usize) -> Result<()>,

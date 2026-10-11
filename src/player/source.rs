@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// One NV12 picture: Y plane then interleaved UV at half resolution.
@@ -77,6 +78,16 @@ pub enum Kind {
 /// A running decode from `start`, delivering frames in order.
 pub struct Stream {
     pub frames: Receiver<Frame>,
+    /// Its decoders, killed as soon as it's dropped: left to the pump, one
+    /// only stopped after its next frame, a second or more for an OSV
+    /// starting up, and scrubbing piled them up until memory ran out.
+    procs: Arc<Mutex<Vec<Child>>>,
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        kill(&self.procs);
+    }
 }
 
 pub fn spawn(kind: Kind, hw: Hwaccel, start: f64, fps: f64) -> Result<Stream> {
@@ -103,30 +114,37 @@ pub fn spawn(kind: Kind, hw: Hwaccel, start: f64, fps: f64) -> Result<Stream> {
         Kind::Lrf(_) => Layout::SideBySide,
         Kind::Osv { .. } => Layout::PerTrack,
     };
-    thread::spawn(move || pump(procs, layout, start, fps, tx));
-    Ok(Stream { frames: rx })
+    let (mut children, sizes): (Vec<Child>, Vec<(u32, u32)>) = procs.into_iter().map(|(c, w, h)| (c, (w, h))).unzip();
+    let outs: Vec<_> = children.iter_mut().map(|c| c.stdout.take().unwrap()).collect();
+    let procs = Arc::new(Mutex::new(children));
+    let decoders = procs.clone();
+    thread::spawn(move || {
+        pump(outs, sizes, layout, start, fps, tx);
+        kill(&decoders);
+    });
+    Ok(Stream { frames: rx, procs })
 }
 
-fn pump(mut procs: Vec<(Child, u32, u32)>, layout: Layout, start: f64, fps: f64, tx: SyncSender<Frame>) {
-    let mut outs: Vec<_> = procs.iter_mut().map(|(c, _, _)| c.stdout.take().unwrap()).collect();
+/// Reads whole frames from the decoders until they end or nobody wants
+/// more.
+fn pump(mut outs: Vec<std::process::ChildStdout>, sizes: Vec<(u32, u32)>, layout: Layout, start: f64, fps: f64, tx: SyncSender<Frame>) {
     for n in 0.. {
-        let mut pictures = Vec::with_capacity(procs.len());
-        for ((_, w, h), out) in procs.iter().zip(outs.iter_mut()) {
-            let mut data = vec![0; (*w * *h * 3 / 2) as usize];
+        let mut pictures = Vec::with_capacity(sizes.len());
+        for (&(w, h), out) in sizes.iter().zip(outs.iter_mut()) {
+            let mut data = vec![0; (w * h * 3 / 2) as usize];
             if out.read_exact(&mut data).is_err() {
-                return kill(procs);
+                return;
             }
-            pictures.push(Picture { width: *w, height: *h, data });
+            pictures.push(Picture { width: w, height: h, data });
         }
-        let frame = Frame { pts: start + n as f64 / fps, layout, pictures };
-        if tx.send(frame).is_err() {
-            return kill(procs);
+        if tx.send(Frame { pts: start + n as f64 / fps, layout, pictures }).is_err() {
+            return;
         }
     }
 }
 
-fn kill(procs: Vec<(Child, u32, u32)>) {
-    for (mut c, _, _) in procs {
+fn kill(procs: &Mutex<Vec<Child>>) {
+    for c in procs.lock().unwrap().iter_mut() {
         let _ = c.kill();
         let _ = c.wait();
     }
