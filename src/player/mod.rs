@@ -148,8 +148,13 @@ pub fn run(inputs: Vec<PathBuf>, launch: Launch) -> Result<()> {
         size: iced::Size::new(1280.0, 820.0),
         // Closing asks first when the edit has unsaved changes.
         exit_on_close_request: false,
+        // Wayland matches the window to its menu entry and icon by this id: in a
+        // Flatpak that's the Flatpak's own (io.github.ravelund.rOsmo360).
         #[cfg(target_os = "linux")]
-        platform_specific: window::settings::PlatformSpecific { application_id: NAME.to_owned(), ..Default::default() },
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: std::env::var("FLATPAK_ID").unwrap_or_else(|_| NAME.to_owned()),
+            ..Default::default()
+        },
         ..Default::default()
     })
     .run()

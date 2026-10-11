@@ -64,7 +64,7 @@ Developed and tested on Linux (KDE Plasma, NVIDIA RTX 3090). Windows and macOS b
 
 ## Installing
 
-Ready-made builds for x86_64 Linux are on the [releases page](https://github.com/ravelund/rOsmo360/releases/latest). They run on Ubuntu 22.04, Debian 12, Fedora 36 and newer distributions. Install `ffmpeg` from your distribution first; the builds use it, and its GPU decoders, from the system.
+Ready-made builds for x86_64 Linux are on the [releases page](https://github.com/ravelund/rOsmo360/releases/latest). They run on Ubuntu 22.04, Debian 12, Fedora 36 and newer distributions. The install script and the AppImage use `ffmpeg` from the system, with its GPU decoders, so install it from your distribution first; the Flatpak brings its own.
 
 - **Install script**: puts `rosmo360` in `~/.local/bin` and adds rOsmo360 to the application menu.
 
@@ -74,6 +74,13 @@ Ready-made builds for x86_64 Linux are on the [releases page](https://github.com
 
   Or download `rosmo360-x86_64-linux.tar.gz`, unpack it and run `./install.sh` in it. `--prefix /usr/local` (as root) installs for all users, and `--uninstall` removes it again.
 - **AppImage**: download `rOsmo360-x86_64.AppImage`, make it executable (`chmod +x`) and run it. Without arguments, or given clips or a project, it opens the player. Commands work as with `rosmo360`: `./rOsmo360-x86_64.AppImage export clip.OSV -o out.mp4`.
+- **Flatpak**: download `rOsmo360-x86_64.flatpak` and install it; the Freedesktop runtime comes from Flathub.
+
+  ```sh
+  flatpak install --user rOsmo360-x86_64.flatpak
+  ```
+
+  It brings its own ffmpeg (GPL, with VA-API, Vulkan and NVDEC decoding; built without `scale_cuda`, so exports decode with Vulkan, ~16 rather than ~21 fps at 1080p on an RTX 3090) and needs nothing else from the system. Commands work through `flatpak run io.github.ravelund.rOsmo360 export clip.OSV -o out.mp4`. It sees your files, but has a `/tmp` of its own, and keeps its settings and cache in `~/.var/app/io.github.ravelund.rOsmo360`. The sources of the ffmpeg and x264 inside are in `rOsmo360-flatpak-ffmpeg-sources.tar` on the same release.
 
 ## Building
 

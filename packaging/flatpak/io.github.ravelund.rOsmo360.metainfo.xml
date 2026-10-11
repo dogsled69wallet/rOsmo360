@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.ravelund.rOsmo360</id>
+  <name>rOsmo360</name>
+  <summary>Play and edit DJI Osmo 360 footage</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <developer id="io.github.ravelund">
+    <name>Vibing with Ravelund</name>
+  </developer>
+  <description>
+    <p>rOsmo360 plays and edits 360° video from the DJI Osmo 360. It reads the camera's .OSV files directly, stitches the two lenses with DJI's own calibration, keeps the horizon level from the camera's motion data, and lets you look around, cut clips together, move the view with keyframes and export a finished video.</p>
+    <ul>
+      <li>Real-time playback with free look, perspective, little planet and equirect views</li>
+      <li>Stabilisation: level horizon, fixed heading or world lock, with rolling-shutter correction</li>
+      <li>A timeline of cuts with keyframed camera moves, following the selfie stick or a coloured subject</li>
+      <li>Export to MP4 or to DaVinci Resolve, as one video or a file per cut</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.ravelund.rOsmo360.desktop</launchable>
+  <url type="homepage">https://github.com/ravelund/rOsmo360</url>
+  <url type="bugtracker">https://github.com/ravelund/rOsmo360/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/ravelund/rOsmo360/master/docs/screenshot.png</image>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.2.8" date="2026-10-11"/>
+  </releases>
+</component>

@@ -35,7 +35,7 @@ Part 2: Advanced
 
 ### Installing
 
-Install `ffmpeg` from your distribution first (`sudo apt install ffmpeg`, `sudo dnf install ffmpeg` or `sudo pacman -S ffmpeg`). Then take one of the ready-made builds from the [releases page](https://github.com/ravelund/rOsmo360/releases/latest). They run on x86_64 Linux: Ubuntu 22.04, Debian 12, Fedora 36 and newer.
+For the install script and the AppImage, install `ffmpeg` from your distribution first (`sudo apt install ffmpeg`, `sudo dnf install ffmpeg` or `sudo pacman -S ffmpeg`). Then take one of the ready-made builds from the [releases page](https://github.com/ravelund/rOsmo360/releases/latest). They run on x86_64 Linux: Ubuntu 22.04, Debian 12, Fedora 36 and newer.
 
 - **Install script**: puts rOsmo360 in your application menu. Paste this into a terminal:
 
@@ -45,6 +45,7 @@ Install `ffmpeg` from your distribution first (`sudo apt install ffmpeg`, `sudo 
 
   Run it again to update. Adding `--uninstall` removes it; your settings stay.
 - **AppImage**: download `rOsmo360-x86_64.AppImage`, make it executable (in your file manager's properties, or `chmod +x rOsmo360-x86_64.AppImage`) and double-click it.
+- **Flatpak**: download `rOsmo360-x86_64.flatpak` and open it with your software centre (Discover, GNOME Software), or install it in a terminal with `flatpak install --user rOsmo360-x86_64.flatpak`. It brings everything it needs, ffmpeg included, so you can skip installing ffmpeg. Its exports are a little slower on NVIDIA cards.
 
 ### What you need
 
@@ -322,7 +323,7 @@ With the mouse: drag in the view to look around, right-drag to roll, scroll to z
 
 ## 14. The command line
 
-Everything the player does can also be done from a terminal, which is handy for batches and scripts, and a few tools exist only there. `rosmo360 --help` and `rosmo360 <command> --help` list every option. If you use the AppImage, write `./rOsmo360-x86_64.AppImage` where these say `rosmo360`.
+Everything the player does can also be done from a terminal, which is handy for batches and scripts, and a few tools exist only there. `rosmo360 --help` and `rosmo360 <command> --help` list every option. If you use the AppImage, write `./rOsmo360-x86_64.AppImage` where these say `rosmo360`; with the Flatpak, `flatpak run io.github.ravelund.rOsmo360`. The Flatpak has a `/tmp` of its own, so give it output paths elsewhere.
 
 **Open** the player with something loaded:
 
@@ -388,6 +389,6 @@ rosmo360 cache clear                            # empty it
 rosmo360 cache clear --older-than 90            # only what no clip has used for 90 days
 ```
 
-- **Where**: `~/.cache/rosmo360` on Linux (`%LOCALAPPDATA%\rosmo360` on Windows), about 1.5 MB per minute of footage. `cache move` moves what's cached to the new folder, say on a disk meant for media, and remembers it. Setting `ROSMO360_CACHE=/some/folder` overrides that for one run or a script.
+- **Where**: `~/.cache/rosmo360` on Linux (in the Flatpak, `~/.var/app/io.github.ravelund.rOsmo360/cache/rosmo360`; `%LOCALAPPDATA%\rosmo360` on Windows), about 1.5 MB per minute of footage. `cache move` moves what's cached to the new folder, say on a disk meant for media, and remembers it. Setting `ROSMO360_CACHE=/some/folder` overrides that for one run or a script.
 - **Ahead of time**: run `cache add` after copying a card, and even the first open is quick. It skips clips already cached, so it's cheap to run again.
 - **Safe to clear**: anything removed is simply read again the next time it's needed. `--no-cache` on any command reads clips afresh and caches nothing.
