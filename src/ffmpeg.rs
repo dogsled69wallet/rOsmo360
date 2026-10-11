@@ -342,6 +342,8 @@ impl Encoder {
     /// The sound is `audio`'s stretches back to back. Each stretch should
     /// last exactly as long as the frames written for it, so later cuts stay
     /// in sync. Several stretches are joined only if every clip has sound.
+    /// No `-shortest`: the sound already ends with the frames, and with the
+    /// frames arriving slower than the sound it cut the last frame off.
     pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio: &[Sound<'_>], format: Format) -> Result<Self> {
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24"]).args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"]);
@@ -364,7 +366,6 @@ impl Encoder {
             eprintln!("not every clip has sound; exporting without");
         }
         let mut child = cmd
-            .args(["-shortest"])
             .args(format.codecs())
             .arg(output)
             .stdin(Stdio::piped())

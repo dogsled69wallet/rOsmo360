@@ -593,12 +593,14 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
     let mut plan = Vec::with_capacity(project.cuts.len());
     for (cut, &i) in project.cuts.iter().zip(&of_cut) {
         let p = &pipelines[i];
-        let start = p.snap((cut.start - handles).max(0.0));
+        let from = (cut.start - handles).max(0.0);
         let end = (cut.end + handles).min(ffmpeg::duration(&cut.input)?);
-        if end <= start {
+        if end <= from {
             bail!("the cut from {} s starts after {} ends", cut.start, cut.input.display());
         }
-        plan.push((i, start, ((end - start) * p.fps).round().max(1.0) as usize));
+        // Count frames over the span asked for, not from the frame the start
+        // snaps to: snapping 14 s forward to 14.014 left `-d 5` at 149 frames.
+        plan.push((i, p.snap(from), ((end - from) * p.fps).round().max(1.0) as usize));
     }
     let fps = pipelines[0].fps;
     if pipelines.iter().any(|p| (p.fps - fps).abs() > 0.01) {
