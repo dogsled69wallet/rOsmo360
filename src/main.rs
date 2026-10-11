@@ -435,7 +435,12 @@ struct Carry {
 impl Pipeline {
     /// `stabilize` is the mode when the options don't name one.
     fn new(input: &Path, opts: &StitchOpts, stabilize: stab::Mode) -> Result<Self> {
-        let parsed = load_input(input)?;
+        Self::load(input, opts, stabilize, &|_| {})
+    }
+
+    /// `new`, telling `progress` how far reading the telemetry has got (0..1).
+    fn load(input: &Path, opts: &StitchOpts, stabilize: stab::Mode, progress: &dyn Fn(f64)) -> Result<Self> {
+        let parsed = load_input(input, progress)?;
         let rig = telemetry_parser::util::camera_rig(&parsed).context("no camera rig in file")?;
         let projection = match opts.variant {
             Some(i) => &rig.variants.get(i).context("no such variant")?.projection,
@@ -733,11 +738,11 @@ impl Stream {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Rig { input } => {
-            let rig = telemetry_parser::util::camera_rig(&load_input(&input)?).context("no camera rig in file")?;
+            let rig = telemetry_parser::util::camera_rig(&load_input(&input, &|_| {})?).context("no camera rig in file")?;
             println!("{}", serde_json::to_string_pretty(&rig)?);
         }
         Cmd::Imu { input } => {
-            let imu = imu::read(&load_input(&input)?);
+            let imu = imu::read(&load_input(&input, &|_| {})?);
             println!("kind,t,w,x,y,z");
             for (t, q) in &imu.quats {
                 println!("q,{t},{},{},{},{}", q[0], q[1], q[2], q[3]);
@@ -929,7 +934,7 @@ fn save_png(path: &Path, f: &stitch::Frame) -> Result<()> {
 }
 
 fn info(input: &Path) -> Result<()> {
-    let parsed = load_input(input)?;
+    let parsed = load_input(input, &|_| {})?;
     let info = serde_json::json!({
         "input": input,
         "proxy": ffmpeg::proxy(input),
@@ -1011,7 +1016,7 @@ pub fn track_to(
 /// One CSV row per `every` seconds; see `Cmd::Scan` and the header.
 fn scan(input: &Path, every: f64, image: bool) -> Result<()> {
     let skies = if image { skies(input)? } else { Vec::new() };
-    let parsed = load_input(input)?;
+    let parsed = load_input(input, &|_| {})?;
     let quats = imu::read(&parsed).quats;
     let duration = ffmpeg::duration(input)?;
     let levels = if ffmpeg::has_audio(input)? { ffmpeg::audio_levels(input, every)? } else { Vec::new() };
@@ -1124,9 +1129,9 @@ fn seam_report(input: &Path, start: f64, duration: f64, dump: Option<&Path>) -> 
     Ok(())
 }
 
-fn load_input(input: &Path) -> Result<telemetry_parser::Input> {
+fn load_input(input: &Path, progress: &dyn Fn(f64)) -> Result<telemetry_parser::Input> {
     let mut f = File::open(input)?;
     let size = f.metadata()?.len() as usize;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    Ok(telemetry_parser::Input::from_stream(&mut f, size, input, |_| {}, cancel)?)
+    Ok(telemetry_parser::Input::from_stream(&mut f, size, input, progress, cancel)?)
 }

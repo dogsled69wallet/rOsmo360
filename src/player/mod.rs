@@ -77,9 +77,11 @@ pub struct Options {
 }
 
 impl Media {
-    fn load(input: PathBuf, opts: &Options) -> Result<Media> {
+    /// `progress` hears how far reading the clip's telemetry has got (0..1),
+    /// which is most of the time a clip takes to load.
+    fn load(input: PathBuf, opts: &Options, progress: &dyn Fn(f64)) -> Result<Media> {
         let stitch = crate::StitchOpts { stabilize: Some(opts.stabilize), imu_axes: opts.imu_axes, world_z_down: opts.world_z_down, ..Default::default() };
-        let p = crate::Pipeline::new(&input, &stitch, opts.stabilize)?;
+        let p = crate::Pipeline::load(&input, &stitch, opts.stabilize, progress)?;
         let proxy = ffmpeg::proxy(&input);
         let hw = match opts.hw {
             Some(hw) => hw,
@@ -249,6 +251,8 @@ enum Message {
     ExportCancel,
     /// Starts (or stops) drawing a box over a subject to track its colour.
     PickColour,
+    /// A redraw while clips load, for the loading bar.
+    LoadingTick,
     /// The box being drawn, in fractions of the view.
     PickArea(Rectangle),
     /// The box drawn, and the view's width over its height.
@@ -337,6 +341,11 @@ struct App {
     queue: std::collections::VecDeque<(PathBuf, bool)>,
     /// Whether the clip loading now is added as a cut.
     loading_adds: bool,
+    /// Clips loaded since the queue was last empty, and how far the one
+    /// loading now has got (an f64's bits, set from its loading thread):
+    /// together with the queue, a project's loading progress.
+    loaded: usize,
+    loading_part: Arc<std::sync::atomic::AtomicU64>,
     /// The project file, once opened or saved, and the edit version saved.
     project: Option<PathBuf>,
     saved_version: u64,
@@ -404,6 +413,8 @@ impl App {
             timeline_start: 0.0,
             queue: Default::default(),
             loading_adds: true,
+            loaded: 0,
+            loading_part: Arc::default(),
             project: None,
             saved_version: 0,
             after_save: None,
@@ -480,6 +491,7 @@ impl App {
                 }
             }
         }
+        self.loaded = 0;
         // A project's first cut can play once its clip is in.
         if self.clip.is_none() && !self.edit.cuts.is_empty() {
             let start = self.edit.cuts[0].start;
@@ -669,7 +681,7 @@ impl App {
             return row![
                 text(format!("Tracking {:.0}%", done * 100.0)),
                 progress_bar(0.0..=1.0, *done).length(140).girth(8),
-                button("Cancel").on_press(Message::TrackCancel),
+                tip(icon_button(CANCEL, Some(Message::TrackCancel)), text("Stop tracking"), tooltip::Position::Bottom),
             ]
             .spacing(8)
             .align_y(Alignment::Center)
@@ -679,7 +691,7 @@ impl App {
             Some((_, done)) => row![
                 text(format!("Exporting {:.0}%", done * 100.0)),
                 progress_bar(0.0..=1.0, *done).length(140).girth(8),
-                button("Cancel").on_press(Message::ExportCancel),
+                tip(icon_button(CANCEL, Some(Message::ExportCancel)), text("Stop the export"), tooltip::Position::Bottom),
             ]
             .spacing(8)
             .align_y(Alignment::Center)
@@ -691,8 +703,8 @@ impl App {
                     tooltip::Position::Bottom,
                 ),
                 tip(
-                    button("Export…").on_press_maybe((!self.edit.cuts.is_empty()).then_some(Message::Export)),
-                    text("Render the edit with sound, at this resolution, in the aspect's shape"),
+                    icon_button(EXPORT, (!self.edit.cuts.is_empty()).then_some(Message::Export)),
+                    text("Export… the edit with sound, at this resolution, in the aspect's shape"),
                     tooltip::Position::Bottom,
                 ),
                 pick_list(&crate::Resolution::ALL[..], Some(self.resolution), Message::Resolution),
@@ -751,7 +763,10 @@ impl App {
         self.loading = Some(path.clone());
         self.error = None;
         let opts = self.opts.clone();
-        Task::perform(blocking(move || Media::load(path, &opts).map_err(|e| format!("{e:#}"))), |r| Message::Loaded(Arc::new(r)))
+        let part = self.loading_part.clone();
+        part.store(0f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        let progress = move |f: f64| part.store(f.clamp(0.0, 1.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+        Task::perform(blocking(move || Media::load(path, &opts, &progress).map_err(|e| format!("{e:#}"))), |r| Message::Loaded(Arc::new(r)))
     }
 
     fn title(&self) -> String {
@@ -763,7 +778,7 @@ impl App {
             None => String::new(),
         };
         match (&self.loading, &self.clip) {
-            (Some(p), _) => format!("{NAME}{project} · loading {}", name(p)),
+            (Some(_), _) => format!("{NAME}{project} · loading {:.0}%", self.load_progress() * 100.0),
             (None, Some(c)) => format!("{NAME}{project} · {}", name(&c.playback.media.input)),
             (None, None) => format!("{NAME}{project}"),
         }
@@ -777,7 +792,14 @@ impl App {
         let theme = Subscription::run(theme_changes);
         let busy = self.clip.as_ref().is_some_and(|c| c.playback.busy());
         let close = window::close_requests().map(|_| Message::CloseRequested);
-        if busy { Subscription::batch([keys, theme, close, window::frames().map(|_| Message::Tick)]) } else { Subscription::batch([keys, theme, close]) }
+        if busy {
+            Subscription::batch([keys, theme, close, window::frames().map(|_| Message::Tick)])
+        } else if self.loading.is_some() {
+            // Only to redraw the loading bar as it fills.
+            Subscription::batch([keys, theme, close, window::frames().map(|_| Message::LoadingTick)])
+        } else {
+            Subscription::batch([keys, theme, close])
+        }
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
@@ -803,6 +825,7 @@ impl App {
             }
             Message::Loaded(result) => {
                 self.loading = None;
+                self.loaded += 1;
                 match Arc::into_inner(result).expect("loaded clip is not shared") {
                     Ok(media) => {
                         self.opts.hw = Some(media.hw);
@@ -1015,6 +1038,7 @@ impl App {
                     self.error = Some(format!("Saving the project failed: {e:#}"));
                 }
             },
+            Message::LoadingTick => {}
             Message::Tick => {
                 self.tick();
                 if self.clip.as_ref().is_some_and(|c| c.playback.playing) {
@@ -1626,36 +1650,78 @@ impl App {
         image(self.logo.clone()).width(Length::Fixed(420.0)).into()
     }
 
-    fn loading_text(&self, path: &Path) -> String {
-        format!("Loading {}…", path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()))
+    /// Clips loaded and to load since the queue was last empty: a clip
+    /// that several cuts use loads once.
+    fn load_total(&self) -> usize {
+        let waiting: std::collections::HashSet<&PathBuf> =
+            self.queue.iter().map(|(p, _)| p).filter(|p| self.loading.as_ref() != Some(*p) && !self.library.iter().any(|m| &m.input == *p)).collect();
+        self.loaded + waiting.len() + usize::from(self.loading.is_some())
+    }
+
+    /// How far loading the queued clips has got, 0..1.
+    fn load_progress(&self) -> f32 {
+        let part = f64::from_bits(self.loading_part.load(std::sync::atomic::Ordering::Relaxed));
+        ((self.loaded as f64 + part) / self.load_total().max(1) as f64) as f32
+    }
+
+    /// A bar for loading clips, rather than their names going by.
+    fn loading_bar(&self, length: f32) -> Element<'_, Message> {
+        let total = self.load_total();
+        let label = if total > 1 { format!("Loading clip {} of {total}", self.loaded + 1) } else { "Loading…".to_owned() };
+        row![text(label), progress_bar(0.0..=1.0, self.load_progress()).length(length).girth(8)].spacing(8).align_y(Alignment::Center).into()
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let open = button(if self.edit.cuts.is_empty() { "Open…" } else { "Add clip…" }).on_press(Message::Open);
+        let open_hint = if self.edit.cuts.is_empty() { "Open clips (Ctrl+O)" } else { "Add clips to the edit as cuts (Ctrl+O)" };
         let error = self.error.as_ref().map(|e| text(e.clone()).style(text::danger));
         let Some(clip) = &self.clip else {
-            let status = match &self.loading {
-                Some(p) => self.loading_text(p),
-                None => "Open DJI Osmo 360 .OSV clips, or a saved project, to start.".to_owned(),
+            let status: Element<'_, Message> = match &self.loading {
+                Some(_) => self.loading_bar(280.0),
+                None => text("Open DJI Osmo 360 .OSV clips, or a saved project, to start.").into(),
             };
-            let buttons = row![open, button("Open project…").on_press(Message::OpenProject)].spacing(12);
-            let start = center(column![self.logo(), text(status), buttons].push(error).spacing(16).align_x(Alignment::Center));
+            let buttons = row![
+                labelled_button(ADD_CLIP, "Open clips…", (self.loading.is_none()).then_some(Message::Open)),
+                labelled_button(OPEN_PROJECT, "Open project…", (self.loading.is_none()).then_some(Message::OpenProject)),
+            ]
+            .spacing(12);
+            let start = center(column![self.logo(), status, buttons].push(error).spacing(16).align_x(Alignment::Center));
             return column![start, credit()].into();
         };
         let p = &clip.playback;
         let media = &p.media;
 
-        let status = match (&self.loading, &self.save_status) {
-            (Some(path), _) => self.loading_text(path),
-            (None, Some(s)) => format!("{s} · {} · {:?} decode", p.quality(), media.hw),
-            (None, None) => format!("{} · {:?} decode", p.quality(), media.hw),
+        let quality = p.quality();
+        let showing = if quality.starts_with("loading") {
+            status_icon(SHOWING_LOADING, format!("Showing the playback picture, {quality}"))
+        } else if quality == "proxy" {
+            status_icon(SHOWING_PROXY, "Showing the proxy (LRF): quick to decode, less detail".to_owned())
+        } else {
+            status_icon(SHOWING_FULL, format!("Showing the {}", if quality == "full res" { "OSV at full resolution".to_owned() } else { quality.clone() }))
+        };
+        let decode = match media.hw {
+            Hwaccel::Software => status_icon(DECODE_CPU, "Decoding in software: no GPU decoder worked here".to_owned()),
+            hw => status_icon(DECODE_GPU, format!("Decoding on the GPU with {}", match hw {
+                Hwaccel::Vulkan => "Vulkan Video",
+                Hwaccel::Vaapi => "VA-API",
+                _ => "CUDA",
+            })),
+        };
+        let message = self.save_status.as_ref().map(|s| text(s.clone()).style(text::secondary));
+        let status: Element<'_, Message> = match &self.loading {
+            Some(_) => self.loading_bar(140.0),
+            None => row![].push(message).push(showing).push(decode).spacing(10).align_y(Alignment::Center).into(),
         };
         let top = row![
-            open,
-            tip(button("Open project…").on_press(Message::OpenProject), text("Open a saved edit (Ctrl+Shift+O)"), tooltip::Position::Bottom),
+            tip(icon_button(ADD_CLIP, Some(Message::Open)), text(open_hint), tooltip::Position::Bottom),
+            tip(icon_button(OPEN_PROJECT, Some(Message::OpenProject)), text("Open a saved edit (Ctrl+Shift+O)"), tooltip::Position::Bottom),
             tip(
-                button("Save project").on_press_maybe(self.unsaved().then_some(Message::SaveProject(false))),
-                text("Save the edit: cuts, keyframes and shape (Ctrl+S; Ctrl+Shift+S saves as)"),
+                icon_button(SAVE, self.unsaved().then_some(Message::SaveProject(false))),
+                text("Save the edit: cuts, keyframes and shape (Ctrl+S)"),
+                tooltip::Position::Bottom,
+            ),
+            tip(
+                icon_button(SAVE_AS, (!self.edit.cuts.is_empty()).then_some(Message::SaveProject(true))),
+                text("Save the edit as a new project file (Ctrl+Shift+S)"),
                 tooltip::Position::Bottom,
             ),
             self.export_controls(),
@@ -1666,7 +1732,7 @@ impl App {
                 tooltip::Position::Bottom,
             ),
             space().width(Length::Fill),
-            text(status)
+            status
         ]
             .spacing(12)
             .padding([6, 10])
@@ -1730,14 +1796,18 @@ impl App {
         .view();
         let can_split = self.edit.cuts.get(self.current).is_some_and(|c| p.target() > c.start + edit::MIN_CUT && p.target() < c.end - edit::MIN_CUT);
         let transport = row![
-            button(text(if p.playing { "Pause" } else { "Play" }).width(48).align_x(Alignment::Center)).on_press(Message::Toggle),
             tip(
-                button("Save view…").on_press_maybe((!p.playing).then_some(Message::Save(Saving::View))),
+                icon_button(if p.playing { PAUSE } else { PLAY }, Some(Message::Toggle)),
+                text(if p.playing { "Pause (Space)" } else { "Play (Space)" }),
+                tooltip::Position::Top,
+            ),
+            tip(
+                icon_button(SAVE_VIEW, (!p.playing).then_some(Message::Save(Saving::View))),
                 text("Save what you see as a PNG (pause first)"),
                 tooltip::Position::Top,
             ),
             tip(
-                button("Save 360°…").on_press_maybe((!p.playing).then_some(Message::Save(Saving::Sphere))),
+                icon_button(SAVE_SPHERE, (!p.playing).then_some(Message::Save(Saving::Sphere))),
                 text("Save the whole sphere as an equirect PNG (pause first)"),
                 tooltip::Position::Top,
             ),
@@ -1817,8 +1887,12 @@ impl App {
                 text("Off: paused frames stay at the playback source's quality"),
                 tooltip::Position::Top,
             ),
-            button("Reset view").on_press(Message::ResetView),
-            button(if self.fullscreen { "Exit fullscreen" } else { "Fullscreen" }).on_press(Message::Fullscreen),
+            tip(icon_button(RESET_VIEW, Some(Message::ResetView)), text("Reset the view: straight ahead, level (0)"), tooltip::Position::Top),
+            tip(
+                icon_button(if self.fullscreen { FULLSCREEN_EXIT } else { FULLSCREEN }, Some(Message::Fullscreen)),
+                text(if self.fullscreen { "Leave fullscreen (F)" } else { "Fullscreen (F)" }),
+                tooltip::Position::Top,
+            ),
         ]
         .spacing(18)
         .padding([6, 10])
@@ -1867,6 +1941,34 @@ const PICK: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 
 const KEY_ADD: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M10 2 18 10 10 18 2 10z" fill="white"/><path d="M19 15v8M15 19h8" stroke-linecap="round"/></svg>"#;
 const KEY_DELETE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linejoin="round"><path d="M10 2 18 10 10 18 2 10z"/><path d="m16 16 6 6M22 16l-6 6" stroke-linecap="round"/></svg>"#;
 
+/// File icons: a film strip with a plus (open or add clips), an open folder
+/// (open a project), a diskette (save) and one with a pencil (save as).
+const ADD_CLIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="14" height="18" rx="2"/><path d="M6 3v18M12 3v18M2 8h4M2 16h4M12 8h4M12 16h4M20 9v6M17 12h6"/></svg>"#;
+const OPEN_PROJECT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>"#;
+const SAVE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7M7 3v4a1 1 0 0 0 1 1h7"/></svg>"#;
+const SAVE_AS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h10.2a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V10"/><path d="M7 3v4a1 1 0 0 0 1 1h7M7 21v-7a1 1 0 0 1 1-1h4"/><path d="M21.4 15.6a1.98 1.98 0 0 0-2.8-2.8L14 17.4V20.2h2.8z"/></svg>"#;
+/// An arrow out of a tray (export) and a crossed circle (cancel a running job).
+const EXPORT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/></svg>"#;
+const CANCEL: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/></svg>"#;
+/// Transport: play, pause, a camera (save the view) and a globe (save the
+/// whole sphere).
+const PLAY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16l13-8z" fill="white"/></svg>"#;
+const PAUSE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16" rx="1" fill="white"/><rect x="14" y="4" width="4" height="16" rx="1" fill="white"/></svg>"#;
+const SAVE_VIEW: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3"/></svg>"#;
+const SAVE_SPHERE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>"#;
+/// View: turn back (reset the view) and corners out or in (fullscreen).
+const RESET_VIEW: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>"#;
+const FULLSCREEN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>"#;
+const FULLSCREEN_EXIT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3"/></svg>"#;
+
+/// Status: what the view shows (the proxy, the OSV or full res, a full-res
+/// frame on its way) and how it decodes (on the GPU, or in software).
+const SHOWING_PROXY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 3v18M17 3v18M3 7.5h4M3 12h18M3 16.5h4M17 7.5h4M17 16.5h4"/></svg>"#;
+const SHOWING_FULL: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>"#;
+const SHOWING_LOADING: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 22h14M5 2h14M17 22v-4.2a2 2 0 0 0-.6-1.4L12 12l-4.4 4.4a2 2 0 0 0-.6 1.4V22M7 2v4.2a2 2 0 0 0 .6 1.4L12 12l4.4-4.4a2 2 0 0 0 .6-1.4V2"/></svg>"#;
+const DECODE_GPU: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg>"#;
+const DECODE_CPU: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>"#;
+
 /// A hint on hover, on a box of its own so it reads over the picture.
 fn tip<'a>(content: impl Into<Element<'a, Message>>, hint: iced::widget::Text<'a>, position: tooltip::Position) -> Element<'a, Message> {
     tooltip(content, container(hint).padding([4, 8]).style(container::rounded_box), position).into()
@@ -1874,6 +1976,23 @@ fn tip<'a>(content: impl Into<Element<'a, Message>>, hint: iced::widget::Text<'a
 
 fn icon_button<'a>(icon: &'static [u8], on_press: Option<Message>) -> Element<'a, Message> {
     button(svg(svg::Handle::from_memory(icon)).width(20).height(20)).padding(5).on_press_maybe(on_press).into()
+}
+
+/// A status icon, dimmed towards the background so it stays out of the
+/// way, with what it means on hover.
+fn status_icon<'a>(icon: &'static [u8], hint: String) -> Element<'a, Message> {
+    let dim = svg(svg::Handle::from_memory(icon)).width(18).height(18).style(|theme: &Theme, _| svg::Style {
+        color: Some(iced::Color { a: 0.45, ..theme.palette().text }),
+    });
+    tip(dim, text(hint), tooltip::Position::Bottom)
+}
+
+/// An icon with its words, for the start screen, which has the room.
+fn labelled_button<'a>(icon: &'static [u8], label: &'a str, on_press: Option<Message>) -> Element<'a, Message> {
+    button(row![svg(svg::Handle::from_memory(icon)).width(20).height(20), text(label)].spacing(8).align_y(Alignment::Center))
+        .padding([6, 12])
+        .on_press_maybe(on_press)
+        .into()
 }
 
 /// Speaker icons for the mute button, drawn in the button's text colour.

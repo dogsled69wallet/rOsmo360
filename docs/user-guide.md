@@ -58,7 +58,7 @@ rosmo360 play edit.json        # a saved project
 
 ![The start screen, with the Vibing with Ravelund logo and the buttons Open… and Open project…](guide/start.jpg)
 
-On the start screen, **Open…** picks one or more clips and **Open project…** opens a saved edit. The first clip starts playing as soon as it has loaded.
+On the start screen, **Open clips…** picks one or more clips and **Open project…** opens a saved edit. A bar shows how far loading has got ("Loading clip 4 of 23": a clip that several cuts use loads once). The first clip starts playing as soon as it has loaded.
 
 ## 2. The window
 
@@ -70,11 +70,13 @@ From top to bottom:
 
    ![The top bar: Add clip…, Open project…, Save project, Aspect 16:9, Export…, 1080p, the clip's name, and the playback quality](guide/top-bar.png)
 
-   On the right it says what you're seeing ("proxy", "OSV 1920 px" or "full res") and which decoder is in use. After an export it says where the file went.
+   The buttons are icons: add clips (a film strip with a plus), open a project (a folder), save (a diskette; dimmed when there's nothing new to save), save as (a diskette with a pencil) and export (an arrow out of a tray). While an export or a track runs, a crossed circle cancels it.
+
+   On the right, two dimmed icons say what you're seeing (a film strip for the proxy, a picture for the OSV or full resolution, an hourglass while a full-resolution frame loads) and how it decodes (a lightning bolt for the GPU, a chip for software); hover over them for the details. After an export it says where the file went.
 
 2. **The view**, where you look around.
 
-3. **The transport row**: play, photos, the time, keyframe and cut tools, timeline zoom, and sound.
+3. **The transport row**: play or pause, photos (a camera saves the view, a globe the whole sphere), the time, keyframe and cut tools, timeline zoom, and sound.
 
    ![The transport row: Play, Save view…, Save 360°…, the time, add and delete keyframe, the Ease picker, split, delete cut, undo, redo, zoom out, the zoom slider, zoom in, fit, mute and volume](guide/transport.png)
 
@@ -82,7 +84,7 @@ From top to bottom:
 
    ![The timeline: four cuts with thumbnails and labels such as "0045 · 12.0 s" and "0026 · 10.0 s · world lock", and the seek bar with keyframe marks](guide/timeline.png)
 
-5. **The settings row**: stabilisation, projection, playback source, field of view, rolling-shutter correction, and full resolution when paused.
+5. **The settings row**: stabilisation, projection, playback source, field of view, rolling-shutter correction, full resolution when paused, reset view (a turn-back arrow) and fullscreen.
 
    ![The settings row: Stabilisation Horizon, Projection Perspective, Playback source Proxy (LRF), the FOV slider, Rolling shutter, Full res when paused, Reset view and Fullscreen](guide/settings.png)
 
@@ -92,14 +94,14 @@ Hover over any button to see what it does and its shortcut.
 
 | To | Do |
 |---|---|
-| Play or pause | Space, or **Play** |
+| Play or pause | Space, or ▶ |
 | Seek | Click or drag on the seek bar; ← / → jump 5 seconds |
 | Step one frame (paused) | `,` and `.` |
 | Look around | Drag in the view, or use ↑ / ↓ (pitch) and Shift+← / → (yaw) |
 | Roll the view | Right-drag, or Q / E |
 | Zoom | Scroll in the view, `+` / `-`, or the **FOV** slider |
-| Go back to the starting view | 0 or Home, or **Reset view** |
-| Fullscreen | F, or **Fullscreen**; Esc leaves it |
+| Go back to the starting view | 0 or Home, or the turn-back arrow |
+| Fullscreen | F, or the corners button; Esc leaves it |
 | Mute | M, or the speaker button; the slider sets the volume |
 
 **Playback source.** Clips play from the `.LRF` proxy by default. It decodes quickly, so playback and scrubbing stay smooth on most computers. On a fast GPU you can play the `.OSV` itself, scaled to 1920 px or at its full 3840 px. If there's no `.LRF`, the `.OSV` is used.
@@ -139,7 +141,7 @@ Press **S**, or use the **Stabilisation** picker. **Each cut keeps its own mode*
 
 An *edit* is a row of *cuts*, each a stretch of one clip, played one after another. Every clip you open becomes a cut.
 
-- **Add clips**: **Add clip…** or Ctrl+O; you can pick several at once. Each is added at the end.
+- **Add clips**: the film strip with a plus, or Ctrl+O; you can pick several at once. Each is added at the end.
 - **Select a cut**: click it in the top row of the timeline.
 - **Split**: put the playhead where you want the cut, then press **C** or ✂. Both halves keep the cut's keyframes, so the camera move carries on unchanged.
 - **Trim**: drag a cut's left or right edge.
@@ -216,7 +218,7 @@ To follow **someone or something else**, such as a friend in a red jacket, track
 
 1. Pause where the subject is in view, at the keyframe that should start following it.
 2. Click the **eyedropper** button next to the Follow picker, or choose **Colour track** in the picker, and draw a box over the subject. A box over a good patch of the colour works better than a thin edge.
-3. rOsmo360 takes the box's colour, tracks it from there to the end of the cut (the top bar shows **Tracking** with **Cancel**), saves the track next to the project, and makes the keyframe follow it with the subject in the middle. The top bar says in how many moments it found the colour.
+3. rOsmo360 takes the box's colour, tracks it from there to the end of the cut (the top bar shows **Tracking** with a crossed circle to stop it), saves the track next to the project, and makes the keyframe follow it with the subject in the middle. The top bar says in how many moments it found the colour.
 
 Pick something with a strong colour that nothing big nearby shares: sky, grass, rock and snow won't track. Small things that swing, like legs, follow less steadily than a jacket. Tracks can also be made on the command line ([`rosmo360 track`](#12-the-command-line)).
 
@@ -232,8 +234,8 @@ Exports and saved views take the same shape. With **Free**, exports are 16:9.
 
 A project saves the edit: the cuts, their keyframes and stabilisation, and the aspect lock.
 
-- **Save**: Ctrl+S, or **Save project**. **Save as**: Ctrl+Shift+S.
-- **Open**: Ctrl+Shift+O, or **Open project…**. You can also give the file to `rosmo360 play edit.json`.
+- **Save**: Ctrl+S, or the diskette. **Save as**: Ctrl+Shift+S, or the diskette with a pencil.
+- **Open**: Ctrl+Shift+O, or the folder. You can also give the file to `rosmo360 play edit.json`.
 
 The window title shows the project's name, with a dot (•) when there are unsaved changes. If you close the window or open another project with unsaved changes, rOsmo360 asks whether to **Save**, **Don't save** or **Cancel**.
 
@@ -241,17 +243,17 @@ Projects are small JSON files. Clips in the project's folder, or in folders insi
 
 ## 10. Exporting video
 
-1. Pick the resolution next to **Export…**: 720p, 1080p (the default, good for sharing online), 1440p or 2160p (4K). It's the short side of the picture, so 1080p is 1920 × 1080 for 16:9, or 1080 × 1920 for 9:16.
+1. Pick the resolution next to the export button (an arrow out of a tray): 720p, 1080p (the default, good for sharing online), 1440p or 2160p (4K). It's the short side of the picture, so 1080p is 1920 × 1080 for 16:9, or 1080 × 1920 for 9:16.
 2. Set the shape with the **Aspect** picker.
-3. Click **Export…** and choose where to save the MP4.
+3. Click the export button and choose where to save the MP4.
 
-The export renders the whole edit at full resolution, with the sound joined across the cuts. Each cut uses its own keyframes and stabilisation, and the export follows the rolling-shutter setting. Progress shows in the top bar, with **Cancel** to stop; a cancelled export leaves no half-finished file.
+The export renders the whole edit at full resolution, with the sound joined across the cuts. Each cut uses its own keyframes and stabilisation, and the export follows the rolling-shutter setting. Progress shows in the top bar, with a crossed circle to stop it; a cancelled export leaves no half-finished file.
 
 Exports render on the GPU. On an RTX 3090 that's about 21 frames a second at 1080p, so a one-minute edit takes about a minute and a half. You can keep using the player while it runs.
 
 Two checkboxes next to the resolution change what gets written:
 
-- **Clips** writes each cut to its own file instead of one video, for finishing in another editor. Export… then asks for a folder, and the files are named after the project: `My hike - 001.mp4`, `My hike - 002.mp4` and so on, in timeline order.
+- **Clips** writes each cut to its own file instead of one video, for finishing in another editor. Export then asks for a folder, and the files are named after the project: `My hike - 001.mp4`, `My hike - 002.mp4` and so on, in timeline order.
 - **Resolve** writes DNxHR HQ video with uncompressed PCM sound in a `.mov`, instead of H.264 and AAC in an MP4. Use it for DaVinci Resolve: its free version on Linux can't read H.264, H.265 or AAC. The files are large, about 27 MB a second at 1080p (110 at 4K), as editing formats are.
 
 Both are remembered, and they combine: Clips and Resolve together give one `.mov` per cut, ready to drop into Resolve.
@@ -260,8 +262,8 @@ Both are remembered, and they combine: Clips and Resolve together give one `.mov
 
 Pause, then:
 
-- **Save view…** saves what you see as a PNG, 3840 px on the long side, in the aspect lock's shape.
-- **Save 360°…** saves the whole sphere as a 7680 × 3840 equirectangular PNG. Most photo sites and viewers that support 360° photos can show it.
+- **Save view** (the camera) saves what you see as a PNG, 3840 px on the long side, in the aspect lock's shape.
+- **Save 360°** (the globe) saves the whole sphere as a 7680 × 3840 equirectangular PNG. Most photo sites and viewers that support 360° photos can show it.
 
 Both are rendered from fresh full-resolution frames, which takes a few seconds.
 

@@ -88,7 +88,7 @@ The program is `target/release/rosmo360`. `packaging/build-release.sh` builds th
 The **[user guide](docs/user-guide.md)** walks through the whole app with screenshots: watching, projections, stabilisation, the timeline, keyframes, projects and exporting.
 
 ```sh
-rosmo360 play                 # opens the player; use Open… or Ctrl+O
+rosmo360 play                 # opens the player; use Open clips… or Ctrl+O
 rosmo360 play clip.OSV        # opens a clip straight away
 rosmo360 play a.OSV b.OSV     # several clips, one after another on the timeline
 rosmo360 play edit.json       # a saved project
@@ -111,16 +111,17 @@ In the player:
 | Jump to the previous / next keyframe | `[` / `]`, or click a ◆ on the timeline |
 | Move / delete a keyframe | Drag its ◆ / Delete |
 | How a keyframe moves on to the next | J cycles, or the Ease picker: smooth (◆), linear (●) or hold (■, stays put then cuts) |
-| Make a keyframe follow the selfie stick | The Follow picker: Fixed or Stick (its mark gets a ring) |
+| Make a keyframe follow the selfie stick or a subject | The Follow picker: Fixed, Stick, or Colour track (its mark gets a ring); for a colour track, the eyedropper: drag a box over the subject (a jacket, a tent) and it's tracked to the end of the cut |
+| Keep the horizon level and the heading fixed | S to **level**: a keyframe's yaw is then a direction in the world, so a view stays on a summit through a pan |
 | Zoom the timeline | Scroll on it (around the pointer), Ctrl+= / Ctrl+−, or the 🔍 buttons and slider; Ctrl+0 or ⟷ shows the whole edit |
 | Scroll the zoomed timeline | Shift+scroll or a sideways scroll on it, or drag the bar under it; it follows the playhead while playing |
-| Add clips to the edit | Add clip… (Ctrl+O); several at once is fine |
+| Add clips to the edit | The film strip with a plus (Ctrl+O); several at once is fine |
 | Split the cut at the playhead | C, or ✂ |
 | Trim / move a cut | Drag its edge / drag the cut on the timeline |
 | Delete the selected cut | Shift+Delete, or 🗑 |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
 | Save / open a project | Ctrl+S (Ctrl+Shift+S: save as) / Ctrl+Shift+O |
-| Export the edit | Export… (pick 720p–2160p next to it); the aspect lock sets the shape, 16:9 when free. **Clips** writes each cut to its own file ("project - 001" and on) for another editor; **Resolve** writes DNxHR and PCM in `.mov`, which DaVinci Resolve's free Linux version can read |
+| Export the edit | The export button, an arrow out of a tray (pick 720p–2160p next to it); the aspect lock sets the shape, 16:9 when free. **Clips** writes each cut to its own file ("project - 001" and on) for another editor; **Resolve** writes DNxHR and PCM in `.mov`, which DaVinci Resolve's free Linux version can read |
 
 A project saves the cuts, their keyframes and the aspect lock, in the same file `rosmo360 export` renders (see below). Clips in the project's folder are stored by relative path, so the folder can be moved as a whole.
 
