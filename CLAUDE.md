@@ -268,6 +268,7 @@ How it was found:
   - Contrast-and-offset matching spread wide into lens 0 (scratchpad prototype): changed the sky well away from the seam (an affine fit on rock/snow extrapolated to sky); gated by detail it no longer did, but the blend proxy drew a seam beside the stick.
   - The same in the stitcher (`--veil`: a robust per-bin line fit of the pairs, half-way each lens, `FADE_FROM` fade, eased): a little better on 0032 but the line stayed (the veil varies across the ±7° blend band, one line per bin is right only mid-band); a close subject on the seam (0043, the holder's legs) bent the fit and darkened a wedge of sky with a hard edge, even with iterative outlier rejection.
   - Two-band blending (`--multiband`: a per-lens 96² normalised low-pass, the broad layer blended over ±10°, detail on the usual ramp, falling back where detail disagrees): "a big improvement" on 0032 in a stacked comparison, but in separate 1080p files the user saw no real gain, and before the fallback it drew a bright line along a knee. The overlap (~±9°) is too narrow for a wider broad-layer blend to hide much.
+  - Whole-lens exposure (`--whole-lens`: each lens's mean gain over its whole picture, only the variation along the seam faded in): evened 0043's halves by ~7-8 levels each, 0032's by ~3; the user saw no improvement.
 
 ### Hardware decode through the ffmpeg CLI
 
