@@ -109,7 +109,7 @@ impl Media {
             proxy,
             osv_size: opts.osv_size,
             hw,
-            rig: Arc::new(Rig::new(p.lenses, p.tracks)),
+            rig: Arc::new(Rig::new(p.lenses, p.tracks, false)),
             stab: p.stab,
             readout_ms: p.readout_ms,
             fps: p.fps,

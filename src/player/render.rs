@@ -164,10 +164,7 @@ pub struct Clip {
 
 impl Clip {
     pub fn new(p: &crate::Pipeline) -> Result<Clip> {
-        let mut rig = Rig::new(p.lenses.clone(), p.tracks.clone());
-        if p.seam.is_none() {
-            rig.seam = None;
-        }
+        let mut rig = Rig::new(p.lenses.clone(), p.tracks.clone(), p.seam.is_some());
         if p.aligner.is_none() {
             rig.aligner = None;
         }

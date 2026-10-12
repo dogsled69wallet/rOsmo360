@@ -67,6 +67,14 @@ const ZERO_MARGIN: f64 = 0.05;
 /// 0.02–0.15, so the cut still takes them.
 const CUT_DETAIL_FROM: f64 = 0.008;
 const CUT_DETAIL_FULL: f64 = 0.02;
+/// ...and only where, once aligned, their detail shows different things:
+/// the cut stays off above this correlation and acts fully below the
+/// lower. Correlation ignores brightness and contrast, so the same scene in
+/// different light (the sun veiling one lens, 0032 at 5-11 s) doesn't cut,
+/// where without exposure matching it drew a hard line across snow and rock;
+/// a hand against sky still does.
+const CUT_AGREE_FROM: f64 = 0.3;
+const CUT_AGREE_FULL: f64 = 0.6;
 
 /// The seam correction measured on one frame.
 #[derive(Clone, Debug)]
@@ -170,7 +178,9 @@ impl Aligner {
         let mut shift: Vec<f32> =
             (0..CELLS_PHI * CELLS_ALPHA).into_par_iter().map(|c| match_cell(&detail, c % CELLS_PHI, c / CELLS_PHI, prev.map(|p| p.shift[c]))).collect();
         fill_and_smooth(&mut shift);
-        Field { shift, cut: (0..CELLS_PHI).map(|b| cut_strength(&detail, b)).collect() }
+        let field = Field { shift, cut: Vec::new() };
+        let cut = (0..CELLS_PHI).map(|b| cut_strength(&detail, &field, b)).collect();
+        Field { cut, ..field }
     }
 
     /// Writes the frame's strips as images for inspection: each lens, their
@@ -326,25 +336,50 @@ fn match_cell(strips: &[Vec<f32>; 2], cx: usize, cy: usize, prev: Option<f32>) -
 /// only edges and texture are left to match.
 /// How far the cut may act in azimuth bin `b`, from the detail both lenses
 /// see across the blend band. Bins with no overlap keep the full cut.
-fn cut_strength(detail: &[Vec<f32>; 2], b: usize) -> f32 {
+fn cut_strength(detail: &[Vec<f32>; 2], field: &Field, b: usize) -> f32 {
     let rows = ((TAPER_LO - STRIP_ALPHA_LO) / STRIP_STEP) as usize..((TAPER_HI - STRIP_ALPHA_LO) / STRIP_STEP) as usize;
     let cols = b * STRIP_W / CELLS_PHI..(b + 1) * STRIP_W / CELLS_PHI;
     let (mut sum, mut n) = ([0.0f64; 2], 0.0);
+    // Sums for the correlation of the aligned detail: a, b, a², b², ab.
+    let mut c = [0.0f64; 5];
     for y in rows {
         for x in cols.clone() {
-            let (a, c) = (detail[0][y * STRIP_W + x], detail[1][y * STRIP_W + x]);
-            if !a.is_nan() && !c.is_nan() {
+            let (a, d) = (detail[0][y * STRIP_W + x], detail[1][y * STRIP_W + x]);
+            if !a.is_nan() && !d.is_nan() {
                 sum[0] += a.abs() as f64;
-                sum[1] += c.abs() as f64;
+                sum[1] += d.abs() as f64;
                 n += 1.0;
+            }
+            let alpha = STRIP_ALPHA_LO + y as f64 * STRIP_STEP;
+            let half = 0.5 * field.at((x as f64 + 0.5) / STRIP_W as f64 * TAU, alpha).to_degrees() / STRIP_STEP;
+            let (a, d) = (sample_rows(&detail[0], x, y as f64 - half), sample_rows(&detail[1], x, y as f64 + half));
+            if !a.is_nan() && !d.is_nan() {
+                c = [c[0] + a, c[1] + d, c[2] + a * a, c[3] + d * d, c[4] + a * d];
             }
         }
     }
     if n == 0.0 {
         return 1.0;
     }
-    let t = ((sum[0].min(sum[1]) / n - CUT_DETAIL_FROM) / (CUT_DETAIL_FULL - CUT_DETAIL_FROM)).clamp(0.0, 1.0);
-    (t * t * (3.0 - 2.0 * t)) as f32
+    let smooth = |lo: f64, hi: f64, x: f64| {
+        let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let detailed = smooth(CUT_DETAIL_FROM, CUT_DETAIL_FULL, sum[0].min(sum[1]) / n);
+    let m = n.max(1.0);
+    let (va, vd) = (c[2] / m - (c[0] / m).powi(2), c[3] / m - (c[1] / m).powi(2));
+    let agree = if va > 0.0 && vd > 0.0 { (c[4] / m - c[0] / m * c[1] / m) / (va * vd).sqrt() } else { 0.0 };
+    (detailed * (1.0 - smooth(CUT_AGREE_FROM, CUT_AGREE_FULL, agree))) as f32
+}
+
+/// A strip linear in α between rows, NaN off it or where a lens has nothing.
+fn sample_rows(s: &[f32], x: usize, y: f64) -> f64 {
+    let y0 = y.floor();
+    if y0 < 0.0 || y0 + 1.0 >= STRIP_H as f64 {
+        return f64::NAN;
+    }
+    let (a, b) = (s[y0 as usize * STRIP_W + x] as f64, s[(y0 as usize + 1) * STRIP_W + x] as f64);
+    a + (b - a) * (y - y0)
 }
 
 fn highpass(s: &[f32], r: isize) -> Vec<f32> {

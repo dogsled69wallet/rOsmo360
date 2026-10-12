@@ -63,12 +63,19 @@ pub struct Rig {
     pub tracks: Vec<u32>,
     pub seam: Option<Seam>,
     pub aligner: Option<Aligner>,
+    /// Places the seam for the shader's blend whatever corrections are on.
+    ring: Option<crate::ring::Ring>,
 }
 
 impl Rig {
-    pub fn new(lenses: Vec<Lens>, tracks: Vec<u32>) -> Self {
-        let (seam, aligner) = (Seam::new(&lenses), Aligner::new(&lenses));
-        Rig { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), lenses, tracks, seam, aligner }
+    /// `exposure`: match the lenses' exposure at the seam. Off by default
+    /// (2026-10-12): where the sun veils one lens it brightened the clean one
+    /// to meet it, dulling its side, and without it both test clips looked
+    /// better and close to DJI Studio's.
+    pub fn new(lenses: Vec<Lens>, tracks: Vec<u32>, exposure: bool) -> Self {
+        let seam = if exposure { Seam::new(&lenses) } else { None };
+        let (aligner, ring) = (Aligner::new(&lenses), crate::ring::Ring::new(&lenses));
+        Rig { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), lenses, tracks, seam, aligner, ring }
     }
 }
 
@@ -334,8 +341,11 @@ impl Pipeline {
         for (k, m) in rig_from_view.iter().take(steps).enumerate() {
             u.views[k * 3..k * 3 + 3].copy_from_slice(&rows(*m));
         }
-        if let Some(seam) = &rig.seam {
-            u.seam = rows(seam.ring.basis);
+        // Set whatever corrections are on: the blend needs it too (without
+        // it the picture was black), and without exposure matching the
+        // gains stay 1.
+        if let Some(ring) = &rig.ring {
+            u.seam = rows(ring.basis);
             u.seam[0][3] = FADE_FROM as f32;
             u.seam[1][3] = FADE_TO as f32;
         }

@@ -469,9 +469,10 @@ struct StitchOpts {
     /// Skip rolling-shutter correction.
     #[arg(long)]
     no_rs: bool,
-    /// Skip evening out the lenses' exposure at the seam.
+    /// Even out the lenses' exposure at the seam. Off by default: where the
+    /// sun veils one lens it dulls the other to meet it.
     #[arg(long)]
-    no_exposure: bool,
+    exposure: bool,
     /// Skip shifting the lenses to line up close subjects at the seam.
     #[arg(long)]
     no_align: bool,
@@ -490,7 +491,7 @@ impl Default for StitchOpts {
             imu_axes: stab::ImuAxes::X180,
             world_z_down: false,
             no_rs: false,
-            no_exposure: false,
+            exposure: false,
             no_align: false,
             no_cut: false,
         }
@@ -565,7 +566,7 @@ impl Pipeline {
         }
         let readout_ms = cameras[0].readout.map_or(0.0, |r| r.time_us / 1000.0);
         let rs_steps = if opts.no_rs || readout_ms == 0.0 || !stab.has_data() { 1 } else { 33 };
-        let seam = if opts.no_exposure || opts.only.is_some() { None } else { exposure::Seam::new(&lenses) };
+        let seam = if opts.exposure && opts.only.is_none() { exposure::Seam::new(&lenses) } else { None };
         let aligner = if opts.no_align || opts.only.is_some() { None } else { align::Aligner::new(&lenses) };
         let hw = ffmpeg::Hwaccel::pick(input, tracks[0])?;
         Ok(Pipeline {
@@ -1255,7 +1256,7 @@ fn skies(input: &Path) -> Result<Vec<(f64, sky::Sky)>> {
     const LENS: usize = 256;
     // The seam corrections measure at full strip size whatever the output's;
     // at 1° a pixel their few pixels at the seam don't change the sky.
-    let opts = StitchOpts { no_rs: true, no_exposure: true, no_align: true, no_cut: true, ..StitchOpts::default() };
+    let opts = StitchOpts { no_rs: true, no_align: true, no_cut: true, ..StitchOpts::default() };
     let p = Pipeline::new(input, &opts, stab::Mode::Horizon)?;
     let proxy = ffmpeg::proxy(input).context("scan --image reads the LRF proxy beside the clip, and there is none")?;
     let mut skies = Vec::new();
@@ -1269,7 +1270,7 @@ fn skies(input: &Path) -> Result<Vec<(f64, sky::Sky)>> {
 }
 
 fn seam_report(input: &Path, start: f64, duration: f64, dump: Option<&Path>) -> Result<()> {
-    let opts = StitchOpts { no_rs: true, no_exposure: true, ..StitchOpts::default() };
+    let opts = StitchOpts { no_rs: true, ..StitchOpts::default() };
     let p = Pipeline::new(input, &opts, stab::Mode::Off)?;
     let aligner = p.aligner.as_ref().context("not a two-lens rig")?;
     let start = p.snap(start);
