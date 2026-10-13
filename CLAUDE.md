@@ -4,7 +4,7 @@ A Rust/Linux replacement for DJI Studio's playback of DJI Osmo 360 `.OSV` footag
 
 The tool is called **rOsmo360** (the r is for its Rust core); the window title, app id and `--help` use that name. The crate and binary are `rosmo360` (renamed from `osmo360` on 2026-10-10).
 
-## Status (2026-10-13, version 0.3.0 on branch `timeline`, not released; 0.2.10 is the latest release)
+## Status (2026-10-13, version 0.3.0 released: ordinary videos, photos, titles and overlays)
 
 Working and verified on real footage:
 
