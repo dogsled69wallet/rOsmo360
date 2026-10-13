@@ -86,6 +86,12 @@ struct Shared {
     /// before it, its buffer drained, so its clock ran early).
     running: AtomicBool,
     stop: AtomicBool,
+    /// The sound has all been decoded. Once it has also all been played,
+    /// the silence after it counts towards the clock: a clip's sound often
+    /// ends a frame or so before its picture (our own exports' do, by
+    /// ~20 ms), and a clock stopped there never reached the cut's out point,
+    /// so playback stood still.
+    done: AtomicBool,
 }
 
 pub struct Audio {
@@ -129,6 +135,7 @@ impl Audio {
             volume: AtomicU32::new(volume.to_bits()),
             running: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            done: AtomicBool::new(false),
         });
 
         let mut out = child.stdout.take().unwrap();
@@ -136,6 +143,14 @@ impl Audio {
         let ahead = (BUFFER_SECONDS * rate) as usize * channels;
         thread::spawn(move || {
             let mut bytes = vec![0u8; 4096 * 4];
+            // However the loop ends, there's no more sound to come.
+            struct Done(Arc<Shared>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.0.done.store(true, Ordering::Relaxed);
+                }
+            }
+            let _done = Done(reader.clone());
             while !reader.stop.load(Ordering::Relaxed) {
                 if reader.samples.lock().unwrap().len() > ahead {
                     thread::sleep(Duration::from_millis(5));
@@ -223,8 +238,9 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: &Strea
             let listening = f32::from_bits(LISTENING.load(Ordering::Relaxed));
             let mut q = shared.samples.lock().unwrap();
             // Only whole frames count towards the clock; an underrun plays
-            // silence without advancing it.
+            // silence without advancing it, unless the sound has ended.
             let frames = (q.len() / channels).min(data.len() / channels);
+            let counted = if frames < data.len() / channels && q.len() < channels && shared.done.load(Ordering::Relaxed) { data.len() / channels } else { frames };
             let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
             if meter.rate != rate {
                 *meter = Meter { rate, slots: vec![(u64::MAX, [0.0; 2]); (METER_SECONDS * rate) as usize] };
@@ -252,7 +268,7 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: &Strea
             }
             drop(meter);
             drop(q);
-            shared.played.fetch_add(frames as u64, Ordering::Relaxed);
+            shared.played.fetch_add(counted as u64, Ordering::Relaxed);
         },
         |e| eprintln!("audio: {e}"),
         None,

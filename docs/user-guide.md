@@ -206,7 +206,9 @@ More:
 
 **Following and looking.** After you play, seek or change a keyframe, the view follows the keyframes. As soon as you look around by hand, you take over from the view they showed, until the next play or seek. So you can always look around freely without changing anything; only K saves a view.
 
-**Cuts without keyframes** hold the view the edit had last: the view at the end of the nearest cut before them that has keyframes. The export frames them the same way. If no earlier cut has keyframes, they show whatever view you look at, and the export and the saved project keep that view: saving gives the first such cut a keyframe of it (you'll see it there when you open the project again). Ordinary videos and photos keep their own framing apart from Osmo cuts, each one its own.
+**Cuts without keyframes** hold the view the edit had last: the view at the end of the nearest cut before them that has keyframes, as after a split. The export frames them the same way.
+
+**Framing a cut by hand keeps it.** Look around in a cut that has no keyframes of its own, and it keeps that view: as soon as you play, seek or go to another cut, the cut gets a keyframe of what you framed at its start (Ctrl+Z takes it away). So it never changes another cut's view, and the export and the saved project frame it as you left it. Ordinary videos and photos keep their own framing apart from Osmo cuts.
 
 Keyframes belong to their cut and stay pinned to the footage. Moving or trimming a cut keeps its camera moves on the same moments. Keyframes trimmed off the end are kept for when you extend the cut again.
 

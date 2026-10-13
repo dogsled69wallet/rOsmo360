@@ -503,6 +503,10 @@ struct App {
     /// another thing there, and a little planet's would push a video's
     /// picture off screen.
     other_look: View,
+    /// The cut (index and clip) looked around in by hand since the view last
+    /// followed keyframes: one without keyframes of its own keeps that view
+    /// (`keep_hand_view`).
+    hand_cut: Option<(usize, PathBuf)>,
     /// Whether `look` belongs to ordinary videos.
     look_flat: bool,
     /// Show the keyframes' view rather than `look`. Playing, seeking and
@@ -580,6 +584,7 @@ impl App {
             error: None,
             look: View::default(),
             other_look: View::home(Projection::Perspective),
+            hand_cut: None,
             look_flat: false,
             follow: true,
             rolling_shutter: saved.rolling_shutter,
@@ -620,7 +625,9 @@ impl App {
 
     /// Handles `message`, then saves the settings if it changed any.
     fn update(&mut self, message: Message) -> Task<Message> {
+        let before = if self.look_flat { (self.other_look, self.look) } else { (self.look, self.other_look) };
         let task = self.handle(message);
+        self.keep_hand_view(before);
         let task = Task::batch([task, self.load_overlay_pictures()]);
         self.settle_look();
         self.settle_text();
@@ -1232,6 +1239,7 @@ impl App {
                 // stay in the library, so adding them again is instant; one
                 // still loading finishes there without becoming a cut.
                 self.edit.replace(Vec::new(), Default::default(), Default::default(), Default::default(), Vec::new(), Vec::new());
+                self.hand_cut = None;
                 self.selected_music = None;
                 self.selected_volume = None;
                 self.selected_sound = None;
@@ -1326,6 +1334,7 @@ impl App {
                 self.queue.extend(cuts.iter().map(|c| (c.input.clone(), false)));
                 let complete = missing.is_empty() && gone.is_empty() && lost.is_empty();
                 self.edit.replace(cuts, music, project.sound, project.fades, overlays, texts);
+                self.hand_cut = None;
                 self.mark_flat();
                 self.saved_version = if complete { self.edit.version } else { 0 };
                 self.saved_aspect = self.aspect;
@@ -2454,8 +2463,32 @@ impl App {
         if self.follow {
             self.look = self.shown_view();
             self.follow = false;
+            self.hand_cut = self.edit.cuts.get(self.current).map(|c| (self.current, c.input.clone()));
         }
         &mut self.look
+    }
+
+    /// Once the view follows keyframes again (play, a seek, another cut),
+    /// a cut looked around in by hand that has no keyframes of its own keeps
+    /// what was shown as a keyframe at its in point (one undo step), so it
+    /// doesn't share the free look with other cuts or lose it at the next
+    /// play. Made then rather than at the first move, which would keep only
+    /// the start of a drag. `before` is the free look of each kind (360,
+    /// flat) as it was.
+    fn keep_hand_view(&mut self, before: (View, View)) {
+        if !self.follow {
+            return;
+        }
+        let Some((i, input)) = self.hand_cut.take() else { return };
+        let Some(cut) = self.edit.cuts.get(i).filter(|c| c.input == input && c.keyframes.is_empty()) else { return };
+        let look = if cut.flat { before.1 } else { before.0 };
+        if look == View::home(Projection::Perspective) && cut.flat {
+            return;
+        }
+        self.edit.checkpoint();
+        let cut = &mut self.edit.cuts[i];
+        let start = cut.start;
+        cut.keyframes.set(start, look, 0.0, &|_, _| None);
     }
 
     /// Jumps to the nearest keyframe before (`-1`) or after (`1`) the playhead.
