@@ -385,7 +385,7 @@ impl App {
             }
             r
         };
-        let families = crate::text::families();
+        let families: Vec<FontChoice> = crate::text::families().iter().map(|f| FontChoice(f.clone())).collect();
         let close = tip(
             button(text("✕").size(14)).padding([0, 6]).style(button::text).on_press(Message::OverlaySelect(None)),
             text("Close (deselects the text)"),
@@ -395,7 +395,11 @@ impl App {
             row![text("Text").size(18).width(Length::Fill), close].align_y(Alignment::Center),
             iced::widget::text_editor(&self.text_content).placeholder("Type the text here").height(80).on_action(|a| Message::Effect(EffectMsg::TextEdit(a))),
             row![
-                pick_list(families, Some(words.font.clone()), |f| Message::Effect(EffectMsg::Text(TextChange::Font(f)))).width(Length::Fill),
+                tip(
+                    pick_list(families, Some(FontChoice(words.font.clone())), |f| Message::Effect(EffectMsg::Text(TextChange::Font(f.0)))).width(Length::Fill),
+                    text("Built-in fonts come with rOsmo360, so the text looks the same on any machine; the others are this system's, and where a project's font is missing the text falls back to Inter."),
+                    tooltip::Position::Bottom,
+                ),
                 iced::widget::checkbox(words.bold).label("Bold").on_toggle(move |b| Message::Effect(EffectMsg::Text(TextChange::Bold(b)))),
             ]
             .spacing(8)
@@ -536,5 +540,15 @@ impl App {
         .spacing(10)
         .into()]);
         container(scrollable(body)).width(WIDTH).height(Length::Fill).into()
+    }
+}
+
+/// A font family in the text panel's list, the built-in ones marked.
+#[derive(Clone, PartialEq)]
+struct FontChoice(String);
+
+impl std::fmt::Display for FontChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if crate::text::BUILT_IN.contains(&self.0.as_str()) { write!(f, "{} · built in", self.0) } else { f.write_str(&self.0) }
     }
 }
