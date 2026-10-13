@@ -16,7 +16,7 @@ use cpal::{FromSample, OutputCallbackInfo, SampleFormat, SizedSample, StreamConf
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
@@ -120,7 +120,7 @@ impl Audio {
         let channels = config.channels as usize;
         let rate = config.sample_rate as f64;
 
-        let mut child = Command::new("ffmpeg")
+        let mut child = crate::ffmpeg::tool("ffmpeg")
             .args(["-v", "error", "-nostdin", "-ss", &start.to_string(), "-i"])
             .arg(input)
             .args(["-map", "0:a:0", "-f", "f32le", "-ac", &channels.to_string(), "-ar", &config.sample_rate.to_string(), "-"])

@@ -2834,6 +2834,7 @@ impl App {
             hw => status_icon(DECODE_GPU, format!("Decoding on the GPU with {}", match hw {
                 Hwaccel::Vulkan => "Vulkan Video",
                 Hwaccel::Vaapi => "VA-API",
+                Hwaccel::VideoToolbox => "VideoToolbox",
                 _ => "CUDA",
             })),
         };
@@ -3003,7 +3004,9 @@ impl App {
                 text("Save the whole sphere as an equirect PNG (pause first)"),
                 tooltip::Position::Top,
             ),
-            text(format!("{} / {}", clock(self.position()), clock(self.edit.duration()))),
+            // A fixed width: the digits' widths differ in most fonts (macOS's
+            // system font especially), and the row after it jittered as it ran.
+            text(format!("{} / {}", clock(self.position()), clock(self.edit.duration()))).width(170).center(),
             tip(
                 icon_button(KEY_ADD, Some(Message::KeyAdd)),
                 text(if current.is_some() { "Update this keyframe with the view (K)" } else { "Add a keyframe with this view (K)" }),
@@ -3294,7 +3297,11 @@ fn system_theme() -> Theme {
         }
     };
     let (scheme, accent) = portal_appearance();
-    let dark = scheme.unwrap_or_else(|| std::env::var_os("FLATPAK_ID").is_some() || sys.mode.is_dark());
+    // On macOS native-theme reads both variants and always reports light as
+    // the mode, so ask for the appearance itself (read fresh each time, for
+    // live changes).
+    let os_dark = if cfg!(target_os = "macos") { native_theme::detect::detect_is_dark() } else { sys.mode.is_dark() };
+    let dark = scheme.unwrap_or_else(|| std::env::var_os("FLATPAK_ID").is_some() || os_dark);
     let mut resolved = if dark { sys.dark } else { sys.light };
     if let Some([r, g, b]) = accent {
         resolved.defaults.accent_color = native_theme_iced::Rgba::from_f32(r as f32, g as f32, b as f32, 1.0);

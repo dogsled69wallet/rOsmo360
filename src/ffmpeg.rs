@@ -7,8 +7,35 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+/// A command running ffmpeg's `tool` (`ffmpeg` or `ffprobe`): one bundled
+/// beside our executable first (in `ffmpeg/` there, or right beside it, as a
+/// Windows zip or a Mac build carries them), else the one on the PATH. On
+/// macOS also Homebrew's, since an app started from the Finder doesn't get
+/// the shell's PATH.
+pub fn tool(tool: &str) -> Command {
+    static FOUND: std::sync::OnceLock<Vec<(String, PathBuf)>> = std::sync::OnceLock::new();
+    let found = FOUND.get_or_init(|| {
+        let file = |name: &str| format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+        ["ffmpeg", "ffprobe"]
+            .into_iter()
+            .map(|name| {
+                let mut places: Vec<PathBuf> = beside.iter().flat_map(|dir| [dir.join("ffmpeg").join(file(name)), dir.join(file(name))]).collect();
+                if cfg!(target_os = "macos") && std::env::var_os("PATH").is_none_or(|p| !std::env::split_paths(&p).any(|d| d.join(name).is_file())) {
+                    places.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(|d| Path::new(d).join(name)));
+                }
+                (name.to_owned(), places.into_iter().find(|p| p.is_file()).unwrap_or_else(|| PathBuf::from(name)))
+            })
+            .collect()
+    });
+    match found.iter().find(|(name, _)| name == tool) {
+        Some((_, path)) => Command::new(path),
+        None => Command::new(tool),
+    }
+}
+
 fn probe(input: &Path, stream: &str, entries: &str) -> Result<String> {
-    let out = Command::new("ffprobe")
+    let out = tool("ffprobe")
         .args(["-v", "error", "-select_streams", stream, "-show_entries", entries, "-of", "csv=p=0"])
         .arg(input)
         .output()
@@ -19,7 +46,7 @@ fn probe(input: &Path, stream: &str, entries: &str) -> Result<String> {
 }
 
 fn probe_format(input: &Path) -> Result<String> {
-    let out = Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=format_name", "-of", "csv=p=0"]).arg(input).output().context("running ffprobe")?;
+    let out = tool("ffprobe").args(["-v", "error", "-show_entries", "format=format_name", "-of", "csv=p=0"]).arg(input).output().context("running ffprobe")?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
@@ -32,7 +59,7 @@ pub fn frame_rate(input: &Path) -> Result<f64> {
 /// How long the clip runs; a picture is `PICTURE_MOST`, as long as its cut
 /// may be stretched.
 pub fn duration(input: &Path) -> Result<f64> {
-    let out = Command::new("ffprobe")
+    let out = tool("ffprobe")
         .args(["-v", "error", "-show_entries", "format=format_name,duration", "-of", "csv=p=0"])
         .arg(input)
         .output()
@@ -60,7 +87,7 @@ fn is_picture(format: &str) -> bool {
 
 /// The clip's recording time as the camera tagged it, if it did.
 pub fn creation_time(input: &Path) -> Result<Option<String>> {
-    let out = Command::new("ffprobe")
+    let out = tool("ffprobe")
         .args(["-v", "error", "-show_entries", "format_tags=creation_time", "-of", "csv=p=0"])
         .arg(input)
         .output()
@@ -96,7 +123,7 @@ pub fn key_frames(input: &Path, track: u32, (w, h): (usize, usize), out: Out, mu
     let mut filters = Vec::new();
     Out { size: Some((w as u32, h as u32)), ..out }.filters(&mut filters);
     filters.push("showinfo".to_owned());
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = tool("ffmpeg");
     cmd.args(["-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", "-skip_frame", "nokey"]);
     out.input_args(&mut cmd);
     let mut child = cmd
@@ -146,7 +173,7 @@ pub fn key_frames(input: &Path, track: u32, (w, h): (usize, usize), out: Out, mu
 /// seconds from the start.
 pub fn audio_levels(input: &Path, window: f64) -> Result<Vec<(f64, f64)>> {
     const RATE: f64 = 16000.0;
-    let out = Command::new("ffmpeg")
+    let out = tool("ffmpeg")
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(input)
         .args(["-map", "0:a:0", "-ac", "1", "-ar", &RATE.to_string(), "-f", "f32le", "-"])
@@ -303,11 +330,14 @@ pub fn dimensions(input: &Path, track: u32) -> Result<(usize, usize)> {
 
 /// Hardware decoders, in the order they are tried. Vulkan Video works on every
 /// vendor with a recent driver; VA-API and CUDA cover stacks without it.
+/// VideoToolbox is macOS's, and the only one there.
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 pub enum Hwaccel {
     Vulkan,
     Vaapi,
     Cuda,
+    #[value(name = "videotoolbox")]
+    VideoToolbox,
     Software,
 }
 
@@ -317,13 +347,24 @@ impl Hwaccel {
             Hwaccel::Vulkan => Some("vulkan"),
             Hwaccel::Vaapi => Some("vaapi"),
             Hwaccel::Cuda => Some("cuda"),
+            Hwaccel::VideoToolbox => Some("videotoolbox"),
             Hwaccel::Software => None,
+        }
+    }
+
+    /// The pixel format its frames stay on the GPU as, for `hwdownload`.
+    fn output_format(self) -> Option<&'static str> {
+        match self {
+            Hwaccel::VideoToolbox => Some("videotoolbox_vld"),
+            hw => hw.name(),
         }
     }
 
     /// The first decoder that gets a frame of `track` out of `input`.
     pub fn pick(input: &Path, track: u32) -> Result<Hwaccel> {
-        for hw in [Hwaccel::Vulkan, Hwaccel::Vaapi, Hwaccel::Cuda] {
+        let tried: &[Hwaccel] =
+            if cfg!(target_os = "macos") { &[Hwaccel::VideoToolbox] } else { &[Hwaccel::Vulkan, Hwaccel::Vaapi, Hwaccel::Cuda] };
+        for &hw in tried {
             if hw.works(input, track)? {
                 return Ok(hw);
             }
@@ -366,11 +407,11 @@ impl Hwaccel {
 pub fn nv12(input: &Path, track: u32, start: f64, out: Out, hw: Hwaccel) -> Result<Command> {
     let hw = out.hw(hw);
     let mut filters = Vec::new();
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = tool("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
     if let Some(name) = hw.name() {
         let ten_bit = probe(input, &format!("v:{track}"), "stream=pix_fmt")?.contains("10");
-        cmd.args(["-hwaccel", name, "-hwaccel_output_format", name]);
+        cmd.args(["-hwaccel", name, "-hwaccel_output_format", hw.output_format().unwrap_or(name)]);
         if hw == Hwaccel::Cuda && out.size.is_none() {
             filters.push("scale_cuda=format=nv12,hwdownload".to_owned());
         } else {
@@ -399,7 +440,7 @@ pub fn still(input: &Path, track: u32, t: f64, hw: Hwaccel) -> Result<Frame> {
 /// picture filters), at `(w, h)`.
 pub fn picture_rgba(input: &Path, flat: Flat, (w, h): (u32, u32)) -> Result<Vec<u8>> {
     let out = flat.out(Some((w, h)), None);
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = tool("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
     out.input_args(&mut cmd);
     let mut filters = Vec::new();
@@ -417,7 +458,7 @@ pub fn picture_rgba(input: &Path, flat: Flat, (w, h): (u32, u32)) -> Result<Vec<
 
 /// `still` delivered as `out` says, which comes out `(width, height)`.
 pub fn still_out(input: &Path, track: u32, t: f64, hw: Hwaccel, (width, height): (usize, usize), out: Out) -> Result<Frame> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = tool("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
     if let Some(name) = out.hw(hw).name() {
         cmd.args(["-hwaccel", name]);
@@ -458,7 +499,7 @@ impl Decoder {
 
     /// `new` delivered as `out` says, which comes out `(width, height)`.
     pub fn with(input: &Path, track: u32, start: f64, hw: Hwaccel, (width, height): (usize, usize), out: Out) -> Result<Self> {
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = tool("ffmpeg");
         cmd.args(["-v", "error"]);
         if let Some(name) = out.hw(hw).name() {
             cmd.args(["-hwaccel", name]);
@@ -563,7 +604,7 @@ impl FrameSink for Encoder {
 /// form any of them reads (Resolve's free version on Linux reads no AAC or
 /// MP3).
 pub fn wav(input: &Path, start: f64, duration: f64, output: &Path) -> Result<()> {
-    let status = Command::new("ffmpeg")
+    let status = tool("ffmpeg")
         .args(["-v", "error", "-nostdin", "-y", "-ss", &start.to_string(), "-t", &duration.to_string(), "-i"])
         .arg(input)
         .args(["-map", "0:a:0", "-ar", "48000", "-c:a", "pcm_s24le"])
@@ -614,7 +655,7 @@ impl Encoder {
     /// With `mix`, the joined sound is set to its level and the music mixed
     /// in.
     pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio: &[Sound<'_>], mix: Option<&Mix<'_>>, format: Format) -> Result<Self> {
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = tool("ffmpeg");
         cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24"]).args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"]);
         for s in audio {
             match s.duration {

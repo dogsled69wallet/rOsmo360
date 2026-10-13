@@ -15,7 +15,7 @@ use crate::project::{self, MusicClip};
 use anyhow::{Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Seconds per waveform peak.
 pub const WAVE_STEP: f64 = 0.05;
@@ -41,7 +41,7 @@ impl Waveform {
             return Ok(Waveform { peaks, duration });
         }
         const RATE: usize = 8000;
-        let mut child = Command::new("ffmpeg")
+        let mut child = crate::ffmpeg::tool("ffmpeg")
             .args(["-v", "error", "-nostdin", "-i"])
             .arg(path)
             .args(["-map", "0:a:0", "-ac", "1", "-ar", &RATE.to_string(), "-f", "f32le", "-"])

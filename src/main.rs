@@ -1019,6 +1019,19 @@ impl Stream {
     }
 }
 
+/// The command line, as the player wants it when started as a macOS app:
+/// Finder starts it with nothing (or, on some versions, only a `-psn_`
+/// process serial number), which opens the player, as the AppImage's AppRun
+/// does on Linux. From a terminal nothing still prints the help.
+fn app_args() -> Vec<std::ffi::OsString> {
+    let mut args: Vec<_> = std::env::args_os().filter(|a| !a.to_string_lossy().starts_with("-psn_")).collect();
+    let in_app = std::env::current_exe().is_ok_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"));
+    if cfg!(target_os = "macos") && in_app && args.len() == 1 {
+        args.push("play".into());
+    }
+    args
+}
+
 fn main() -> Result<()> {
     // Output piped into something that stopped reading (`| head`) is no
     // failure to report: the reader has what it wanted.
@@ -1029,7 +1042,7 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(app_args());
     if cli.no_cache {
         cache::disable();
     }
