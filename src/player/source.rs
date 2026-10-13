@@ -73,6 +73,9 @@ pub enum Kind {
     Lrf(PathBuf),
     /// OSV tracks scaled to this many pixels square, or at their own size.
     Osv { path: PathBuf, tracks: Vec<u32>, size: Option<u32> },
+    /// An ordinary video, upright, scaled to `size` or at its own, and at
+    /// `rate` frames a second if given.
+    Flat { path: PathBuf, flat: ffmpeg::Flat, size: Option<(u32, u32)>, rate: Option<f64> },
 }
 
 /// A running decode from `start`, delivering frames in order.
@@ -109,10 +112,16 @@ pub fn spawn(kind: Kind, hw: Hwaccel, start: f64, fps: f64) -> Result<Stream> {
                 })
                 .collect::<Result<_>>()?
         }
+        Kind::Flat { path, flat, size, rate } => {
+            let (w, h) = size.unwrap_or_else(|| flat.size());
+            let mut cmd = ffmpeg::nv12(path, flat.track, start, flat.out(*size, *rate), hw)?;
+            cmd.args(["-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null());
+            vec![(cmd.spawn().context("running ffmpeg")?, w, h)]
+        }
     };
     let layout = match &kind {
         Kind::Lrf(_) => Layout::SideBySide,
-        Kind::Osv { .. } => Layout::PerTrack,
+        Kind::Osv { .. } | Kind::Flat { .. } => Layout::PerTrack,
     };
     let (mut children, sizes): (Vec<Child>, Vec<(u32, u32)>) = procs.into_iter().map(|(c, w, h)| (c, (w, h))).unzip();
     let outs: Vec<_> = children.iter_mut().map(|c| c.stdout.take().unwrap()).collect();
@@ -173,8 +182,24 @@ pub fn still(path: &Path, tracks: &[u32], t: f64, size: Option<u32>, hw: Hwaccel
     Ok(Frame { pts: t, layout: Layout::PerTrack, pictures })
 }
 
+/// One frame of an ordinary video at its own size, upright, falling back to
+/// software if the hardware decoder fails.
+pub fn still_flat(path: &Path, flat: ffmpeg::Flat, t: f64, hw: Hwaccel) -> Result<Frame> {
+    let (w, h) = flat.size();
+    let read = |hw| -> Result<Vec<u8>> {
+        let mut cmd = ffmpeg::nv12(path, flat.track, t, flat.out(None, None), hw)?;
+        let mut child = cmd.args(["-frames:v", "1", "-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().context("running ffmpeg")?;
+        let mut data = vec![0; (w * h * 3 / 2) as usize];
+        child.stdout.take().unwrap().read_exact(&mut data)?;
+        let _ = child.wait();
+        Ok(data)
+    };
+    let data = read(hw).or_else(|_| read(Hwaccel::Software))?;
+    Ok(Frame { pts: t, layout: Layout::PerTrack, pictures: vec![Picture { width: w, height: h, data }] })
+}
+
 fn decode(path: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel) -> Result<Child> {
-    let mut cmd = ffmpeg::nv12(path, track, start, size, hw)?;
+    let mut cmd = ffmpeg::nv12(path, track, start, ffmpeg::Out { size: size.map(|s| (s, s)), ..Default::default() }, hw)?;
     cmd.args(["-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null());
     cmd.spawn().context("running ffmpeg")
 }

@@ -91,7 +91,12 @@ impl View {
     }
 
     pub fn camera(&self) -> Camera {
-        Camera { user: self.matrix(), zoom: (self.fov.to_radians() / 2.0).tan(), planet: self.projection.planet(), grade: Default::default() }
+        let crop = Crop {
+            centre: [(self.yaw / FLAT_DEGREES) as f32, (-self.pitch / FLAT_DEGREES) as f32],
+            half: (self.fov / FLAT_DEGREES / 2.0) as f32,
+            roll: self.roll.to_radians() as f32,
+        };
+        Camera { user: self.matrix(), zoom: (self.fov.to_radians() / 2.0).tan(), planet: self.projection.planet(), grade: Default::default(), crop }
     }
 
     /// view_from_screen-ray: yaw about +y, then pitch about +x, then roll.
@@ -106,6 +111,23 @@ impl View {
     }
 }
 
+/// On an ordinary video a view's angles become a crop of the picture, so
+/// keyframes, eases, dragging and scrolling work as on a 360 clip: this many
+/// degrees of yaw or pitch move by one picture height, and a field of view
+/// this wide shows the whole height (as the home view's 90° does).
+pub const FLAT_DEGREES: f64 = 90.0;
+
+/// The part of an ordinary video a view shows, in picture heights.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Crop {
+    /// Where the view's centre is from the picture's centre, x right, y down.
+    pub centre: [f32; 2],
+    /// Half the view's height.
+    pub half: f32,
+    /// The view's roll, radians.
+    pub roll: f32,
+}
+
 /// A view ready to draw.
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
@@ -118,6 +140,8 @@ pub struct Camera {
     pub planet: Option<f64>,
     /// The colour effects on what it shows.
     pub grade: crate::grade::Grade,
+    /// What it shows of an ordinary video instead.
+    pub crop: Crop,
 }
 
 impl Camera {
@@ -137,6 +161,19 @@ impl Camera {
         let s = (q[0] * q[0] + q[1] * q[1]).sqrt().max(1e-12);
         let th = s.atan() + (s * d / (1.0 + s * s).sqrt()).asin();
         [th.sin() * q[0] / s, th.sin() * q[1] / s, th.cos()]
+    }
+
+    /// Where screen point `ndc` falls in an ordinary video `picture` wide for
+    /// its height (0..1 each way), or `None` off its edge. The shader's
+    /// `flat_uv` must match.
+    pub fn flat_uv(&self, aspect: f64, picture: f64, [nx, ny]: [f64; 2]) -> Option<[f64; 2]> {
+        let c = &self.crop;
+        let (half, centre) = (c.half as f64, c.centre.map(|v| v as f64));
+        let q = [nx * aspect * half, ny * half];
+        let (s, k) = (c.roll as f64).sin_cos();
+        let p = [k * q[0] - s * q[1], s * q[0] + k * q[1]];
+        let uv = [0.5 + (centre[0] + p[0]) / picture, 0.5 + centre[1] + p[1]];
+        uv.iter().all(|v| (0.0..=1.0).contains(v)).then_some(uv)
     }
 }
 
@@ -600,8 +637,28 @@ mod tests {
     }
 
     #[test]
+    fn flat_views_crop_the_picture() {
+        let at = |v: View, ndc| v.camera().flat_uv(16.0 / 9.0, 16.0 / 9.0, ndc);
+        let home = View::home(Projection::Perspective);
+        // Home shows the whole picture when the shapes match.
+        assert_eq!(at(home, [-1.0, -1.0]), Some([0.0, 0.0]));
+        assert_eq!(at(home, [1.0, 1.0]), Some([1.0, 1.0]));
+        // Half the field of view: the middle half.
+        let zoomed = View { fov: 45.0, ..home };
+        assert_eq!(at(zoomed, [-1.0, -1.0]), Some([0.25, 0.25]));
+        // Yaw right and pitch up move the centre right and up; past the edge is off it.
+        let moved = View { yaw: 22.5, pitch: 22.5, fov: 45.0, ..home };
+        let c = at(moved, [0.0, 0.0]).unwrap();
+        assert!((c[0] - (0.5 + 0.25 * 9.0 / 16.0)).abs() < 1e-6 && (c[1] - 0.25).abs() < 1e-6);
+        assert_eq!(at(View { yaw: 90.0, ..home }, [1.0, 0.0]), None);
+        // A quarter turn of roll stands the screen's x on the picture's y.
+        let rolled = at(View { roll: 90.0, fov: 45.0, ..home }, [0.5, 0.0]).unwrap();
+        assert!((rolled[0] - 0.5).abs() < 1e-6 && (rolled[1] - (0.5 + 0.5 * 16.0 / 9.0 * 0.25)).abs() < 1e-6);
+    }
+
+    #[test]
     fn azimuthal_matches_perspective_and_planet() {
-        let cam = |planet| Camera { user: crate::stitch::IDENTITY, zoom: 0.7, planet: Some(planet), grade: Default::default() };
+        let cam = |planet| Camera { user: crate::stitch::IDENTITY, zoom: 0.7, planet: Some(planet), grade: Default::default(), crop: Default::default() };
         let ndc = [0.3, -0.8];
         let (q, z) = ([0.3 * 1.5 * 0.7, -0.8 * 0.7], 0.7);
         let n = (q[0] * q[0] + q[1] * q[1] + 1.0f64).sqrt();

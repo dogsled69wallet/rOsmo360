@@ -320,6 +320,25 @@ fn fill_row(row: &mut [bool], pts: &[[f64; 2]], py: f64, value: bool) {
     }
 }
 
+/// An ordinary video's `frame` (upright) as `camera` crops it, `(w, h)`
+/// pixels, black off its edge. The shader's flat branch must match.
+pub fn flat(frame: &Frame, (w, h): (usize, usize), camera: &crate::view::Camera) -> Frame {
+    let (aspect, picture) = (w as f64 / h as f64, frame.width as f64 / frame.height as f64);
+    let mut rgb = vec![0u8; w * h * 3];
+    rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let ndc = [(x as f64 + 0.5) / w as f64 * 2.0 - 1.0, (y as f64 + 0.5) / h as f64 * 2.0 - 1.0];
+            if let Some([u, v]) = camera.flat_uv(aspect, picture, ndc) {
+                let px = sample(frame, u * frame.width as f64, v * frame.height as f64);
+                for c in 0..3 {
+                    row[x * 3 + c] = px[c].round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    });
+    Frame { width: w, height: h, rgb }
+}
+
 fn sample(f: &Frame, u: f64, v: f64) -> [f64; 3] {
     let x0 = (u - 0.5).floor();
     let y0 = (v - 0.5).floor();

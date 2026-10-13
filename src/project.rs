@@ -297,6 +297,10 @@ pub struct Cut {
     /// Its colour effects' keyframes, clip time, apart from the camera's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<crate::grade::EffectKey>,
+    /// Its clip is an ordinary video (framed by cropping, not a 360 view):
+    /// found when the clip is opened, not saved.
+    #[serde(skip)]
+    pub flat: bool,
 }
 
 impl Cut {
@@ -425,14 +429,19 @@ impl Project {
 }
 
 /// The keyframes that frame cut `n` of `cuts` (in edit order) at clip time
-/// `t`, and the time to read them at. A cut without keyframes holds the view
-/// the edit had last: the end of the nearest earlier cut with some, as the
-/// player shows it when playing on. `None` before any keyframe.
+/// `t`, and the time to read them at. A 360 cut without keyframes holds the
+/// view the edit had last: the end of the nearest earlier 360 cut with some,
+/// as the player shows it when playing on. An ordinary video without them
+/// shows its whole picture (a view's angles mean another thing there), so
+/// neither kind holds the other's. `None` before any keyframe.
 pub fn keyframed(cuts: &[Cut], n: usize, t: f64) -> Option<(&Keyframes, f64)> {
     if !cuts[n].keyframes.is_empty() {
         return Some((&cuts[n].keyframes, t));
     }
-    cuts[..n].iter().rev().find(|c| !c.keyframes.is_empty()).map(|c| (&c.keyframes, c.end))
+    if cuts[n].flat {
+        return None;
+    }
+    cuts[..n].iter().rev().find(|c| !c.flat && !c.keyframes.is_empty()).map(|c| (&c.keyframes, c.end))
 }
 
 /// The view of cut `n` at clip time `t` (see `keyframed`), or straight ahead
@@ -563,6 +572,11 @@ mod tests {
         let yaw = |n, t| camera_at(&p.cuts, n, t, &|_, _| None).user;
         assert_eq!(yaw(0, 2.0), View::home(Projection::Perspective).camera().user);
         assert_eq!(keyframed(&p.cuts, 1, 12.0).map(|k| k.1), Some(12.0));
+        // An ordinary video in between holds nothing and passes nothing on.
+        let mut mixed = p.cuts.clone();
+        mixed[2].flat = true;
+        assert_eq!(keyframed(&mixed, 2, 55.0), None);
+        assert_eq!(keyframed(&mixed, 3, 75.0).map(|k| k.1), Some(20.0));
         // The view at the earlier cut's out point, not at its last keyframe.
         let held = p.cuts[1].keyframes.camera_at(20.0, &|_, _| None).unwrap().user;
         assert_eq!((yaw(2, 55.0), yaw(3, 75.0)), (held, held));

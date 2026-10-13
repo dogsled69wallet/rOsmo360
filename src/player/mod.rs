@@ -48,6 +48,8 @@ pub struct Media {
     pub readout_ms: f64,
     pub fps: f64,
     pub duration: f64,
+    /// An ordinary video (`ffmpeg::flat`), not a 360 clip.
+    pub flat: Option<ffmpeg::Flat>,
 }
 
 impl fmt::Debug for Media {
@@ -93,7 +95,7 @@ impl Media {
     fn load(input: PathBuf, opts: &Options, progress: &dyn Fn(f64)) -> Result<Media> {
         let stitch = crate::StitchOpts { stabilize: Some(opts.stabilize), imu_axes: opts.imu_axes, world_z_down: opts.world_z_down, ..Default::default() };
         let p = crate::Pipeline::load(&input, &stitch, opts.stabilize, progress)?;
-        let proxy = ffmpeg::proxy(&input);
+        let proxy = if p.flat.is_some() { None } else { ffmpeg::proxy(&input) };
         let hw = match opts.hw {
             Some(hw) => hw,
             None => {
@@ -104,15 +106,19 @@ impl Media {
         };
         Ok(Media {
             duration: ffmpeg::duration(&input)?,
-            osv_full: ffmpeg::dimensions(&input, p.tracks[0])?.0 as u32,
+            osv_full: match p.flat {
+                Some(f) => f.size().0.max(f.size().1),
+                None => ffmpeg::dimensions(&input, p.tracks[0])?.0 as u32,
+            },
             has_audio: ffmpeg::has_audio(&input)?,
             proxy,
             osv_size: opts.osv_size,
             hw,
-            rig: Arc::new(Rig::new(p.lenses, p.tracks, false)),
+            rig: Arc::new(if p.flat.is_some() { Rig::flat(p.tracks[0]) } else { Rig::new(p.lenses, p.tracks, false) }),
             stab: p.stab,
             readout_ms: p.readout_ms,
             fps: p.fps,
+            flat: p.flat,
             input,
         })
     }
@@ -449,6 +455,13 @@ struct App {
     error: Option<String>,
     /// The free-look view: what is shown unless following keyframes.
     look: View,
+    /// The free look kept for the other kind of clip (360 or ordinary
+    /// video), swapped in when the playing cut is of that kind: angles mean
+    /// another thing there, and a little planet's would push a video's
+    /// picture off screen.
+    other_look: View,
+    /// Whether `look` belongs to ordinary videos.
+    look_flat: bool,
     /// Show the keyframes' view rather than `look`. Playing, seeking and
     /// keyframe edits turn it on; looking around by hand turns it off.
     follow: bool,
@@ -514,6 +527,8 @@ impl App {
             loading: None,
             error: None,
             look: View::default(),
+            other_look: View::home(Projection::Perspective),
+            look_flat: false,
             follow: true,
             rolling_shutter: saved.rolling_shutter,
             full_on_pause: saved.full_on_pause,
@@ -554,6 +569,7 @@ impl App {
     /// Handles `message`, then saves the settings if it changed any.
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
+        self.settle_look();
         self.follow_crossfade();
         self.follow_music();
         let now = self.settings();
@@ -1058,7 +1074,10 @@ impl App {
                 let dir = self.clip.as_ref().and_then(|c| c.playback.media.input.parent().map(Path::to_owned));
                 return Task::perform(
                     async move {
-                        let mut dialog = rfd::AsyncFileDialog::new().set_title("Open Osmo 360 clips").add_filter("Osmo 360 video", &["OSV", "osv"]);
+                        let mut dialog = rfd::AsyncFileDialog::new()
+                            .set_title("Add clips")
+                            .add_filter("Videos", &["OSV", "osv", "mp4", "MP4", "mov", "MOV", "mkv", "MKV", "m4v", "M4V", "avi", "AVI", "webm", "WEBM", "mts", "MTS"])
+                            .add_filter("Osmo 360 video", &["OSV", "osv"]);
                         if let Some(dir) = dir {
                             dialog = dialog.set_directory(dir);
                         }
@@ -1083,6 +1102,7 @@ impl App {
                         let thumbs = (!self.thumbs.contains_key(&input)).then(|| Task::run(thumbs::stream(media.clone()), |m| m));
                         self.thumbs.entry(input.clone()).or_default();
                         self.library.push(media);
+                        self.mark_flat();
                         if self.loading_adds {
                             self.add_cut(input, duration);
                         }
@@ -1179,6 +1199,7 @@ impl App {
                 self.queue.extend(cuts.iter().map(|c| (c.input.clone(), false)));
                 let complete = missing.is_empty() && gone.is_empty();
                 self.edit.replace(cuts, music, project.sound, project.fades);
+                self.mark_flat();
                 self.saved_version = if complete { self.edit.version } else { 0 };
                 self.project = Some(path);
                 self.selected_music = None;
@@ -1252,6 +1273,7 @@ impl App {
                 }
             }
             Message::Effect(e) => self.effect_message(e),
+            Message::PickColour if self.on_flat() => {}
             Message::PickColour => {
                 self.picking_white = false;
                 if self.picking.take().is_none() && self.clip.is_some() {
@@ -1615,6 +1637,7 @@ impl App {
                 let at = self.position();
                 let changed = if matches!(message, Message::Undo) { self.edit.undo() } else { self.edit.redo() };
                 if changed {
+                    self.mark_flat();
                     self.after_edit(at);
                 }
             }
@@ -1648,6 +1671,7 @@ impl App {
                     self.follow = true;
                 }
             }
+            Message::KeyFollow(_) | Message::Stab(_) | Message::Projection(_) if self.on_flat() => {}
             Message::KeyFollow(aiming) => {
                 let (Some(k), Some((_, t))) = (self.current_key(), self.playing_cut()) else { return Task::none() };
                 if Aiming::of(&self.edit.cuts[self.current].keyframes[k].follow) == aiming {
@@ -1755,6 +1779,7 @@ impl App {
                 };
                 let request = export::Request {
                     input: media.input.clone(),
+                    flat: media.flat,
                     hw: media.hw,
                     rig: media.rig.clone(),
                     stab: media.stab.clone(),
@@ -1928,7 +1953,10 @@ impl App {
         // As `camera` frames the playing cut: by its keyframes (or those it
         // holds from before), else the view as it is.
         let keyed = || crate::project::keyframed(&self.edit.cuts, *i, t).and_then(|(k, at)| k.camera_at(at, &crate::project::held(&|f, t| self.aim_in(&p.media, f, t), at == t, t)));
-        let camera = if self.follow { keyed().unwrap_or_else(|| self.look.camera()) } else { self.look.camera() };
+        // The free look of the partner's own kind: a 360 view would push an
+        // ordinary video's picture off screen, and the other way round.
+        let look = if self.edit.cuts.get(*i).is_some_and(|c| c.flat) == self.look_flat { self.look } else { self.other_look };
+        let camera = if self.follow { keyed().unwrap_or_else(|| look.camera()) } else { look.camera() };
         let camera = Camera { grade: self.grade(*i, t), ..camera };
         Some((p.media.rig.clone(), shown, camera, p.rig_from_view(self.rolling_shutter), self.crossfade_shares()?.1 as f32))
     }
@@ -1973,7 +2001,8 @@ impl App {
     /// ones leave playback where it is.
     fn add_cut(&mut self, input: PathBuf, duration: f64) {
         self.edit.checkpoint();
-        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new() });
+        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new(), flat: false });
+        self.mark_flat();
         let i = self.edit.cuts.len() - 1;
         self.selected = Some(i);
         if self.clip.is_none() {
@@ -2006,6 +2035,35 @@ impl App {
         self.current = i;
         let mode = self.edit.cuts[i].stabilize.unwrap_or(self.opts.stabilize);
         self.with_playback(|p| p.media.stab.set_mode(mode));
+        self.settle_look();
+    }
+
+    /// Makes `look` the free look of the playing cut's kind. Run after every
+    /// message, as the current cut changes in many places (playing on at an
+    /// out point, a crossfade, a split, undo): swapped only in `goto`, a 360
+    /// view made after playing into a 360 cut became the ordinary video's.
+    fn settle_look(&mut self) {
+        let flat = self.edit.cuts.get(self.current).is_some_and(|c| c.flat);
+        if flat != self.look_flat {
+            std::mem::swap(&mut self.look, &mut self.other_look);
+            self.look_flat = flat;
+        }
+    }
+
+    /// Whether the playing clip is an ordinary video: no stabilisation,
+    /// projection, stick or colour track there.
+    fn on_flat(&self) -> bool {
+        self.clip.as_ref().is_some_and(|c| c.playback.media.flat.is_some())
+    }
+
+    /// Marks each cut whose clip has loaded as an ordinary video or not;
+    /// the views of the two kinds are kept apart (`project::keyframed`).
+    fn mark_flat(&mut self) {
+        for cut in &mut self.edit.cuts {
+            if let Some(m) = self.library.iter().find(|m| m.input == cut.input) {
+                cut.flat = m.flat.is_some();
+            }
+        }
     }
 
     /// Follows a drag (the playhead, a trim, a keyframe) to clip time `t`
@@ -2383,7 +2441,7 @@ impl App {
             let status: Element<'_, Message> = match (&self.loading, song) {
                 (Some(_), _) => self.loading_bar(280.0),
                 (None, Some(song)) => text(song).into(),
-                (None, None) => text("Open DJI Osmo 360 .OSV clips, or a saved project, to start. Or start from a song.").into(),
+                (None, None) => text("Open DJI Osmo 360 .OSV clips or other videos, or a saved project, to start. Or start from a song.").into(),
             };
             let idle = self.loading.is_none();
             let buttons = row![
@@ -2566,12 +2624,12 @@ impl App {
                 tooltip::Position::Bottom,
             ),
             tip(
-                pick_list(&Aiming::ALL[..], aiming, Message::KeyFollow).placeholder("Follow").width(140),
+                pick_list(&Aiming::ALL[..], aiming.filter(|_| !self.on_flat()), Message::KeyFollow).placeholder(if self.on_flat() { "—" } else { "Follow" }).width(140),
                 text("What this keyframe looks at: fixed angles, the selfie stick (whoever holds it), or a colour track (pick a new one by drawing a box over the subject)"),
                 tooltip::Position::Bottom,
             ),
             tip(
-                icon_button(PICK, (self.clip.is_some() && self.tracking.is_none()).then_some(Message::PickColour)),
+                icon_button(PICK, (self.clip.is_some() && self.tracking.is_none() && !self.on_flat()).then_some(Message::PickColour)),
                 text("Track a colour: draw a box over a subject (a jacket, a tent); the keyframe here then follows it"),
                 tooltip::Position::Top,
             ),
@@ -2637,9 +2695,28 @@ impl App {
         };
         let (lo, hi) = shown_view.fov_range();
         let controls = row![
-            labelled("Stabilisation", pick_list(&Mode::ALL[..], Some(media.stab.mode()), Message::Stab)),
-            labelled("Projection", pick_list(&Projection::ALL[..], Some(shown_view.projection), Message::Projection)),
-            labelled("Playback source", pick_list(sources, Some(source), Message::Source)),
+            if media.flat.is_some() {
+                tip(labelled("Stabilisation", text("—")), text("An ordinary video has no motion data to steady it with"), tooltip::Position::Top)
+            } else {
+                labelled("Stabilisation", pick_list(&Mode::ALL[..], Some(media.stab.mode()), Message::Stab))
+            },
+            if media.flat.is_some() {
+                tip(labelled("Projection", text("Flat")), text("An ordinary video is framed by panning and zooming within it"), tooltip::Position::Top)
+            } else {
+                labelled("Projection", pick_list(&Projection::ALL[..], Some(shown_view.projection), Message::Projection))
+            },
+            match media.flat {
+                Some(flat) => {
+                    let (w, h) = playback::fit(flat.size(), playback::FLAT_PLAY);
+                    let (fw, fh) = flat.size();
+                    tip(
+                        labelled("Playback source", text(format!("Video {w}×{h}"))),
+                        text(if (w, h) == (fw, fh) { "The video at its own size".to_owned() } else { format!("The video scaled down to play smoothly; paused, it shows at its full {fw}×{fh} (Full res when paused)") }),
+                        tooltip::Position::Top,
+                    )
+                }
+                None => labelled("Playback source", pick_list(sources, Some(source), Message::Source)),
+            },
             labelled("FOV", slider(lo..=hi, shown_view.fov, Message::Fov).width(120)),
             tip(
                 labelled(

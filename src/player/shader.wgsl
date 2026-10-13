@@ -47,6 +47,10 @@ struct Uniforms {
     cut: array<vec4f, 32>,
     // Colour effects (grade.rs, `Grade::uniforms`).
     grade: array<vec4f, 3>,
+    // An ordinary video: .x 1 if it is one, .y its picture's width over
+    // height; then its crop (view.rs `Crop`): centre x, y, half height, roll.
+    flat: vec4f,
+    crop: vec4f,
 }
 
 const BINS: u32 = 32u;
@@ -277,8 +281,26 @@ fn grade(rgb: vec3f, at: vec2f, aspect: f32) -> vec3f {
     return clamp(c * keep, vec3f(0.0), vec3f(1.0));
 }
 
+// Mirrors `Camera::flat_uv` in view.rs: where a screen pixel falls in an
+// ordinary video's picture, outside 0..1 off its edge.
+fn flat_uv(pos: vec2f) -> vec2f {
+    let ndc = vec2f(pos.x / u.screen.x * 2.0 - 1.0, pos.y / u.screen.y * 2.0 - 1.0);
+    let q = vec2f(ndc.x * u.screen.x / u.screen.y * u.crop.z, ndc.y * u.crop.z);
+    let s = sin(u.crop.w);
+    let k = cos(u.crop.w);
+    let p = vec2f(k * q.x - s * q.y, s * q.x + k * q.y);
+    return vec2f(0.5 + (u.crop.x + p.x) / u.flat.y, 0.5 + u.crop.y + p.y);
+}
+
 @fragment
 fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    if u.flat.x > 0.5 {
+        let uv = flat_uv(pos.xy - u.misc.zw);
+        if any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) {
+            return vec4f(0.0, 0.0, 0.0, 1.0);
+        }
+        return finish(nv12(0.0, uv), pos);
+    }
     let v = rows(u.user0, u.user1, u.user2, screen_ray(pos.xy - u.misc.zw));
     let steps = u32(u.misc.x);
     let mid = view_at(steps / 2u, v);
@@ -312,7 +334,12 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     if wt[0] > 0.0 && wt[1] > 0.0 {
         share = cut_share(share, col[0], col[1], cut_strength(mid));
     }
-    var rgb = col[0] * share + col[1] * (1.0 - share);
+    return finish(col[0] * share + col[1] * (1.0 - share), pos);
+}
+
+// The colour effects, then light as the surface wants it.
+fn finish(picture: vec3f, pos: vec4f) -> vec4f {
+    var rgb = picture;
     if u.grade[2].z > 0.5 {
         let p = pos.xy - u.misc.zw;
         rgb = grade(rgb, vec2f(p.x / u.screen.x * 2.0 - 1.0, p.y / u.screen.y * 2.0 - 1.0), u.screen.x / u.screen.y);

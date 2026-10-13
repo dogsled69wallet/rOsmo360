@@ -21,6 +21,8 @@ pub enum Shot {
 
 pub struct Request {
     pub input: PathBuf,
+    /// An ordinary video: cropped as framed, or saved whole.
+    pub flat: Option<ffmpeg::Flat>,
     pub hw: ffmpeg::Hwaccel,
     pub rig: Arc<Rig>,
     pub stab: Stabilizer,
@@ -32,6 +34,16 @@ pub struct Request {
 }
 
 pub fn save(r: Request) -> Result<PathBuf> {
+    if let Some(flat) = r.flat {
+        let (w, h) = flat.size();
+        let frame = ffmpeg::still_out(&r.input, flat.track, r.t, r.hw, (w as usize, h as usize), flat.out(None, None))?;
+        let out = match r.shot {
+            Shot::Sphere { .. } => frame,
+            Shot::View { camera, size } => stitch::flat(&frame, size, &camera),
+        };
+        image::save_buffer(&r.path, &out.rgb, out.width as u32, out.height as u32, image::ColorType::Rgb8).with_context(|| format!("writing {}", r.path.display()))?;
+        return Ok(r.path);
+    }
     let frames = r
         .rig
         .tracks

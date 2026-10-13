@@ -522,6 +522,11 @@ struct Pipeline {
     hw: ffmpeg::Hwaccel,
     /// Decode this side-by-side proxy instead of the lens tracks.
     proxy: Option<PathBuf>,
+    /// An ordinary video: no lenses, rig or attitude; drawn by cropping.
+    flat: Option<ffmpeg::Flat>,
+    /// Decode at this rate instead of the clip's own (an ordinary video in
+    /// an edit at another rate); `fps` is then this.
+    rate: Option<f64>,
     /// Tracks that keyframes follow, read once each (`None`: unreadable).
     followed: std::sync::Mutex<std::collections::HashMap<PathBuf, Option<std::sync::Arc<track::Track>>>>,
 }
@@ -541,6 +546,9 @@ impl Pipeline {
 
     /// `new`, telling `progress` how far reading the telemetry has got (0..1).
     fn load(input: &Path, opts: &StitchOpts, stabilize: stab::Mode, progress: &dyn Fn(f64)) -> Result<Self> {
+        if let Some(flat) = ffmpeg::flat(input)? {
+            return Self::load_flat(input, flat);
+        }
         let telemetry = cache::telemetry(input, progress)?;
         let rig = telemetry.rig.context("no camera rig in file")?;
         let projection = match opts.variant {
@@ -583,12 +591,39 @@ impl Pipeline {
             cut: !opts.no_cut && opts.only.is_none(),
             hw,
             proxy: None,
+            flat: None,
+            rate: None,
+            followed: Default::default(),
+        })
+    }
+
+    /// An ordinary video: nothing to stitch, steady or follow.
+    fn load_flat(input: &Path, flat: ffmpeg::Flat) -> Result<Self> {
+        Ok(Pipeline {
+            input: input.to_owned(),
+            lenses: Vec::new(),
+            tracks: vec![flat.track],
+            stab: stab::Stabilizer::new(&[], stab::Mode::Off, stab::ImuAxes::X180, -1.0, 0.0),
+            readout_ms: 0.0,
+            fps: ffmpeg::frame_rate(input)?,
+            only: None,
+            rs_steps: 1,
+            seam: None,
+            aligner: None,
+            cut: false,
+            hw: ffmpeg::Hwaccel::pick(input, flat.track)?,
+            proxy: None,
+            flat: Some(flat),
+            rate: None,
             followed: Default::default(),
         })
     }
 
     /// Where `follow` points in the view at clip time `t` (seconds).
     fn aim(&self, follow: &view::Follow, t: f64) -> Option<(f64, f64)> {
+        if self.flat.is_some() {
+            return None;
+        }
         match follow {
             view::Follow::Stick => self.stab.stick(t * 1000.0, self.readout_ms),
             view::Follow::Track(path) => {
@@ -606,6 +641,9 @@ impl Pipeline {
 
     /// Decode from the clip's proxy from now on, if it has one.
     fn use_proxy(&mut self) {
+        if self.flat.is_some() {
+            return;
+        }
         self.proxy = ffmpeg::proxy(&self.input);
         if self.proxy.is_none() {
             eprintln!("no proxy (LRF) next to the clip; using the full-resolution tracks");
@@ -619,6 +657,23 @@ impl Pipeline {
 
     /// Stitches one frame, measuring the seam afresh and easing towards it.
     fn render(&self, frames: &[stitch::Frame], t: f64, carry: &mut Carry, shot: &Shot) -> stitch::Frame {
+        if self.flat.is_some() {
+            let picture = &frames[0];
+            return match *shot {
+                // The whole picture, as the home view shows it.
+                Shot::Equirect(width) => {
+                    let size = (width, (width * picture.height / picture.width).max(2) / 2 * 2);
+                    stitch::flat(picture, size, &view::View::home(view::Projection::Perspective).camera())
+                }
+                Shot::View { camera, size } => {
+                    let mut frame = stitch::flat(picture, size, &camera);
+                    if !camera.grade.is_neutral() {
+                        grade_frame(&mut frame, &camera.grade);
+                    }
+                    frame
+                }
+            };
+        }
         let views = if self.stab.has_data() { self.stab.rig_from_view(t * 1000.0, self.readout_ms, self.rs_steps) } else { vec![stitch::IDENTITY] };
         let rgb = |i: usize, u: f64, v: f64| self.lenses[i].sample(frames, u, v).map(|c| c / 255.0);
         let exposure = self.seam.as_ref().map(|seam| {
@@ -649,6 +704,10 @@ impl Pipeline {
 
     /// Every lens's frame at `t`.
     fn stills(&self, t: f64) -> Result<Vec<stitch::Frame>> {
+        if let Some(flat) = &self.flat {
+            let (w, h) = flat.size();
+            return Ok(vec![ffmpeg::still_out(&self.input, flat.track, t, self.hw, (w as usize, h as usize), flat.out(None, None))?]);
+        }
         match &self.proxy {
             Some(proxy) => Ok(ffmpeg::split_proxy(&ffmpeg::still(proxy, 0, t, self.hw)?, &self.tracks)),
             None => self.tracks.iter().map(|&n| ffmpeg::still(&self.input, n, t, self.hw)).collect(),
@@ -656,6 +715,10 @@ impl Pipeline {
     }
 
     fn stream(&self, start: f64) -> Result<Stream> {
+        if let Some(flat) = &self.flat {
+            let (w, h) = flat.size();
+            return Ok(Stream::Tracks(vec![ffmpeg::Decoder::with(&self.input, flat.track, start, self.hw, (w as usize, h as usize), flat.out(None, self.rate))?]));
+        }
         Ok(match &self.proxy {
             Some(proxy) => Stream::Proxy(ffmpeg::Decoder::new(proxy, 0, start, self.hw)?, self.tracks.clone()),
             None => Stream::Tracks(self.tracks.iter().map(|&n| ffmpeg::Decoder::new(&self.input, n, start, self.hw)).collect::<Result<_>>()?),
@@ -692,10 +755,10 @@ fn span(input: &Path, start: Option<f64>, duration: Option<f64>, reframe: Option
 /// cancel) stops the export and removes the unfinished file.
 /// Sets up each cut's clip once per clip and stabilisation (the cut's own
 /// wins over the command's): the pipelines, and per cut the index of its own.
-fn cut_pipelines(project: &project::Project, opts: &StitchOpts, proxy: bool) -> Result<(Vec<Pipeline>, Vec<usize>)> {
+fn cut_pipelines(project: &mut project::Project, opts: &StitchOpts, proxy: bool) -> Result<(Vec<Pipeline>, Vec<usize>)> {
     let mut pipelines: Vec<Pipeline> = Vec::new();
     let mut of_cut = Vec::with_capacity(project.cuts.len());
-    for cut in &project.cuts {
+    for cut in &mut project.cuts {
         let mode = cut.stabilize.or(opts.stabilize).unwrap_or(stab::Mode::Horizon);
         let i = match pipelines.iter().position(|p| p.input == cut.input && p.stab.mode() == mode) {
             Some(i) => i,
@@ -708,7 +771,16 @@ fn cut_pipelines(project: &project::Project, opts: &StitchOpts, proxy: bool) -> 
                 pipelines.len() - 1
             }
         };
+        cut.flat = pipelines[i].flat.is_some();
         of_cut.push(i);
+    }
+    // The edit runs at its first 360 clip's rate (its first cut's if it has
+    // none); ordinary videos at another rate are decoded at it, frames
+    // repeated or dropped, so they keep their speed and stay in step.
+    let Some(fps) = pipelines.iter().find(|p| p.flat.is_none()).or(pipelines.first()).map(|p| p.fps) else { return Ok((pipelines, of_cut)) };
+    for p in pipelines.iter_mut().filter(|p| p.flat.is_some() && (p.fps - fps).abs() > 0.01) {
+        p.rate = Some(fps);
+        p.fps = fps;
     }
     Ok((pipelines, of_cut))
 }
@@ -742,7 +814,9 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
     if project.cuts.is_empty() {
         bail!("nothing to export yet: the project has music but no video cuts");
     }
-    let (pipelines, of_cut) = cut_pipelines(project, opts, out.draft)?;
+    let mut project = project.clone();
+    let (pipelines, of_cut) = cut_pipelines(&mut project, opts, out.draft)?;
+    let project = &project;
     // The shader always draws both lenses, so `--only` needs the CPU.
     let mut gpu = if out.cpu || opts.only.is_some() {
         None
@@ -911,10 +985,12 @@ fn main() -> Result<()> {
         Cmd::Cache { action: Some(CacheAction::Add { paths, force }) } => cache_clips(&paths, force)?,
         Cmd::Cache { action: Some(CacheAction::Move { folder, .. }) } => cache::move_to(folder)?,
         Cmd::Rig { input } => {
+            needs_360(&input, "a camera rig")?;
             let rig = cache::telemetry(&input, &|_| {})?.rig.context("no camera rig in file")?;
             println!("{}", serde_json::to_string_pretty(&rig)?);
         }
         Cmd::Imu { input } => {
+            needs_360(&input, "motion data")?;
             let imu = imu::read(&load_input(&input, &|_| {})?);
             println!("kind,t,w,x,y,z");
             for (t, q) in &imu.quats {
@@ -930,7 +1006,7 @@ fn main() -> Result<()> {
         Cmd::Play { input, osv_size, hwaccel, stabilize, imu_axes, world_z_down } => {
             player::run(input, player::Launch { osv_size, hw: hwaccel, stabilize, imu_axes, world_z_down })?;
         }
-        Cmd::Seam { input, start, duration, dump } => seam_report(&input, start, duration, dump.as_deref())?,
+        Cmd::Seam { input, start, duration, dump } => needs_360(&input, "a seam").and_then(|_| seam_report(&input, start, duration, dump.as_deref()))?,
         Cmd::Stitch { input, time, output, width, opts } => {
             let p = Pipeline::new(&input, &opts, stab::Mode::Off)?;
             let time = p.snap(time);
@@ -966,7 +1042,7 @@ fn main() -> Result<()> {
                 // One clip is a project of one cut.
                 let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
                 let (start, end) = span(&input, start, duration, Some(&reframe))?;
-                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new() }], ..Default::default() }
+                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new(), flat: false }], ..Default::default() }
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
@@ -1031,8 +1107,9 @@ fn main() -> Result<()> {
             save_png(&output, &sheet::compose(&tiles, columns))?;
             eprintln!("wrote {}: {} tiles at {}", output.display(), tiles.len(), times.iter().map(|t| format!("{:.1}", p.snap(*t))).collect::<Vec<_>>().join(" "));
         }
-        Cmd::Scan { input, every, image } => scan(&input, every, image)?,
+        Cmd::Scan { input, every, image } => needs_360(&input, "motion data").and_then(|_| scan(&input, every, image))?,
         Cmd::Track { input, colour, tolerance, near, start, duration, every } => {
+            needs_360(&input, "a sphere to track in")?;
             let near = near.map(|(yaw, pitch)| track::Near::Level(yaw, pitch));
             let (found, rows) = track_to(&input, &track::Colour::parse(&colour, tolerance)?, near, start, duration, every, &mut std::io::stdout().lock(), &mut |_, _| Ok(()))?;
             eprintln!("found the colour in {found} of {rows} samples");
@@ -1050,7 +1127,9 @@ fn is_project(input: &Path) -> bool {
 /// cut starts a row; blank tiles fill out the last. Returns the sheet and
 /// how many tiles it shows.
 fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<f64>, tile: usize, columns: usize, proxy: bool) -> Result<(stitch::Frame, usize)> {
-    let (pipelines, of_cut) = cut_pipelines(project, opts, proxy)?;
+    let mut project = project.clone();
+    let (pipelines, of_cut) = cut_pipelines(&mut project, opts, proxy)?;
+    let project = &project;
     let view::Aspect(w, h) = project.aspect.unwrap_or(view::Aspect(16, 9));
     let size = (tile, ((tile * h as usize / w as usize) / 2).max(8) * 2);
     let mut shots = Vec::new();
@@ -1124,10 +1203,33 @@ fn save_png(path: &Path, f: &stitch::Frame) -> Result<()> {
     image::save_buffer(path, &f.rgb, f.width as u32, f.height as u32, image::ColorType::Rgb8).with_context(|| format!("writing {}", path.display()))
 }
 
+/// Fails with a plain reason when `input` is an ordinary video, which has
+/// no `what` (only an Osmo 360's .OSV does).
+fn needs_360(input: &Path, what: &str) -> Result<()> {
+    if ffmpeg::flat(input)?.is_some() {
+        bail!("{} is an ordinary video: it has no {what}, only an Osmo 360 clip (.OSV) does", input.display());
+    }
+    Ok(())
+}
+
 fn info(input: &Path) -> Result<()> {
+    if let Some(flat) = ffmpeg::flat(input)? {
+        let info = serde_json::json!({
+            "input": input,
+            "kind": "video",
+            "duration": ffmpeg::duration(input)?,
+            "fps": ffmpeg::frame_rate(input)?,
+            "size": flat.size(),
+            "recorded": ffmpeg::creation_time(input)?,
+            "audio": ffmpeg::has_audio(input)?,
+        });
+        println!("{}", serde_json::to_string_pretty(&info)?);
+        return Ok(());
+    }
     let quats = cache::telemetry(input, &|_| {})?.quats;
     let info = serde_json::json!({
         "input": input,
+        "kind": "osv",
         "proxy": ffmpeg::proxy(input),
         "duration": ffmpeg::duration(input)?,
         "fps": ffmpeg::frame_rate(input)?,
@@ -1260,7 +1362,7 @@ fn skies(input: &Path) -> Result<Vec<(f64, sky::Sky)>> {
     let p = Pipeline::new(input, &opts, stab::Mode::Horizon)?;
     let proxy = ffmpeg::proxy(input).context("scan --image reads the LRF proxy beside the clip, and there is none")?;
     let mut skies = Vec::new();
-    ffmpeg::key_frames(&proxy, 0, (LENS * p.tracks.len(), LENS), |t, frame| {
+    ffmpeg::key_frames(&proxy, 0, (LENS * p.tracks.len(), LENS), ffmpeg::Out::default(), |t, frame| {
         let frames = ffmpeg::split_proxy(&frame, &p.tracks);
         let pic = p.render(&frames, t, &mut Carry::default(), &Shot::Equirect(WIDTH));
         skies.push((t, sky::measure(&pic.rgb, WIDTH)));

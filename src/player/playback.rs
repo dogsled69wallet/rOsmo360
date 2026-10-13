@@ -60,6 +60,18 @@ pub struct Playback {
     pub ended: bool,
 }
 
+/// An ordinary video plays fitted inside this many pixels on its long side
+/// (a phone's 4K would be as heavy as the OSV); paused, "Full res when
+/// paused" shows it whole.
+pub const FLAT_PLAY: u32 = 1920;
+
+/// `size` scaled to fit `long` on its long side (never up), sides even.
+pub fn fit((w, h): (u32, u32), long: u32) -> (u32, u32) {
+    let k = (long as f64 / w.max(h) as f64).min(1.0);
+    let even = |v: u32| ((v as f64 * k / 2.0).round() as u32).max(1) * 2;
+    if k >= 1.0 { (w / 2 * 2, h / 2 * 2) } else { (even(w), even(h)) }
+}
+
 impl Playback {
     /// A playback with nothing decoding yet: `jump` (or `seek`) says where.
     /// It used to seek to 0 first, which started a preview decode and a
@@ -137,6 +149,9 @@ impl Playback {
     }
 
     fn kind(&self) -> Kind {
+        if let Some(flat) = self.media.flat {
+            return Kind::Flat { path: self.media.input.clone(), flat, size: Some(fit(flat.size(), FLAT_PLAY)), rate: None };
+        }
         match (&self.media.proxy, self.media.osv_size) {
             (Some(p), None) => Kind::Lrf(p.clone()),
             (_, size) => Kind::Osv { path: self.media.input.clone(), tracks: self.media.rig.tracks.clone(), size: Some(size.unwrap_or(1920)) },
@@ -353,6 +368,27 @@ impl Playback {
     /// full resolution, or else at the OSV size being played (none when
     /// playing the proxy, whose preview is already that quality).
     fn request_still(&mut self, t: f64) {
+        if let Some(flat) = self.media.flat {
+            // Playing already shows up to `FLAT_PLAY`; only full size adds.
+            if !self.full_on_pause || fit(flat.size(), FLAT_PLAY) == flat.size() {
+                self.still = None;
+                return;
+            }
+            if self.still_busy.load(Ordering::Relaxed) {
+                self.still_next = Some(t);
+                return;
+            }
+            let (tx, rx) = channel();
+            let (path, hw, busy) = (self.media.input.clone(), self.media.hw, self.still_busy.clone());
+            busy.store(true, Ordering::Relaxed);
+            std::thread::spawn(move || {
+                let frame = source::still_flat(&path, flat, t, hw);
+                busy.store(false, Ordering::Relaxed);
+                let _ = tx.send(frame);
+            });
+            self.still = Some((t, None, rx));
+            return;
+        }
         let size = match (self.full_on_pause, self.media.osv_size) {
             (true, _) => None,
             (false, Some(s)) => Some(s),
@@ -500,6 +536,7 @@ impl Playback {
             (None, None) => match self.kind() {
                 Kind::Lrf(_) => "proxy".to_owned(),
                 Kind::Osv { size, .. } => osv(size),
+                Kind::Flat { size, .. } => size.map_or_else(|| "full res".to_owned(), |(w, h)| format!("{w}×{h}")),
             },
         }
     }

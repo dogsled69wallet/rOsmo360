@@ -13,7 +13,9 @@ fn probe(input: &Path, stream: &str, entries: &str) -> Result<String> {
         .arg(input)
         .output()
         .context("running ffprobe")?;
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    // A stream with side data (a phone's rotation) ends each line with an
+    // empty field for it: "30000/1001," didn't parse as a frame rate.
+    Ok(String::from_utf8_lossy(&out.stdout).trim().lines().map(|l| l.trim_end_matches(',')).collect::<Vec<_>>().join("\n"))
 }
 
 pub fn frame_rate(input: &Path) -> Result<f64> {
@@ -65,11 +67,17 @@ pub fn split_proxy(frame: &Frame, tracks: &[u32]) -> Vec<Frame> {
 /// `each` with its time until it returns false. Skipping the other frames
 /// makes this cheap (0037's 55 s proxy: 84 frames in about 1 s); the cost
 /// is mostly reading the file.
-pub fn key_frames(input: &Path, track: u32, (w, h): (usize, usize), mut each: impl FnMut(f64, Frame) -> bool) -> Result<()> {
-    let mut child = Command::new("ffmpeg")
-        .args(["-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", "-skip_frame", "nokey", "-i"])
+pub fn key_frames(input: &Path, track: u32, (w, h): (usize, usize), out: Out, mut each: impl FnMut(f64, Frame) -> bool) -> Result<()> {
+    let mut filters = Vec::new();
+    Out { size: Some((w as u32, h as u32)), ..out }.filters(&mut filters);
+    filters.push("showinfo".to_owned());
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", "-skip_frame", "nokey"]);
+    out.input_args(&mut cmd);
+    let mut child = cmd
+        .arg("-i")
         .arg(input)
-        .args(["-map", &format!("0:v:{track}"), "-vf", &format!("scale={w}:{h},showinfo"), "-fps_mode", "passthrough"])
+        .args(["-map", &format!("0:v:{track}"), "-vf", &filters.join(","), "-fps_mode", "passthrough"])
         .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -131,6 +139,100 @@ pub fn audio_levels(input: &Path, window: f64) -> Result<Vec<(f64, f64)>> {
         .collect())
 }
 
+/// An ordinary (flat) video's picture track: phones, drones and action cams
+/// beside the Osmo's 360 clips. `stored` is its size as encoded; phones film
+/// portrait as landscape and tag a rotation, which `turns` undoes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Flat {
+    /// Index among the file's video streams.
+    pub track: u32,
+    pub stored: (u32, u32),
+    /// Quarter turns clockwise to stand it upright.
+    pub turns: u8,
+}
+
+impl Flat {
+    /// Its size upright.
+    pub fn size(&self) -> (u32, u32) {
+        if self.turns % 2 == 1 { (self.stored.1, self.stored.0) } else { self.stored }
+    }
+
+    /// Decoded upright, at `size` (upright) if given.
+    pub fn out(&self, size: Option<(u32, u32)>, rate: Option<f64>) -> Out {
+        Out { size, turns: Some(self.turns), rate }
+    }
+}
+
+/// `None` for an OSV (two square HEVC lens tracks), else the flat video
+/// track to show. Errors if the file has no video at all.
+pub fn flat(input: &Path) -> Result<Option<Flat>> {
+    let streams = probe(input, "v", "stream=codec_name,width,height:stream_disposition=attached_pic")?;
+    let mut lenses = 0;
+    let mut first = None;
+    for (i, line) in streams.lines().enumerate() {
+        let f: Vec<&str> = line.split(',').collect();
+        let (Some(codec), Some(w), Some(h)) = (f.first(), f.get(1).and_then(|v| v.parse::<u32>().ok()), f.get(2).and_then(|v| v.parse::<u32>().ok())) else { continue };
+        // Cover art and thumbnails ride along as one-picture video streams.
+        if f.get(3) == Some(&"1") {
+            continue;
+        }
+        if *codec == "hevc" && w == h && w >= 2000 {
+            lenses += 1;
+        }
+        first.get_or_insert((i as u32, (w, h)));
+    }
+    if lenses >= 2 {
+        return Ok(None);
+    }
+    let (track, stored) = first.with_context(|| format!("{} has no video", input.display()))?;
+    // ffprobe gives the display matrix's angle counterclockwise; ffmpeg's
+    // own autorotation turns -90 into a clockwise quarter turn.
+    let rotation = probe(input, &format!("v:{track}"), "stream_side_data=rotation")?.lines().next().and_then(|r| r.trim().parse::<f64>().ok()).unwrap_or(0.0);
+    let turns = ((-rotation / 90.0).round() as i64).rem_euclid(4) as u8;
+    Ok(Some(Flat { track, stored, turns }))
+}
+
+/// How a decode delivers frames, beyond the track as stored.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Out {
+    /// Scaled to this size.
+    pub size: Option<(u32, u32)>,
+    /// `Some`: ffmpeg's autorotation off and this many quarter turns
+    /// clockwise instead, so the size is known before the first frame (and
+    /// it works after a hardware download). `None`: as ffmpeg does it.
+    pub turns: Option<u8>,
+    /// Frames repeated or dropped to this rate (a 60 fps phone clip in a
+    /// 29.97 fps edit).
+    pub rate: Option<f64>,
+}
+
+impl Out {
+    fn input_args(&self, cmd: &mut Command) {
+        if self.turns.is_some() {
+            cmd.arg("-noautorotate");
+        }
+    }
+
+    /// Filters for after decoding: the turn, then the scale.
+    fn filters(&self, filters: &mut Vec<String>) {
+        match self.turns {
+            Some(1) => filters.push("transpose=clock".to_owned()),
+            Some(2) => filters.push("hflip,vflip".to_owned()),
+            Some(3) => filters.push("transpose=cclock".to_owned()),
+            _ => {}
+        }
+        if let Some((w, h)) = self.size {
+            filters.push(format!("scale={w}:{h}:flags=bilinear"));
+        }
+    }
+
+    fn output_args(&self, cmd: &mut Command) {
+        if let Some(r) = self.rate {
+            cmd.args(["-r", &r.to_string()]);
+        }
+    }
+}
+
 pub fn has_audio(input: &Path) -> Result<bool> {
     Ok(!probe(input, "a", "stream=index")?.is_empty())
 }
@@ -183,7 +285,7 @@ impl Hwaccel {
         if let Some(&(_, ok)) = PROBED.lock().unwrap().iter().find(|(hw, _)| *hw == self) {
             return Ok(ok);
         }
-        let ok = nv12(input, track, 0.0, None, self)?
+        let ok = nv12(input, track, 0.0, Out::default(), self)?
             .args(["-frames:v", "1", "-f", "null", "-"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -203,25 +305,25 @@ impl Hwaccel {
 /// Except on CUDA at full size: `scale_cuda` converts the 10-bit frames to
 /// NV12 before the download, which halves the bytes. Both 3840² lenses of
 /// 0037 then decode at 1.9× real time instead of 0.9× on Vulkan.
-pub fn nv12(input: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel) -> Result<Command> {
+pub fn nv12(input: &Path, track: u32, start: f64, out: Out, hw: Hwaccel) -> Result<Command> {
     let mut filters = Vec::new();
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
     if let Some(name) = hw.name() {
         let ten_bit = probe(input, &format!("v:{track}"), "stream=pix_fmt")?.contains("10");
         cmd.args(["-hwaccel", name, "-hwaccel_output_format", name]);
-        if hw == Hwaccel::Cuda && size.is_none() {
+        if hw == Hwaccel::Cuda && out.size.is_none() {
             filters.push("scale_cuda=format=nv12,hwdownload".to_owned());
         } else {
             filters.push(format!("hwdownload,format={}", if ten_bit { "p010le" } else { "nv12" }));
         }
     }
-    if let Some(s) = size {
-        filters.push(format!("scale={s}:{s}:flags=bilinear"));
-    }
+    out.filters(&mut filters);
     filters.push("format=nv12".to_owned());
+    out.input_args(&mut cmd);
     cmd.args(["-ss", &start.to_string(), "-i"]).arg(input);
     cmd.args(["-map", &format!("0:v:{track}"), "-vf", &filters.join(",")]);
+    out.output_args(&mut cmd);
     Ok(cmd)
 }
 
@@ -229,16 +331,25 @@ pub fn nv12(input: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel
 /// Asking for exactly one frame lets ffmpeg finish cleanly instead of
 /// complaining about a closed pipe.
 pub fn still(input: &Path, track: u32, t: f64, hw: Hwaccel) -> Result<Frame> {
-    let (width, height) = dimensions(input, track)?;
+    still_out(input, track, t, hw, dimensions(input, track)?, Out::default())
+}
+
+/// `still` delivered as `out` says, which comes out `(width, height)`.
+pub fn still_out(input: &Path, track: u32, t: f64, hw: Hwaccel, (width, height): (usize, usize), out: Out) -> Result<Frame> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
     if let Some(name) = hw.name() {
         cmd.args(["-hwaccel", name]);
     }
+    out.input_args(&mut cmd);
+    let mut filters = Vec::new();
+    out.filters(&mut filters);
+    cmd.args(["-ss", &t.to_string(), "-i"]).arg(input).args(["-map", &format!("0:v:{track}")]);
+    if !filters.is_empty() {
+        cmd.args(["-vf", &filters.join(",")]);
+    }
     let out = cmd
-        .args(["-ss", &t.to_string(), "-i"])
-        .arg(input)
-        .args(["-map", &format!("0:v:{track}"), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
         .stderr(Stdio::inherit())
         .output()
         .context("running ffmpeg")?;
@@ -260,16 +371,26 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new(input: &Path, track: u32, start: f64, hw: Hwaccel) -> Result<Self> {
-        let (width, height) = dimensions(input, track)?;
+        Self::with(input, track, start, hw, dimensions(input, track)?, Out::default())
+    }
+
+    /// `new` delivered as `out` says, which comes out `(width, height)`.
+    pub fn with(input: &Path, track: u32, start: f64, hw: Hwaccel, (width, height): (usize, usize), out: Out) -> Result<Self> {
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error"]);
         if let Some(name) = hw.name() {
             cmd.args(["-hwaccel", name]);
         }
+        out.input_args(&mut cmd);
+        let mut filters = Vec::new();
+        out.filters(&mut filters);
+        cmd.args(["-ss", &start.to_string(), "-i"]).arg(input).args(["-map", &format!("0:v:{track}")]);
+        if !filters.is_empty() {
+            cmd.args(["-vf", &filters.join(",")]);
+        }
+        out.output_args(&mut cmd);
         let mut child = cmd
-            .args(["-ss", &start.to_string(), "-i"])
-            .arg(input)
-            .args(["-map", &format!("0:v:{track}"), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
             .stdout(Stdio::piped())
             .spawn()
             .context("running ffmpeg")?;

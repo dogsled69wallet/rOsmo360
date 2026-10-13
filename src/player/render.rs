@@ -164,6 +164,9 @@ pub struct Clip {
 
 impl Clip {
     pub fn new(p: &crate::Pipeline) -> Result<Clip> {
+        if p.flat.is_some() {
+            return Ok(Clip { rig: Arc::new(Rig::flat(p.tracks[0])), hw: p.hw });
+        }
         let mut rig = Rig::new(p.lenses.clone(), p.tracks.clone(), p.seam.is_some());
         if p.aligner.is_none() {
             rig.aligner = None;
@@ -197,9 +200,10 @@ pub fn encode(
     size: (usize, usize),
     tick: &mut dyn FnMut(usize) -> Result<()>,
 ) -> Result<()> {
-    let kind = match &p.proxy {
-        Some(proxy) => Kind::Lrf(proxy.clone()),
-        None => Kind::Osv { path: p.input.clone(), tracks: p.tracks.clone(), size: None },
+    let kind = match (&p.flat, &p.proxy) {
+        (Some(flat), _) => Kind::Flat { path: p.input.clone(), flat: *flat, size: None, rate: p.rate },
+        (None, Some(proxy)) => Kind::Lrf(proxy.clone()),
+        (None, None) => Kind::Osv { path: p.input.clone(), tracks: p.tracks.clone(), size: None },
     };
     let stream = source::spawn(kind, clip.hw, start, p.fps)?;
     let rig = &clip.rig;

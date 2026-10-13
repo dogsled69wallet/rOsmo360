@@ -38,7 +38,9 @@ pub fn stream(media: Media) -> impl Stream<Item = Message> {
 }
 
 pub fn make(media: &Media, mut send: impl FnMut(f64, Handle) -> bool) -> anyhow::Result<()> {
-    let Some(proxy) = &media.proxy else { return Ok(()) };
+    if media.proxy.is_none() && media.flat.is_none() {
+        return Ok(());
+    }
     let (w, h) = SIZE;
     if let Some(thumbs) = cache::thumbs(&media.input, SIZE) {
         for (t, rgba) in thumbs {
@@ -48,14 +50,35 @@ pub fn make(media: &Media, mut send: impl FnMut(f64, Handle) -> bool) -> anyhow:
         }
         return Ok(());
     }
+    let every = media.duration / MOST;
+    let mut last = f64::NEG_INFINITY;
+    let (mut made, mut whole) = (Vec::new(), true);
+    // An ordinary video's own keyframes, whole as it plays.
+    if let Some(flat) = media.flat {
+        let (fw, fh) = flat.size();
+        let small = (((fw as f64 * 2.0 * h as f64 / fh as f64) as usize).max(2) / 2 * 2, 2 * h);
+        let camera = View::home(Projection::Perspective).camera();
+        ffmpeg::key_frames(&media.input, flat.track, small, flat.out(None, None), |t, frame| {
+            if t - last < every {
+                return true;
+            }
+            last = t;
+            let rgba: Vec<u8> = stitch::flat(&frame, SIZE, &camera).rgb.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+            made.push((t, rgba.clone()));
+            whole = send(t, Handle::from_rgba(w as u32, h as u32, rgba));
+            whole
+        })?;
+        if whole {
+            cache::store_thumbs(&media.input, SIZE, &made);
+        }
+        return Ok(());
+    }
+    let Some(proxy) = &media.proxy else { return Ok(()) };
     let mut stab = media.stab.clone();
     stab.set_mode(Mode::Horizon);
     let camera = View { fov: 100.0, ..View::home(Projection::Perspective) }.camera();
     let ray = |x: f64, y: f64| stitch::apply(camera.user, camera.ray(w as f64 / h as f64, [x / w as f64 * 2.0 - 1.0, y / h as f64 * 2.0 - 1.0]));
-    let every = media.duration / MOST;
-    let mut last = f64::NEG_INFINITY;
-    let (mut made, mut whole) = (Vec::new(), true);
-    ffmpeg::key_frames(proxy, 0, (LENS * media.rig.tracks.len(), LENS), |t, frame| {
+    ffmpeg::key_frames(proxy, 0, (LENS * media.rig.tracks.len(), LENS), ffmpeg::Out::default(), |t, frame| {
         if t - last < every {
             return true;
         }

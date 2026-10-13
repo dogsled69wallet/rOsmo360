@@ -50,6 +50,10 @@ struct Uniforms {
     cut: [[f32; 4]; CELLS_PHI / 4],
     /// Colour effects (`Grade::uniforms`).
     grade: [[f32; 4]; 3],
+    /// An ordinary video: 1 if it is one, its picture's width over height.
+    flat: [f32; 4],
+    /// Its crop (`view::Crop`): centre x, y, half height, roll.
+    crop: [f32; 4],
 }
 
 /// Numbers rigs and frames so each is uploaded once however often it is drawn.
@@ -65,6 +69,9 @@ pub struct Rig {
     pub aligner: Option<Aligner>,
     /// Places the seam for the shader's blend whatever corrections are on.
     ring: Option<crate::ring::Ring>,
+    /// An ordinary video: no lenses, its one picture cropped as the camera
+    /// says.
+    pub flat: bool,
 }
 
 impl Rig {
@@ -75,7 +82,12 @@ impl Rig {
     pub fn new(lenses: Vec<Lens>, tracks: Vec<u32>, exposure: bool) -> Self {
         let seam = if exposure { Seam::new(&lenses) } else { None };
         let (aligner, ring) = (Aligner::new(&lenses), crate::ring::Ring::new(&lenses));
-        Rig { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), lenses, tracks, seam, aligner, ring }
+        Rig { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), lenses, tracks, seam, aligner, ring, flat: false }
+    }
+
+    /// An ordinary video's: its picture track and nothing to stitch.
+    pub fn flat(track: u32) -> Self {
+        Rig { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), lenses: Vec::new(), tracks: vec![track], seam: None, aligner: None, ring: None, flat: true }
     }
 }
 
@@ -338,6 +350,13 @@ impl Pipeline {
         u.misc = [steps as f32, srgb as u8 as f32, origin[0], origin[1]];
         u.lenses = l.lens_u;
         u.grade = camera.grade.uniforms();
+        if rig.flat
+            && let Some(p) = shown.frame.pictures.first()
+        {
+            u.flat = [1.0, p.width as f32 / p.height as f32, 0.0, 0.0];
+            let c = &camera.crop;
+            u.crop = [c.centre[0], c.centre[1], c.half, c.roll];
+        }
         for (k, m) in rig_from_view.iter().take(steps).enumerate() {
             u.views[k * 3..k * 3 + 3].copy_from_slice(&rows(*m));
         }
@@ -393,6 +412,14 @@ impl Pipeline {
 
 impl Layer {
     fn set_rig(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rig: &Rig, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler) {
+        if rig.flat {
+            self.masks = [0, 1].map(|_| plane(device, 1, 1, wgpu::TextureFormat::R8Unorm));
+            self.lens_u = [LensU::zeroed(); 2];
+            self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.masks);
+            self.rig_id = rig.id;
+            self.shown_id = 0;
+            return;
+        }
         self.masks = [0, 1].map(|i| {
             let l = &rig.lenses[i];
             let [w, h] = l.calib_dim;
