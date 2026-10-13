@@ -115,7 +115,7 @@ impl Stabilizer {
     }
 
     /// The world_from_view basis at frame time `t_ms`.
-    fn world_from_view(&self, t_ms: f64) -> M3 {
+    pub fn world_from_view(&self, t_ms: f64) -> M3 {
         match self.mode {
             Mode::Off => self.world_from_rig(t_ms),
             Mode::Lock => self.world_from_rig(self.quats[0].0),

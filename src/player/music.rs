@@ -73,7 +73,7 @@ pub fn gain(db: f64) -> f32 {
 /// `crossfades` with the clips before and after it (equal power, so the
 /// loudness holds through the middle), and the fade-out before `video_end`
 /// when it runs on past it, 0..1.
-fn envelope(clip: &MusicClip, (cross_in, cross_out): (f64, f64), t: f64, video_end: f64) -> f64 {
+pub fn envelope(clip: &MusicClip, (cross_in, cross_out): (f64, f64), t: f64, video_end: f64) -> f64 {
     let into = t - clip.at;
     let left = clip.ends() - t;
     let mut g: f64 = 1.0;

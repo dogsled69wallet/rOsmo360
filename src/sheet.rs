@@ -18,6 +18,7 @@ fn glyph(c: char) -> [u8; 7] {
         '8' => [0x70, 0x88, 0x88, 0x70, 0x88, 0x88, 0x70],
         '9' => [0x70, 0x88, 0x88, 0x78, 0x08, 0x10, 0x60],
         '.' => [0, 0, 0, 0, 0, 0x60, 0x60],
+        ':' => [0, 0x60, 0x60, 0, 0x60, 0x60, 0],
         '-' => [0, 0, 0, 0xf8, 0, 0, 0],
         's' => [0, 0, 0x70, 0x80, 0x70, 0x08, 0xf0],
         '#' => [0x50, 0xf8, 0x50, 0x50, 0xf8, 0x50, 0],
@@ -77,9 +78,68 @@ pub fn equirect_grid(f: &mut Frame) {
     }
 }
 
+const GAP: usize = 4;
+/// A row's heading band and its waveform band, pixels.
+const HEAD: usize = 9 * SCALE + 4;
+const WAVE: usize = 16;
+
+/// What goes with a row of a project's sheet: a heading over it, and
+/// under it a waveform, one 0..1 peak per pixel across the sheet (`None`
+/// where there is nothing), drawn from −40 to 0 dB.
+pub struct Band {
+    pub heading: String,
+    pub wave: Option<Vec<Option<f32>>>,
+}
+
+/// How wide `compose` makes a sheet of `columns` tiles `tile` wide.
+pub fn width(tile: usize, columns: usize) -> usize {
+    columns * tile + (columns - 1) * GAP
+}
+
+/// Where tile column `i`'s middle is across the sheet.
+pub fn tile_middle(tile: usize, i: usize) -> f64 {
+    (i * (tile + GAP)) as f64 + tile as f64 / 2.0
+}
+
+/// `compose` with a heading over each row and the waveform under it.
+pub fn compose_rows(tiles: &[Frame], columns: usize, bands: &[Band]) -> Frame {
+    let sheet = compose(tiles, columns);
+    let th = tiles[0].height;
+    let wave = bands.iter().any(|b| b.wave.is_some());
+    let row = HEAD + th + if wave { WAVE } else { 0 };
+    let (width, height) = (sheet.width, bands.len() * row + bands.len().saturating_sub(1) * GAP);
+    let mut out = Frame { width, height, rgb: vec![32; width * height * 3] };
+    for (r, band) in bands.iter().enumerate() {
+        let y0 = r * (row + GAP);
+        // The heading on its own dark strip, the tiles under it.
+        for y in y0..y0 + HEAD {
+            out.rgb[y * width * 3..(y + 1) * width * 3].fill(16);
+        }
+        label(&mut out, 0, y0 + 2, &band.heading);
+        let from = r * (th + GAP);
+        for y in 0..th {
+            let (src, dst) = ((from + y) * width * 3, (y0 + HEAD + y) * width * 3);
+            out.rgb[dst..dst + width * 3].copy_from_slice(&sheet.rgb[src..src + width * 3]);
+        }
+        let Some(peaks) = &band.wave else { continue };
+        let top = y0 + HEAD + th;
+        for (x, p) in peaks.iter().enumerate().take(width) {
+            let Some(p) = p else { continue };
+            // In dB from −40, so a song mixed down still reads.
+            let db = if *p > 0.0 { ((20.0 * p.log10() + 40.0) / 40.0).clamp(0.0, 1.0) } else { 0.0 };
+            let half = ((db * (WAVE / 2) as f32).round() as usize).max(1);
+            let mid = top + WAVE / 2;
+            for y in mid - half.min(WAVE / 2)..(mid + half).min(top + WAVE) {
+                let i = (y * width + x) * 3;
+                out.rgb[i..i + 3].copy_from_slice(&[230, 150, 60]);
+            }
+        }
+    }
+    out
+}
+
 /// Lays `tiles` (all the same size) out in rows of `columns` with a gap.
 pub fn compose(tiles: &[Frame], columns: usize) -> Frame {
-    const GAP: usize = 4;
     let (tw, th) = (tiles[0].width, tiles[0].height);
     let columns = columns.clamp(1, tiles.len());
     let rows = tiles.len().div_ceil(columns);

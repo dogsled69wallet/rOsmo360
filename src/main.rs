@@ -1,5 +1,6 @@
 mod align;
 mod cache;
+mod check;
 mod dissolve;
 mod exposure;
 mod grade;
@@ -52,6 +53,22 @@ enum Cmd {
     Imu { input: PathBuf },
     /// The clip's length, frame rate, recording time and what it holds, as JSON.
     Info { input: PathBuf },
+    /// List what in a project is likely a mistake, one line each (edit
+    /// time, cut, what): cuts out of the order they were filmed in, a cut
+    /// repeating footage the cut before shows, crossfades between cuts of one
+    /// clip seconds apart (one scene: it stutters), pans faster than 30°/s
+    /// (and whether keyframes or the camera turn the view),
+    /// cuts under a second, and music ending before the edit or running long
+    /// past it.
+    Check {
+        project: PathBuf,
+        /// Pans faster than this, degrees a second over a second, are
+        /// listed: they smear and are hard to follow.
+        #[arg(long, default_value_t = 30.0)]
+        fast_pan: f64,
+        #[command(flatten)]
+        opts: StitchOpts,
+    },
     /// Stitch one frame to an equirectangular PNG.
     Stitch {
         input: PathBuf,
@@ -228,8 +245,20 @@ enum Cmd {
     /// Summarise the clip over time as CSV, to find moments worth a look:
     /// the camera's heading and tilt, how fast it turns or shakes, and how
     /// loud it is.
+    ///
+    /// Given several clips or folders (every .OSV in them and the folders
+    /// inside), writes a CSV per clip into the folder --output, named after
+    /// the clip, a few clips at a time.
     Scan {
-        input: PathBuf,
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        /// The folder for a CSV per clip; one clip without it goes to the
+        /// standard output.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Clips scanned at once into --output.
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
         /// Seconds per row.
         #[arg(long, default_value_t = 1.0)]
         every: f64,
@@ -298,17 +327,16 @@ enum CacheAction {
     },
 }
 
-/// `cache add`: caches each clip under `paths` that isn't yet (all of them
-/// with `force`), saying how it went one line a clip. A clip that fails is
-/// reported and skipped.
-fn cache_clips(paths: &[PathBuf], force: bool) -> Result<()> {
-    fn osv_under(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+/// Each path given that is a file, and every .OSV in the folders given (and
+/// the folders inside), in name order.
+fn osv_under(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    fn walk(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         if path.is_dir() {
             let mut inside: Vec<_> = std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?.flatten().map(|e| e.path()).collect();
             inside.sort();
             for p in inside {
                 if p.is_dir() || p.extension().is_some_and(|e| e.eq_ignore_ascii_case("osv")) {
-                    osv_under(&p, out)?;
+                    walk(&p, out)?;
                 }
             }
         } else if path.exists() {
@@ -320,8 +348,16 @@ fn cache_clips(paths: &[PathBuf], force: bool) -> Result<()> {
     }
     let mut clips = Vec::new();
     for p in paths {
-        osv_under(p, &mut clips)?;
+        walk(p, &mut clips)?;
     }
+    Ok(clips)
+}
+
+/// `cache add`: caches each clip under `paths` that isn't yet (all of them
+/// with `force`), saying how it went one line a clip. A clip that fails is
+/// reported and skipped.
+fn cache_clips(paths: &[PathBuf], force: bool) -> Result<()> {
+    let clips = osv_under(paths)?;
     let dir = cache::dir().context("no cache folder (HOME is not set)")?;
     eprintln!("caching {} clips in {}", clips.len(), dir.display());
     let (mut added, mut failed) = (0, 0);
@@ -984,6 +1020,15 @@ impl Stream {
 }
 
 fn main() -> Result<()> {
+    // Output piped into something that stopped reading (`| head`) is no
+    // failure to report: the reader has what it wanted.
+    match run() {
+        Err(e) if e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)) => Ok(()),
+        r => r,
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     if cli.no_cache {
         cache::disable();
@@ -1012,6 +1057,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Info { input } => info(&input)?,
+        Cmd::Check { project, fast_pan, opts } => check::check(&project, &opts, fast_pan)?,
         Cmd::Play { input, osv_size, hwaccel, stabilize, imu_axes, world_z_down } => {
             player::run(input, player::Launch { osv_size, hw: hwaccel, stabilize, imu_axes, world_z_down })?;
         }
@@ -1116,7 +1162,11 @@ fn main() -> Result<()> {
             save_png(&output, &sheet::compose(&tiles, columns))?;
             eprintln!("wrote {}: {} tiles at {}", output.display(), tiles.len(), times.iter().map(|t| format!("{:.1}", p.snap(*t))).collect::<Vec<_>>().join(" "));
         }
-        Cmd::Scan { input, every, image } => needs_360(&input, "motion data").and_then(|_| scan(&input, every, image))?,
+        Cmd::Scan { inputs, output, jobs, every, image } => match (&inputs[..], output) {
+            ([input], None) if !input.is_dir() => needs_360(input, "motion data").and_then(|_| scan(input, every, image, &mut std::io::stdout().lock()))?,
+            (_, None) => bail!("several clips (or a folder) need --output, a folder for a CSV per clip"),
+            (_, Some(dir)) => scan_many(&inputs, &dir, jobs, every, image)?,
+        },
         Cmd::Track { input, colour, tolerance, near, start, duration, every } => {
             needs_360(&input, "a sphere to track in")?;
             let near = near.map(|(yaw, pitch)| track::Near::Level(yaw, pitch));
@@ -1133,22 +1183,56 @@ fn is_project(input: &Path) -> bool {
 
 /// A contact sheet of a project: per cut, `columns` moments spread across
 /// it (or one every `every` seconds), framed as `export` frames them. Each
-/// cut starts a row; blank tiles fill out the last. Returns the sheet and
-/// how many tiles it shows.
+/// cut starts a row, headed by its edit time, number, clip and span
+/// (`2:16 #23 0036 18.0-25.0`); each tile says its edit and clip time, and
+/// with music the mix's waveform runs under each row, lined up with the
+/// tiles. Blank tiles fill out the last. Returns the sheet and how many
+/// tiles it shows.
 fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<f64>, tile: usize, columns: usize, proxy: bool) -> Result<(stitch::Frame, usize)> {
     let mut project = project.clone();
     let (pipelines, of_cut) = cut_pipelines(&mut project, opts, proxy)?;
     let project = &project;
     let view::Aspect(w, h) = project.aspect.unwrap_or(view::Aspect(16, 9));
     let size = (tile, ((tile * h as usize / w as usize) / 2).max(8) * 2);
+    let offsets = project::offsets(&project.cuts);
+    let music = sheet_music(project);
+    let width = sheet::width(tile, columns);
     let mut shots = Vec::new();
+    let mut bands = Vec::new();
     for (n, (cut, &i)) in project.cuts.iter().zip(&of_cut).enumerate() {
         let p = &pipelines[i];
         let len = cut.end - cut.start;
-        let times: Vec<f64> = match every {
-            Some(every) => (0..).map(|k| cut.start + k as f64 * every.max(1.0 / p.fps)).take_while(|&t| t < cut.end).collect(),
-            None => (0..columns).map(|k| cut.start + (k as f64 + 0.5) * len / columns as f64).collect(),
+        let (times, step): (Vec<f64>, f64) = match every {
+            Some(every) => {
+                let every = every.max(1.0 / p.fps);
+                ((0..).map(|k| cut.start + k as f64 * every).take_while(|&t| t < cut.end).collect(), every)
+            }
+            None => ((0..columns).map(|k| cut.start + (k as f64 + 0.5) * len / columns as f64).collect(), len / columns as f64),
         };
+        let edit = |t: f64| offsets[n] + t - cut.start;
+        for (r, row) in times.chunks(columns).enumerate() {
+            let heading = if r == 0 {
+                format!("{} #{} {} {:.1}-{:.1}", check::clock(offsets[n]), n + 1, clip_number(&cut.input), cut.start, cut.end)
+            } else {
+                format!("{} #{}", check::clock(edit(row[0])), n + 1)
+            };
+            // Each pixel across the row stands for the edit time between
+            // its tiles' times, as far as the cut goes.
+            let wave = music.as_ref().map(|level| {
+                let at = |x: f64| edit(row[0]) + (x - sheet::tile_middle(tile, 0)) / (sheet::tile_middle(tile, 1) - sheet::tile_middle(tile, 0)).max(1.0) * step;
+                (0..width)
+                    .map(|x| {
+                        let (a, b) = (at(x as f64), at(x as f64 + 1.0));
+                        let (from, to) = (offsets[n], offsets[n] + len);
+                        (b > from && a < to).then(|| {
+                            let k = ((b - a) / player::music::WAVE_STEP).ceil().max(1.0) as usize;
+                            (0..k).map(|j| level(a + (b - a) * j as f64 / k as f64)).fold(0.0, f32::max)
+                        })
+                    })
+                    .collect()
+            });
+            bands.push(sheet::Band { heading, wave });
+        }
         let row_end = times.len().div_ceil(columns) * columns;
         shots.extend(times.iter().map(|&t| Some((n, i, p.snap(t).clamp(cut.start, cut.end)))));
         shots.extend((times.len()..row_end).map(|_| None));
@@ -1159,11 +1243,45 @@ fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<
             let Some((n, i, t)) = *shot else { return Ok(stitch::Frame { width: size.0, height: size.1, rgb: vec![0; size.0 * size.1 * 3] }) };
             let p = &pipelines[i];
             let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &Shot::View { camera: Box::new(project::camera_at(&project.cuts, n, t, &|f, t| p.aim(f, t))), size });
-            sheet::label(&mut f, 4, 4, &format!("#{} {t:.1}s", n + 1));
+            let cut = &project.cuts[n];
+            sheet::label(&mut f, 4, 4, &format!("{} {t:.1}s", check::clock(offsets[n] + t - cut.start)));
             Ok(f)
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((sheet::compose(&tiles, columns), shots.iter().flatten().count()))
+    Ok((sheet::compose_rows(&tiles, columns, &bands), shots.iter().flatten().count()))
+}
+
+/// A clip's number for a sheet's headings, which draw only digits: the
+/// last run of them in its name (`CAM_20260713153034_0037_D` → 0037).
+fn clip_number(input: &Path) -> String {
+    let stem = input.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let digits: Vec<&str> = stem.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).collect();
+    digits.last().map_or_else(String::new, |d| d.to_string())
+}
+
+/// The music's loudness at edit time, 0..1, as the export mixes it (each
+/// song's peaks at its level, fades and crossfades), or `None` without
+/// music. Songs that can't be read are left out, with a note.
+fn sheet_music(project: &project::Project) -> Option<impl Fn(f64) -> f32 + '_> {
+    let track = &project.music;
+    if track.clips.is_empty() {
+        return None;
+    }
+    let waves: Vec<_> = track.clips.iter().map(|c| player::music::Waveform::read(&c.input).inspect_err(|e| eprintln!("no waveform for {}: {e:#}", c.input.display())).ok()).collect();
+    let end = project::edit_length(&project.cuts);
+    Some(move |t: f64| {
+        let mut loudest = 0.0f32;
+        for (i, (clip, wave)) in track.clips.iter().zip(&waves).enumerate() {
+            let Some(wave) = wave else { continue };
+            if t < clip.at || t >= clip.ends() {
+                continue;
+            }
+            let peak = wave.peaks.get(((clip.start + t - clip.at) / player::music::WAVE_STEP) as usize).copied().unwrap_or(0.0);
+            let level = player::music::gain(track.level_at(t)) * player::music::envelope(clip, track.crossfades(i), t, end) as f32;
+            loudest = loudest.max(peak * level);
+        }
+        loudest
+    })
 }
 
 /// Stitches `total` frames (or to the end) from `start` into `encoder`,
@@ -1319,17 +1437,63 @@ pub fn track_to(
     Ok((found, rows))
 }
 
-/// One CSV row per `every` seconds; see `Cmd::Scan` and the header.
-fn scan(input: &Path, every: f64, image: bool) -> Result<()> {
+/// `scan` of each clip under `inputs` into `dir/<clip>.csv`, `jobs` at once,
+/// a line each on how it went; a clip that fails is reported and skipped.
+fn scan_many(inputs: &[PathBuf], dir: &Path, jobs: usize, every: f64, image: bool) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let clips = osv_under(inputs)?;
+    std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
+    eprintln!("scanning {} clips into {}", clips.len(), dir.display());
+    let (next, failed) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    std::thread::scope(|s| {
+        for _ in 0..jobs.clamp(1, clips.len().max(1)) {
+            s.spawn(|| {
+                while let Some(clip) = clips.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let at = std::time::Instant::now();
+                    let name = clip.file_stem().map_or_else(|| clip.display().to_string(), |n| n.to_string_lossy().into_owned());
+                    let out = dir.join(format!("{name}.csv"));
+                    // To a temporary file first, so a failed scan leaves no half CSV.
+                    let tmp = dir.join(format!(".{name}.csv.part"));
+                    let result = needs_360(clip, "motion data").and_then(|_| {
+                        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+                        scan(clip, every, image, &mut w)?;
+                        std::io::Write::flush(&mut w)?;
+                        drop(w);
+                        std::fs::rename(&tmp, &out)?;
+                        Ok(())
+                    });
+                    match result {
+                        Ok(()) => println!("{name}: {} in {:.0} s", out.display(), at.elapsed().as_secs_f64()),
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&tmp);
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            println!("{name}: failed: {e:#}");
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let failed = failed.into_inner();
+    eprintln!("{} scanned, {failed} failed", clips.len() - failed);
+    Ok(())
+}
+
+/// One CSV row per `every` seconds into `out`; see `Cmd::Scan` and the header.
+fn scan(input: &Path, every: f64, image: bool, out: &mut dyn std::io::Write) -> Result<()> {
     let skies = if image { skies(input)? } else { Vec::new() };
     let quats = cache::telemetry(input, &|_| {})?.quats;
     let duration = ffmpeg::duration(input)?;
-    let levels = if ffmpeg::has_audio(input)? { ffmpeg::audio_levels(input, every)? } else { Vec::new() };
+    // The proxy carries the same sound (decoded, sample for sample) at a
+    // sixteenth of the file: reading the clip's own from a network share
+    // made a folder of clips take minutes.
+    let sound = ffmpeg::proxy(input).filter(|p| ffmpeg::has_audio(p).unwrap_or(false)).unwrap_or_else(|| input.to_owned());
+    let levels = if ffmpeg::has_audio(&sound)? { ffmpeg::audio_levels(&sound, every)? } else { Vec::new() };
     let stab = (!quats.is_empty()).then(|| stab::Stabilizer::new(&quats, stab::Mode::Off, stab::ImuAxes::X180, -1.0, 0.0));
     // Turning is sampled every 20 ms: fine enough for hand shake, coarse
     // enough that the attitude's held-then-jumping samples average out.
     const STEP: f64 = 0.02;
-    println!("t,heading,tilt,turn,rotation,shake,loudness,peak{}", if image { ",sky,skyline,open" } else { "" });
+    writeln!(out, "t,heading,tilt,turn,rotation,shake,loudness,peak{}", if image { ",sky,skyline,open" } else { "" })?;
     let mut heading = None::<f64>;
     let rows = (duration / every).ceil() as usize;
     for n in 0..rows {
@@ -1344,7 +1508,7 @@ fn scan(input: &Path, every: f64, image: bool) -> Result<()> {
             }
         }
         let Some(stab) = &stab else {
-            println!("{t:.2},,,,,,{level}");
+            writeln!(out, "{t:.2},,,,,,{level}")?;
             continue;
         };
         let poses: Vec<_> = (0..=(every / STEP).round() as usize).map(|k| stab.pose((t + k as f64 * STEP) * 1000.0)).collect();
@@ -1359,7 +1523,7 @@ fn scan(input: &Path, every: f64, image: bool) -> Result<()> {
         let turn = (last.heading - first.heading + 540.0).rem_euclid(360.0) - 180.0;
         let rotation = path / every;
         let shake = (path - first.turn_to(last)) / every;
-        println!("{t:.2},{h:.1},{:.1},{:.1},{rotation:.1},{shake:.1},{level}", first.tilt, turn / every);
+        writeln!(out, "{t:.2},{h:.1},{:.1},{:.1},{rotation:.1},{shake:.1},{level}", first.tilt, turn / every)?;
     }
     Ok(())
 }

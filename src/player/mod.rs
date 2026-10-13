@@ -14,7 +14,7 @@ mod settings;
 mod source;
 mod thumbs;
 mod effects;
-mod music;
+pub mod music;
 mod timeline;
 
 use crate::ffmpeg::{self, Hwaccel};
