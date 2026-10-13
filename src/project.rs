@@ -386,13 +386,18 @@ impl Project {
             if item.end <= item.start || item.at < 0.0 {
                 bail!("overlay {} is empty or starts before the edit", n + 1);
             }
+            if item.text.is_none() == item.input.as_os_str().is_empty() {
+                bail!("overlay {} needs a picture (\"input\") or \"text\", one of them", n + 1);
+            }
             if item.motion.iter().any(|k| !k.t.is_finite() || k.place.values().iter().any(|v| !v.is_finite())) {
                 bail!("an overlay's motion keyframe isn't a number");
             }
             if item.effects.iter().any(|k| !k.t.is_finite() || k.grade.values().iter().any(|v| !v.is_finite())) {
                 bail!("an overlay's effect keyframe isn't a number");
             }
-            item.input = dir.join(&item.input);
+            if item.text.is_none() {
+                item.input = dir.join(&item.input);
+            }
             item.motion.sort_by(|a, b| a.t.total_cmp(&b.t));
             item.effects.sort_by(|a, b| a.t.total_cmp(&b.t));
         }

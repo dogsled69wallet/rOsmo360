@@ -10,6 +10,7 @@
 use super::{App, Message, icon_button, tip};
 use crate::grade::{EffectKey, Grade, grade_at};
 use crate::overlay::{MotionKey, Place, place_at};
+use crate::text::{Colour, Outline, TextAlign};
 use crate::view::Ease;
 use iced::widget::{button, column, container, pick_list, row, rule, scrollable, slider, text, tooltip};
 use iced::{Alignment, Element, Length};
@@ -32,6 +33,9 @@ pub enum EffectMsg {
     Place(usize, f64),
     /// Its place value `i` back to the default here.
     ResetPlace(usize),
+    /// The selected text overlay's words edited, and its look.
+    TextEdit(iced::widget::text_editor::Action),
+    Text(TextChange),
     /// The look at the playhead on every cut.
     ToAll,
     /// Draw a box over something grey or white to set the white balance.
@@ -69,6 +73,23 @@ fn label(i: usize, v: f64) -> String {
         _ => format!("{v:+.2}"),
     }
 }
+
+/// A change to a text overlay's look.
+#[derive(Debug, Clone)]
+pub enum TextChange {
+    Font(String),
+    Size(f64),
+    Colour(Colour),
+    Bold(bool),
+    Align(TextAlign),
+    Outline(bool),
+    OutlineWidth(f64),
+    OutlineColour(Colour),
+    Shadow(bool),
+}
+
+/// The colours a text's swatches offer.
+const SWATCHES: [[u8; 3]; 9] = [[255, 255, 255], [0, 0, 0], [255, 214, 10], [255, 140, 0], [230, 40, 40], [255, 90, 170], [40, 120, 255], [30, 200, 110], [130, 130, 130]];
 
 /// What the panel edits: the playing cut, or the overlay selected (in the
 /// lane shown).
@@ -183,6 +204,45 @@ impl App {
                 });
             }
             EffectMsg::Done => self.dragging = false,
+            EffectMsg::TextEdit(action) => {
+                let edits = action.is_edit();
+                self.text_content.perform(action);
+                let words = self.text_content.text().trim_end_matches('\n').to_owned();
+                if edits && self.selected_text().is_some_and(|t| t.content != words) {
+                    // A run of typing is one undo step, until something else is done.
+                    self.begin_drag();
+                    if let Some(text) = self.selected_text() {
+                        text.content = words;
+                    }
+                }
+            }
+            EffectMsg::Text(change) => {
+                // Sliders are one undo step a drag, the rest one a click.
+                match change {
+                    TextChange::Size(_) | TextChange::OutlineWidth(_) => self.begin_drag(),
+                    _ => self.edit.checkpoint(),
+                }
+                let Some(text) = self.selected_text() else { return };
+                match change {
+                    TextChange::Font(f) => text.font = f,
+                    TextChange::Size(v) => text.size = v,
+                    TextChange::Colour(c) => text.colour = c,
+                    TextChange::Bold(b) => text.bold = b,
+                    TextChange::Align(a) => text.align = a,
+                    TextChange::Outline(on) => text.outline = on.then_some(Outline { colour: Colour([0, 0, 0]), width: 0.08 }),
+                    TextChange::OutlineWidth(w) => {
+                        if let Some(o) = &mut text.outline {
+                            o.width = w;
+                        }
+                    }
+                    TextChange::OutlineColour(c) => {
+                        if let Some(o) = &mut text.outline {
+                            o.colour = c;
+                        }
+                    }
+                    TextChange::Shadow(on) => text.shadow = on,
+                }
+            }
             // On an overlay a keyframe holds both where it is and its look.
             EffectMsg::Key => {
                 self.edit.checkpoint();
@@ -279,6 +339,64 @@ impl App {
                 self.goto(cut, t, false);
             }
         }
+    }
+
+    /// The selected overlay's text, if it's a text overlay.
+    fn selected_text(&mut self) -> Option<&mut crate::text::Text> {
+        let i = self.selected_overlay?;
+        self.edit.overlays.first_mut()?.items.get_mut(i)?.text.as_mut()
+    }
+
+    /// The text panel, in a window of its own while a text overlay is
+    /// selected: its words and look, wherever the playhead is (where it is
+    /// and its effects stay in the Effects panel).
+    pub(super) fn text_panel(&self) -> Option<Element<'_, Message>> {
+        let i = self.selected_overlay?;
+        let words = self.edit.overlays.first()?.items.get(i)?.text.as_ref()?;
+        let t = |c: TextChange| Message::Effect(EffectMsg::Text(c));
+        let swatches = |chosen: Colour, f: fn(Colour) -> TextChange| {
+            let mut r = row![].spacing(4);
+            for c in SWATCHES {
+                let colour = iced::Color::from_rgb8(c[0], c[1], c[2]);
+                let on = chosen.0 == c;
+                r = r.push(
+                    button(iced::widget::space().width(16).height(16))
+                        .padding(0)
+                        .style(move |theme: &iced::Theme, _| button::Style {
+                            background: Some(colour.into()),
+                            border: iced::Border { color: if on { theme.extended_palette().primary.strong.color } else { iced::Color::from_rgba(0.5, 0.5, 0.5, 0.6) }, width: if on { 2.5 } else { 1.0 }, radius: 3.0.into() },
+                            ..button::Style::default()
+                        })
+                        .on_press(Message::Effect(EffectMsg::Text(f(Colour(c))))),
+                );
+            }
+            r
+        };
+        let families = crate::text::families();
+        let mut controls = column![
+            text("Text").size(16),
+            iced::widget::text_editor(&self.text_content).placeholder("Type the text here").height(80).on_action(|a| Message::Effect(EffectMsg::TextEdit(a))),
+            row![
+                pick_list(families, Some(words.font.clone()), |f| Message::Effect(EffectMsg::Text(TextChange::Font(f)))).width(Length::Fill),
+                iced::widget::checkbox(words.bold).label("Bold").on_toggle(move |b| Message::Effect(EffectMsg::Text(TextChange::Bold(b)))),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            row![text("Size").width(Length::Fill), text(format!("{:.0} %", words.size * 100.0)).size(13)],
+            slider(0.02..=0.3, words.size, move |v| Message::Effect(EffectMsg::Text(TextChange::Size(v)))).step(0.005).on_release(Message::Effect(EffectMsg::Done)),
+            row![text("Lines").width(Length::Fill), pick_list(&TextAlign::ALL[..], Some(words.align), move |a| t(TextChange::Align(a))).width(110)].align_y(Alignment::Center),
+            text("Colour"),
+            swatches(words.colour, TextChange::Colour),
+            iced::widget::checkbox(words.shadow).label("Shadow").on_toggle(move |b| Message::Effect(EffectMsg::Text(TextChange::Shadow(b)))),
+            iced::widget::checkbox(words.outline.is_some()).label("Outline").on_toggle(move |b| Message::Effect(EffectMsg::Text(TextChange::Outline(b)))),
+        ]
+        .spacing(6);
+        if let Some(o) = words.outline {
+            controls = controls.push(row![text("Outline width").width(Length::Fill), text(format!("{:.0} %", o.width * 100.0)).size(13)]);
+            controls = controls.push(slider(0.01..=0.3, o.width, move |v| Message::Effect(EffectMsg::Text(TextChange::OutlineWidth(v)))).step(0.005).on_release(Message::Effect(EffectMsg::Done)));
+            controls = controls.push(swatches(o.colour, TextChange::OutlineColour));
+        }
+        Some(container(scrollable(controls.padding(12))).width(Length::Fill).height(Length::Fill).into())
     }
 
     /// Neutralises the playing cut's colour cast from `rgb`, the median of
@@ -383,9 +501,8 @@ impl App {
                 tooltip::Position::Left,
             )
         };
-        let body = column![
-            text("Effects").size(18),
-            text(cut_name).size(13),
+        let body = column![text("Effects").size(18), text(cut_name).size(13)].spacing(10).padding(12);
+        let body = body.extend([column![
             sliders,
             keys,
             tools,
@@ -395,7 +512,7 @@ impl App {
             fade("Fade out", fades.fade_out, EffectMsg::FadeOut, "To black at the end of the edit, the sound with it"),
         ]
         .spacing(10)
-        .padding(12);
+        .into()]);
         container(scrollable(body)).width(WIDTH).height(Length::Fill).into()
     }
 }

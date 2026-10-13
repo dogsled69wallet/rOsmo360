@@ -68,6 +68,9 @@ modules:
       - install -Dm644 rosmo360.png /app/share/icons/hicolor/256x256/apps/rosmo360.png
       - install -Dm644 io.github.ravelund.rOsmo360.metainfo.xml /app/share/metainfo/io.github.ravelund.rOsmo360.metainfo.xml
       - install -Dm644 -t /app/share/licenses/rosmo360 LICENSE-MIT LICENSE-APACHE
+      # The built-in fonts are inside the binary; their licences beside it.
+      - for d in fonts/*/; do install -Dm644 -t /app/share/licenses/rosmo360/fonts/$(basename $d) $d*.txt; done
+      - install -Dm644 -t /app/share/licenses/rosmo360/fonts fonts/README.md
     sources:
       - type: file
         path: ../../target/jammy/release/rosmo360
@@ -85,3 +88,6 @@ modules:
         path: ../../LICENSE-MIT
       - type: file
         path: ../../LICENSE-APACHE
+      - type: dir
+        path: ../../fonts
+        dest: fonts

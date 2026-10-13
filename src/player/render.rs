@@ -291,7 +291,7 @@ mod tests {
         for _ in 0..2 {
             rgba.extend([255, 0, 0, 255, 255, 0, 0, 255, 0, 128, 0, 128, 0, 128, 0, 128]);
         }
-        let picture = Arc::new(overlay::Picture { width: 4, height: 2, rgba });
+        let picture = Arc::new(overlay::Picture { width: 4, height: 2, rgba, natural: None });
         let place = Place { x: 0.4, y: 0.6, size: 0.5, rotation: 20.0 };
         let grade = crate::grade::Grade { opacity: 0.8, saturation: -0.5, ..Default::default() };
         let draw = gpu::OverlayDraw { id: 1, picture: picture.clone(), place, grade, black: 0.25 };
@@ -319,7 +319,7 @@ mod tests {
         };
         let mut want = render(&[]);
         let got = render(&[draw]);
-        overlay::composite(&mut want, &picture, &Quad::new(&place, (4, 2), (w, h)), &grade, 0.25);
+        overlay::composite(&mut want, &picture, &Quad::new(&place, &picture, (w, h)), &grade, 0.25);
         let diff: Vec<i32> = want.rgb.iter().zip(&got.rgb).map(|(a, b)| (*a as i32 - *b as i32).abs()).collect();
         let big = diff.iter().filter(|&&d| d > 8).count();
         let mean = diff.iter().sum::<i32>() as f64 / diff.len() as f64;

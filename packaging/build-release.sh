@@ -22,6 +22,9 @@ mkdir -p "$pkg"
 cp "$exe" packaging/install.sh packaging/rOsmo360.desktop packaging/rosmo360.png \
     packaging/rosmo360.svg README.md LICENSE-MIT LICENSE-APACHE "$pkg/"
 chmod 755 "$pkg/rosmo360" "$pkg/install.sh"
+# The built-in fonts are inside the binary; their licences go beside it.
+for d in fonts/*/; do mkdir -p "$pkg/fonts/$(basename "$d")" && cp "$d"*.txt "$pkg/fonts/$(basename "$d")/"; done
+cp fonts/README.md "$pkg/fonts/"
 tar -czf "$dist/rosmo360-x86_64-linux.tar.gz" -C "$dist" rosmo360-x86_64-linux
 cp packaging/install.sh "$dist/install.sh"
 
@@ -34,6 +37,8 @@ cp packaging/AppRun "$app/AppRun" && chmod 755 "$app/AppRun"
 cp packaging/rOsmo360.desktop "$app/" && cp packaging/rOsmo360.desktop "$app/usr/share/applications/"
 cp packaging/rosmo360.png "$app/" && cp packaging/rosmo360.png "$app/usr/share/icons/hicolor/256x256/apps/"
 ln -s rosmo360.png "$app/.DirIcon"
+for d in fonts/*/; do mkdir -p "$app/usr/share/licenses/rosmo360/fonts/$(basename "$d")" && cp "$d"*.txt "$app/usr/share/licenses/rosmo360/fonts/$(basename "$d")/"; done
+cp fonts/README.md "$app/usr/share/licenses/rosmo360/fonts/"
 tool=target/appimagetool-x86_64.AppImage
 if [ ! -x "$tool" ]; then
     curl -fsSL https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -o "$tool"

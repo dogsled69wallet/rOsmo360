@@ -4054,6 +4054,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "clap",
+ "cosmic-text",
  "cpal",
  "iced",
  "image",

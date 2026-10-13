@@ -13,6 +13,7 @@ mod sheet;
 mod sky;
 mod stab;
 mod stitch;
+mod text;
 mod track;
 mod view;
 

@@ -758,7 +758,7 @@ fn draw_rows(frame: &mut Frame, theme: &Theme, b: Rectangle, top: f32, keys: &st
         frame.fill(&Path::rectangle(Point::new(0.0, y + 1.0), Size::new(b.width, h - 2.0)), palette.background.weak.color.scale_alpha(0.25));
         frame.fill_text(Text {
             content: name.to_owned(),
-            position: Point::new(PICK + 2.0, y + h / 2.0),
+            position: Point::new(PICK + 12.0, y + h / 2.0),
             color: palette.background.base.text.scale_alpha(0.35),
             size: 10.0.into(),
             align_y: Vertical::Center,

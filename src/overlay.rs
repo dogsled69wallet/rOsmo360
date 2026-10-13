@@ -29,8 +29,13 @@ pub struct Lane {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Item {
-    /// The picture; a relative path is relative to the project file.
+    /// The picture; a relative path is relative to the project file. Empty
+    /// for text.
+    #[serde(default, skip_serializing_if = "is_empty_path")]
     pub input: PathBuf,
+    /// Text drawn as its picture, instead of a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<crate::text::Text>,
     /// Where it starts on the edit, in seconds.
     pub at: f64,
     /// In and out points in its own time (a picture's start at 0).
@@ -46,7 +51,37 @@ pub struct Item {
     pub effects: Vec<EffectKey>,
 }
 
+fn is_empty_path(p: &Path) -> bool {
+    p.as_os_str().is_empty()
+}
+
 impl Item {
+    /// Its picture: the file's, or its text drawn for a frame `height`
+    /// pixels high (`most` caps a file's size). Also the text's missing
+    /// font, if any.
+    pub fn picture(&self, most: usize, height: usize) -> Result<(Picture, Option<String>)> {
+        match &self.text {
+            Some(text) => Ok(crate::text::render(text, height)),
+            None => Ok((Picture::load(&self.input, most)?, None)),
+        }
+    }
+
+    /// Tells its picture apart from others': the file, or the text drawn.
+    pub fn key(&self) -> String {
+        match &self.text {
+            Some(text) => format!("text:{}", serde_json::to_string(text).unwrap_or_default()),
+            None => format!("file:{}", self.input.display()),
+        }
+    }
+
+    /// A name for it: the file's, or its text's first line.
+    pub fn name(&self) -> String {
+        match &self.text {
+            Some(text) => text.content.lines().next().unwrap_or("").to_owned(),
+            None => self.input.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned()),
+        }
+    }
+
     /// Where it ends on the edit.
     pub fn ends(&self) -> f64 {
         self.at + self.end - self.start
@@ -167,6 +202,9 @@ pub struct Picture {
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<u8>,
+    /// Its own size on the frame, as a share of the frame's height (text,
+    /// drawn for it); `None` fits the frame.
+    pub natural: Option<f64>,
 }
 
 impl std::fmt::Debug for Picture {
@@ -186,7 +224,7 @@ impl Picture {
         let k = (most as f64 / w.max(h) as f64).min(1.0);
         let size = (((w as f64 * k).round() as u32).max(1), ((h as f64 * k).round() as u32).max(1));
         let rgba = ffmpeg::picture_rgba(input, flat, size)?;
-        Ok(Picture { width: size.0 as usize, height: size.1 as usize, rgba })
+        Ok(Picture { width: size.0 as usize, height: size.1 as usize, rgba, natural: None })
     }
 
     /// Premultiplied RGBA 0..1 at picture point (`u`, `v`) in pixels,
@@ -219,11 +257,16 @@ pub struct Quad {
 }
 
 impl Quad {
-    /// `place` for a picture `picture` big (its shape) on a frame `frame` big.
-    pub fn new(place: &Place, picture: (usize, usize), frame: (usize, usize)) -> Quad {
-        let (pw, ph) = (picture.0.max(1) as f64, picture.1.max(1) as f64);
+    /// `place` for `picture` on a frame `frame` big: sized to fit the
+    /// frame, or (text) to its own share of the frame's height.
+    pub fn new(place: &Place, picture: &Picture, frame: (usize, usize)) -> Quad {
+        let (pw, ph) = (picture.width.max(1) as f64, picture.height.max(1) as f64);
         let (fw, fh) = (frame.0 as f64, frame.1 as f64);
-        let fit = (fw / pw).min(fh / ph) * place.size.max(0.0);
+        let base = match picture.natural {
+            Some(share) => share * fh / ph,
+            None => (fw / pw).min(fh / ph),
+        };
+        let fit = base * place.size.max(0.0);
         Quad { centre: [place.x * fw, place.y * fh], half: [pw * fit / 2.0, ph * fit / 2.0], turn: place.rotation.to_radians() }
     }
 
@@ -294,7 +337,8 @@ pub fn look(item: &Item, t: f64) -> (Place, Grade) {
 pub struct Burn<'a> {
     out: &'a mut dyn FrameSink,
     lanes: &'a [Lane],
-    pictures: Vec<(PathBuf, Arc<Picture>)>,
+    /// Each item's picture, by its `Item::key`.
+    pictures: Vec<(String, Arc<Picture>)>,
     fps: f64,
     fades: crate::project::Fades,
     length: f64,
@@ -306,10 +350,15 @@ impl<'a> Burn<'a> {
     /// (none drawn bigger than the frame needs more). With no lanes it
     /// passes frames on.
     pub fn new(out: &'a mut dyn FrameSink, lanes: &'a [Lane], size: (usize, usize), fps: f64, fades: crate::project::Fades, length: f64) -> Result<Self> {
-        let mut pictures: Vec<(PathBuf, Arc<Picture>)> = Vec::new();
+        let mut pictures: Vec<(String, Arc<Picture>)> = Vec::new();
         for item in lanes.iter().flat_map(|l| &l.items) {
-            if !pictures.iter().any(|(p, _)| *p == item.input) {
-                pictures.push((item.input.clone(), Arc::new(Picture::load(&item.input, 2 * size.0.max(size.1))?)));
+            let key = item.key();
+            if !pictures.iter().any(|(k, _)| *k == key) {
+                let (picture, missing) = item.picture(2 * size.0.max(size.1), size.1)?;
+                if let Some(font) = missing {
+                    eprintln!("the font {font} isn't here; its text is in Inter");
+                }
+                pictures.push((key, Arc::new(picture)));
             }
         }
         Ok(Burn { out, lanes, pictures, fps, fades, length, n: 0 })
@@ -327,9 +376,10 @@ impl FrameSink for Burn<'_> {
         let mut frame = Frame { width: frame.width, height: frame.height, rgb: frame.rgb.clone() };
         let black = self.fades.black(t, self.length);
         for item in showing {
-            let picture = &self.pictures.iter().find(|(p, _)| *p == item.input).unwrap().1;
+            let key = item.key();
+            let picture = &self.pictures.iter().find(|(k, _)| *k == key).unwrap().1;
             let (place, grade) = look(item, t);
-            let quad = Quad::new(&place, (picture.width, picture.height), (frame.width, frame.height));
+            let quad = Quad::new(&place, picture, (frame.width, frame.height));
             composite(&mut frame, picture, &quad, &grade, black);
         }
         self.out.write(&frame)
@@ -341,7 +391,7 @@ mod tests {
     use super::*;
 
     fn item(at: f64, len: f64) -> Item {
-        Item { input: "a.png".into(), at, start: 0.0, end: len, motion: Vec::new(), effects: Vec::new() }
+        Item { input: "a.png".into(), text: None, at, start: 0.0, end: len, motion: Vec::new(), effects: Vec::new() }
     }
 
     #[test]
@@ -362,7 +412,8 @@ mod tests {
         assert!((place_at(&keys, 1.0).x - 0.4).abs() < 1e-9);
         assert_eq!(place_at(&[], 1.0), Place::default());
         // A square picture fills the height of a 16:9 frame, centred.
-        let q = Quad::new(&Place::default(), (100, 100), (1920, 1080));
+        let square = Picture { width: 100, height: 100, rgba: vec![0; 40000], natural: None };
+        let q = Quad::new(&Place::default(), &square, (1920, 1080));
         assert_eq!((q.centre, q.half), ([960.0, 540.0], [540.0, 540.0]));
         // Turned a quarter clockwise, its top edge points right.
         let q = Quad { turn: std::f64::consts::FRAC_PI_2, ..q };
@@ -376,9 +427,9 @@ mod tests {
     #[test]
     fn composite_blends_by_alpha_and_opacity() {
         // A 2×2 half-transparent white picture over grey, filling the frame.
-        let picture = Picture { width: 2, height: 2, rgba: [128u8, 128, 128, 128].repeat(4) };
+        let picture = Picture { width: 2, height: 2, rgba: [128u8, 128, 128, 128].repeat(4), natural: None };
         let mut frame = Frame { width: 4, height: 4, rgb: vec![100; 48] };
-        let quad = Quad::new(&Place::default(), (2, 2), (4, 4));
+        let quad = Quad::new(&Place::default(), &picture, (4, 4));
         composite(&mut frame, &picture, &quad, &Grade::default(), 0.0);
         assert!((frame.rgb[5 * 3] as i32 - 178).abs() <= 1, "{}", frame.rgb[5 * 3]);
         let mut frame = Frame { width: 4, height: 4, rgb: vec![100; 48] };

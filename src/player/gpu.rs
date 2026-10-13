@@ -388,7 +388,7 @@ impl Pipeline {
                 slot.bind_group = bind_overlay(device, &self.overlay_layout, &slot.uniforms, &self.sampler, &slot.texture);
                 slot.picture = d.id;
             }
-            let q = Quad::new(&d.place, (pic.width, pic.height), (size[0].round() as usize, size[1].round() as usize));
+            let q = Quad::new(&d.place, pic, (size[0].round() as usize, size[1].round() as usize));
             let f = |v: f64| v as f32;
             let (s, c) = q.turn.sin_cos();
             // Its opacity and fade are applied on their own, after the grade.
