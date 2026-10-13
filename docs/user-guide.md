@@ -1,6 +1,6 @@
 # rOsmo360 user guide
 
-rOsmo360 plays and edits 360° video from the **DJI Osmo 360**. It reads the camera's `.OSV` files directly, stitches the two lenses, keeps the horizon level, and lets you look around, cut clips together, move the camera's view with keyframes, add crossfades, music and colour effects, and export a finished video.
+rOsmo360 plays and edits 360° video from the **DJI Osmo 360**. It reads the camera's `.OSV` files directly, stitches the two lenses, keeps the horizon level, and lets you look around, cut clips together, move the camera's view with keyframes, add crossfades, music, colour effects, titles and logos, and export a finished video. Ordinary videos (from a phone, a drone or an action camera) and photos go in the same edit.
 
 Part 1 walks through the app itself; everything there is done with the mouse and keyboard. Part 2 covers the command line, for batches, scripts and a few extra tools. For building rOsmo360 from source, see the [README](../README.md).
 
@@ -17,18 +17,19 @@ Part 1: Using rOsmo360
 7. [Keyframes: moving the camera](#7-keyframes-moving-the-camera)
 8. [Crossfades](#8-crossfades)
 9. [Music and sound](#9-music-and-sound)
-10. [Effects: colour and fades](#10-effects-colour-and-fades)
-11. [Framing: the aspect lock](#11-framing-the-aspect-lock)
-12. [Projects](#12-projects)
-13. [Exporting video](#13-exporting-video)
-14. [Saving photos](#14-saving-photos)
-15. [Keyboard shortcuts](#15-keyboard-shortcuts)
-16. [Tips and troubleshooting](#16-tips-and-troubleshooting)
+10. [Effects: colour, opacity and fades](#10-effects-colour-opacity-and-fades)
+11. [Titles and overlays](#11-titles-and-overlays)
+12. [Framing: the aspect lock](#12-framing-the-aspect-lock)
+13. [Projects](#13-projects)
+14. [Exporting video](#14-exporting-video)
+15. [Saving photos](#15-saving-photos)
+16. [Keyboard shortcuts](#16-keyboard-shortcuts)
+17. [Tips and troubleshooting](#17-tips-and-troubleshooting)
 
 Part 2: Advanced
 
-17. [The command line](#17-the-command-line)
-18. [The clip cache](#18-the-clip-cache)
+18. [The command line](#18-the-command-line)
+19. [The clip cache](#19-the-clip-cache)
 
 ---
 
@@ -53,6 +54,7 @@ For the install script and the AppImage, install `ffmpeg` from your distribution
 ### What you need
 
 - Clips from the Osmo 360 (`.OSV`). Copy the `.LRF` file that the camera records next to each clip as well. It's a small preview version, and rOsmo360 uses it for smooth playback, scrubbing and thumbnails.
+- If you like, ordinary videos and photos to mix in: MP4, MOV, MKV and the like, and JPG, PNG, WebP, BMP or TIFF (see [Ordinary videos and photos](#ordinary-videos-and-photos)).
 - A GPU with up-to-date drivers (Vulkan on Linux). It decodes the video, draws the view and renders exports.
 
 ### Opening clips
@@ -61,23 +63,23 @@ Start **rOsmo360** from your application menu.
 
 ![The start screen: the Vibing with Ravelund logo, and the buttons Open clips…, Open project… and Add music…](guide/start.jpg)
 
-**Open clips…** picks one or more clips; **Open project…** opens a saved edit; **Add music…** starts a project from a song (see [Music and sound](#9-music-and-sound)). A bar shows how far loading has got. The first time, a clip takes a while to open, longest from a network drive or a spinning disk, because rOsmo360 reads the camera's motion data from all through the file. It remembers what it read, so the same clip opens almost at once after that, in any project.
+**Open clips…** picks one or more clips (Osmo clips, ordinary videos or photos); **Open project…** opens a saved edit; **Add music…** starts a project from a song (see [Music and sound](#9-music-and-sound)). A bar shows how far loading has got. The first time, a clip takes a while to open, longest from a network drive or a spinning disk, because rOsmo360 reads the camera's motion data from all through the file. It remembers what it read, so the same clip opens almost at once after that, in any project.
 
 The first clip starts playing as soon as it has loaded; the others load behind it.
 
 ## 2. The window
 
-![The rOsmo360 editor: a view over a cairn on a ridge and a lake below glaciers, with the timeline of four cuts underneath, crossfades between them, and a soundtrack lane with its waveform below the seek bar](guide/editor.jpg)
+![The rOsmo360 editor: a view over a cairn on a ridge with a title over it, and underneath the timeline: a Text and an Overlay lane, four cuts with crossfades between them, their keyframe rows, the seek bar and a soundtrack lane with its waveform](guide/editor.jpg)
 
 From top to bottom:
 
 1. **The top bar**: projects, clips, the export, and what is playing.
 
-   ![The top bar: icons for new project, add clips, add music, open project, save and save as; Aspect 16:9; the export icon, 1080p, the Clips and Resolve checkboxes, the clip's name, and two dimmed status icons](guide/top-bar.png)
+   ![The top bar: icons for new project, add clips, add music, add overlay pictures, add text, open project, save and save as; Aspect 16:9; the export icon, 1080p, the Clips and Resolve checkboxes, the clip's name, the audio meter, and two dimmed status icons](guide/top-bar.png)
 
-   The icons, from the left: **new project** (a page with a plus), **add clips** (a film strip with a plus), **add music** (a note with a plus), **open a project** (a folder), **save** (a diskette; dimmed when there's nothing new to save) and **save as** (a diskette with a pencil). Then the **Aspect** of the picture, and **export** (an arrow out of a tray) with its resolution and options. While an export or a colour track runs, its progress shows here, with a crossed circle to stop it.
+   The icons, from the left: **new project** (a page with a plus), **add clips** (a film strip with a plus), **add music** (a note with a plus), **add overlay pictures** (a picture with a plus) and **add text** (a T with a plus; see [Titles and overlays](#11-titles-and-overlays)), **open a project** (a folder), **save** (a diskette; dimmed when there's nothing new to save) and **save as** (a diskette with a pencil). Then the **Aspect** of the picture, and **export** (an arrow out of a tray) with its resolution and options. While an export or a colour track runs, its progress shows here, with a crossed circle to stop it.
 
-   On the right, two dimmed icons say what you're seeing (a film strip for the quick preview version, a picture for the full video, an hourglass while a sharp paused frame loads) and how the video is decoded (a lightning bolt when the GPU does it). Messages, such as where an export went, appear beside them.
+   On the right are the **audio meter** (see [The audio meter](#the-audio-meter)) and two dimmed icons that say what you're seeing (a film strip for the quick preview version, a picture for the full video, an hourglass while a sharp paused frame loads) and how the video is decoded (a lightning bolt when the GPU does it). Messages, such as where an export went, appear beside them.
 
 2. **The view**, where you look around.
 
@@ -85,13 +87,13 @@ From top to bottom:
 
    ![The transport row: play, save view, save 360°, the time, add and delete keyframe, the Ease and Follow pickers, the eyedropper, the Effects panel, crossfade, split, delete, undo, redo, the timeline zoom, mute and volume](guide/transport.png)
 
-   Next to the eyedropper are **Effects** (three sliders; opens the [Effects panel](#10-effects-colour-and-fades)) and **crossfade** (two overlapping frames; see [Crossfades](#8-crossfades)).
+   Next to the eyedropper are **Effects** (three sliders; opens the [Effects panel](#10-effects-colour-opacity-and-fades)) and **crossfade** (two overlapping frames; see [Crossfades](#8-crossfades)).
 
-4. **The timeline**: the cuts of your edit, with thumbnails; below them the seek bar with the keyframes; and below that the music lane.
+4. **The timeline**, from the top: the **Text** lane and the **Overlay** lane (once they have something in them, each with its own keyframe rows), the cuts of your edit with thumbnails, their **Effects** and **View** keyframe rows, the seek bar, and the music lane.
 
-   ![The timeline: four cuts with thumbnails and labels such as "0045 · 12.0 s" and "0026 · 10.0 s · world lock", crossed boxes where cuts crossfade, a light-blue sound line over the second cut and small purple effect marks; the seek bar with keyframe marks; and a green soundtrack lane with its waveform and an orange volume line](guide/timeline.png)
+   ![The timeline: a teal title block on the Text lane and an orange logo block on the Overlay lane, each with Effects and Motion rows; four cuts with thumbnails and labels such as "0045 · 12.0 s" and "0026 · 10.0 s · world lock", crossed boxes where cuts crossfade and a light-blue sound line; the Effects and View rows with keyframe marks; the seek bar; and a green soundtrack lane with its waveform and an orange volume line](guide/timeline.png)
 
-   On the cuts, an **X** marks a crossfade, a light-blue line a cut's own sound level, and small purple squares its effect keyframes. In the music lane, the orange line is the music's volume.
+   On the cuts, an **X** marks a crossfade and a light-blue line a cut's own sound level. Each track's keyframes sit in faint rows under it, named at the left: **View** for the camera's keyframes (see [Keyframes](#7-keyframes-moving-the-camera)), **Effects** for colour ([Effects](#10-effects-colour-opacity-and-fades)), and **Motion** for where an overlay is ([Titles and overlays](#11-titles-and-overlays)). In the music lane, the orange line is the music's volume.
 
 5. **The settings row**: stabilisation, projection, playback source, field of view, the levels of the clips' sound and the music, rolling-shutter correction, full resolution when paused, reset view (a turn-back arrow) and fullscreen (corners).
 
@@ -164,6 +166,16 @@ Each cut shows thumbnails of its footage, the view straight ahead. They fill in 
 
 A cut's label shows its clip and length, its stabilisation when it differs, and its note when there's room. Notes come from the project file, so whoever put the edit together can say what each cut is for; the player shows them but doesn't edit them yet.
 
+### Ordinary videos and photos
+
+Videos from a phone, a drone or an action camera, and photos, go on the timeline as cuts too: add them with **add clips** like any clip. They look and work the same as an Osmo cut: trim, split, move, keyframes, effects, crossfades, volume points and export. What differs:
+
+- **Framing is pan and zoom** within the picture, as there's no sphere to look around in. Drag to pan, scroll or the FOV slider to zoom; a keyframe holds that framing, and keyframes in a row make a pan or a slow zoom. A cut of one without keyframes shows the whole picture.
+- **No stabilisation, projection or follow**: their pickers show "—" and "Flat". Ordinary videos play as they were filmed, portrait ones upright.
+- **The playback source** shows the video's or photo's size. Videos play at up to 1920 px, and pausing swaps in the full size when it's bigger.
+- **Any frame rate**: a 60 fps phone video plays and exports at the edit's rate (the first Osmo clip's).
+- **Photos** have no length of their own: a new one is 5 seconds; trim it to any length. A slow zoom in over a photo (two keyframes) makes a still feel alive. Photos have no sound, and a PNG's see-through parts show black on the main track; for a logo, use the [overlay track](#11-titles-and-overlays) instead.
+
 ### Zooming the timeline
 
 With a long edit, short cuts and close keyframes get narrow. Zoom in:
@@ -172,7 +184,7 @@ With a long edit, short cuts and close keyframes get narrow. Zoom in:
 - **Ctrl+=** / **Ctrl+−**, or the magnifier icons and the slider between them, zoom around the playhead.
 - **Ctrl+0**, or the arrows-to-both-ends icon, shows the whole edit again.
 
-![The timeline zoomed in on the end of the first cut and the start of the second: thumbnails of the rock tower and the rock dome, the seek bar with two keyframe squares, and a scrollbar underneath](guide/timeline-zoomed.png)
+![The timeline zoomed in on the end of the first cut and the start of the second: rock thumbnails, the crossfade's X, the second cut's light-blue sound line, the View row's keyframe marks, the seek bar, and a scrollbar underneath](guide/timeline-zoomed.png)
 
 When zoomed in, a scrollbar appears under the seek bar. Drag it, use Shift+scroll, or scroll sideways on a touchpad to move along. While playing, the timeline scrolls along to keep the playhead in sight.
 
@@ -181,7 +193,7 @@ When zoomed in, a scrollbar appears under the seek bar. Drag it, use Shift+scrol
 A **keyframe** remembers a view at a moment of a cut: where it looks (yaw, pitch, roll), the zoom, and the projection. Between keyframes the view moves smoothly from one to the next. That's how you make pans, slow zooms and morphs into a little planet.
 
 1. Go to the moment where the move should start, and frame the view.
-2. Press **K**, or the diamond-with-a-plus icon. A mark appears on the seek bar.
+2. Press **K**, or the diamond-with-a-plus icon. A mark appears in the cut's **View** row, under its thumbnails.
 3. Go to where the move should end, frame the new view, and press **K** again.
 4. Play it back.
 
@@ -189,12 +201,12 @@ More:
 
 - **Update a keyframe**: go to it and press K again with the new view.
 - **Jump between keyframes**: `[` and `]`, or click a mark.
-- **Retime a keyframe**: drag its mark along the seek bar.
+- **Retime a keyframe**: drag its mark along the View row.
 - **Delete a keyframe**: go to it and press **Delete**, or the crossed-diamond icon.
 
 **Following and looking.** After you play, seek or change a keyframe, the view follows the keyframes. As soon as you look around by hand, you take over from the view they showed, until the next play or seek. So you can always look around freely without changing anything; only K saves a view.
 
-**Cuts without keyframes** hold the view the edit had last: the view at the end of the nearest cut before them that has keyframes. The export frames them the same way. If no earlier cut has keyframes, they show whatever view you look at, and an export from the player frames them as you see them. The project file doesn't remember that view, though (the command line exports such cuts looking straight ahead), so press K in the first cut to keep it.
+**Cuts without keyframes** hold the view the edit had last: the view at the end of the nearest cut before them that has keyframes. The export frames them the same way. If no earlier cut has keyframes, they show whatever view you look at, and the export and the saved project keep that view: saving gives the first such cut a keyframe of it (you'll see it there when you open the project again). Ordinary videos and photos keep their own framing apart from Osmo cuts, each one its own.
 
 Keyframes belong to their cut and stay pinned to the footage. Moving or trimming a cut keeps its camera moves on the same moments. Keyframes trimmed off the end are kept for when you extend the cut again.
 
@@ -208,7 +220,7 @@ Each keyframe also says how the view travels from it to the *next* one. Choose i
 | **Linear** | ● | Moves at a steady speed. Good for an even pan, or for several keyframes in a row that should feel like one move. |
 | **Hold** | ■ | Stays still, then jumps to the next keyframe's view when the playhead gets there. A cut to a new angle within one cut. |
 
-![The playhead on a linear keyframe (a circle on the seek bar); the Ease picker shows Linear](guide/keyframe-ease.png)
+![The playhead on a linear keyframe (a circle in the View row); the Ease picker shows Linear](guide/keyframe-ease.png)
 
 Two common patterns:
 
@@ -220,7 +232,7 @@ Two common patterns:
 A keyframe can **follow the selfie stick** instead of looking in a fixed direction. The stick points at whoever holds it, so the view keeps you in the picture as you walk, turn and move the stick, like a drone following from above and behind. rOsmo360 knows where the stick points from the camera's own motion data, so it keeps working even when the stick points straight down.
 
 1. Frame the shot you want around yourself: for example tilt the view up a little from the stick so the trail ahead shows too, and widen it (FOV 100 or so).
-2. Press **K**, then choose **Stick** in the **Follow** picker. The view stays as it is: the keyframe now keeps it as an offset from the stick. Its mark on the seek bar gets a ring.
+2. Press **K**, then choose **Stick** in the **Follow** picker. The view stays as it is: the keyframe now keeps it as an offset from the stick. Its mark in the View row gets a ring.
 3. Play. Keyframes you add after it follow too, until you set one back to **Fixed**. A move from a following keyframe to a fixed one, or back, eases over as usual.
 
 To follow **someone or something else**, such as a friend in a red jacket, track it by its colour:
@@ -277,6 +289,12 @@ Two sliders in the settings row set the mix, in dB (0 is as recorded, and the fa
 
 The speaker slider in the transport row is only how loud you listen; it doesn't change the export.
 
+### The audio meter
+
+The meter on the right of the top bar shows the mix as it plays: a bar each for left and right, the faint part the peaks and the solid part the average (RMS). It turns yellow from −6 dB and red past 0 dBFS, where the export's sound would clip; a mark holds each recent peak a moment. The number beside it is the loudest peak since you pressed play, in dBFS, and stays there after you pause, red if it went over 0.
+
+It measures what the export mixes: the clips' sound and the music at their levels, volume points and crossfades included, whatever the speaker slider and mute are set to. If it goes red, lower **Clip sound** or **Music** a little, or dip the loud stretch with a volume point.
+
 ### Volume points
 
 For a level that changes over time, such as music dipping under someone talking, add **volume points**.
@@ -288,11 +306,11 @@ For a level that changes over time, such as music dipping under someone talking,
 
 The level runs in a straight line between points, and stays at the first and last point's level before and after them. Points work on top of the sliders, so the slider still turns everything up or down together.
 
-## 10. Effects: colour and fades
+## 10. Effects: colour, opacity and fades
 
-Click **Effects** (three sliders) in the transport row, or press **G**, to open the Effects panel beside the view. It shows the effects of the cut under the playhead.
+Click **Effects** (three sliders) in the transport row, or press **G**, to open the Effects panel beside the view. It shows the effects of the cut under the playhead, or of the selected title or overlay while it's showing (see [Titles and overlays](#11-titles-and-overlays)).
 
-![The Effects panel for cut 1: sliders for Exposure (+0.15 EV), Contrast, Highlights (−0.30), Shadows (+0.15), Temperature (+0.08), Tint, Saturation, Vibrance (+0.25) and Vignette (0.25), each with its value and a reset arrow, and below them the add-keyframe and delete-keyframe icons and the Ease picker](guide/effects-panel.png)
+![The Effects panel for cut 1: sliders for Exposure (+0.15 EV), Contrast, Highlights (−0.30), Shadows (+0.15), Temperature (+0.08), Tint, Saturation, Vibrance (+0.25), Vignette (0.25) and Opacity (100 %), each with its value and a reset arrow; below them the add-keyframe and delete-keyframe icons, the Ease picker, white balance, to all cuts and reset; and the edit's Fade in and Fade out](guide/effects-panel.png)
 
 | Effect | What it does |
 |---|---|
@@ -305,6 +323,7 @@ Click **Effects** (three sliders) in the transport row, or press **G**, to open 
 | **Saturation** | Less or more colour; all the way down is black and white |
 | **Vibrance** | More colour mostly where there's little, sparing what's already colourful |
 | **Vignette** | Darker corners |
+| **Opacity** | How much shows: less fades the cut towards black (an overlay towards see-through) |
 
 The turn-back arrow next to a value sets it back to none. A little goes a long way: exposure ±0.3, highlights −0.3 under a bright sky, and some vibrance are often all a shot needs.
 
@@ -312,7 +331,7 @@ The turn-back arrow next to a value sets it back to none. A little goes a long w
 
 - Moving a slider sets the effect keyframe at the playhead, making one there if there isn't one. A cut with a single effect keyframe has that look all the way through; add another further on, with other values, and the look changes smoothly from one to the next.
 - The **add keyframe** icon in the panel adds one at the playhead without changing anything, and the **delete** icon removes the one there. The **Ease** picker sets how it moves on to the next: smooth, linear or hold.
-- On the timeline, effect keyframes are small purple squares along the bottom of their cut. Click one to jump to it.
+- On the timeline, effect keyframes are marks in the **Effects** row under their cut. Click one to jump to it.
 
 More in the panel:
 
@@ -321,9 +340,52 @@ More in the panel:
 - **Reset** (the turn-back arrow): removes all of this cut's effects.
 - **Fade in** and **Fade out**: fade the whole edit from black at its start and to black at its end, the sound with the picture.
 
+**Opacity** fades a cut out and in within the edit: ease it from 100% to 0% over a second for a fade to black between two cuts, or use it on a title or logo to fade it in and out. For the edit's own start and end, use the fades.
+
 Effects apply to the framed picture after stitching, so what you see in the player is what the export gives, and a crossfade blends two graded cuts. Press **G** again, or click the Effects icon, to close the panel.
 
-## 11. Framing: the aspect lock
+## 11. Titles and overlays
+
+Above the main picture are two more tracks: **Overlay**, for pictures such as a logo or a map, and **Text**, for titles and captions, on top of everything. Both are in edit time, like the music: they stay where they are on the timeline when you move or trim cuts.
+
+![The editor with a title selected: the Text panel at the left with the words "Kyrkja" and "July 2026", the font Bebas Neue, Size, Lines, colour swatches, Shadow and Outline; in the view the title with a box, corner squares and a turning knob around it](guide/text-panel.jpg)
+
+### Adding them
+
+- **Add text** (the T with a plus in the top bar) puts a title at the playhead, 5 seconds long, in bold white Inter with a soft shadow, and opens the **Text panel** at the left of the view.
+- **Add overlay pictures** (the picture with a plus) picks one or more pictures and puts them at the playhead, 5 seconds each, one after another. PNGs keep their see-through parts.
+
+On the timeline each item is a block: teal for text, orange for pictures. Click one to select it; drag it to move it and its edges to change how long it shows; **Delete** removes the selected one. Items on one lane never overlap: one pushed into another stops against it, and jumps past once you drag over halfway. Click the empty lane to deselect.
+
+### The Text panel
+
+With a title selected, the panel at the left of the view holds:
+
+- **The words**: type them in the box; Enter starts a new line.
+- **The font**, and **Bold** where the font has it. The first six come with rOsmo360 and are marked **built in**: they look the same on any computer. **Inter** (clean, the default), **Montserrat** (geometric), **Bebas Neue** (tall capitals for titles), **Playfair Display** (an elegant serif), **Caveat** (handwriting) and **Permanent Marker** (a marker pen). The rest of the list is your computer's own fonts; a project using one that another computer lacks shows Inter there, and says which font is missing.
+- **Size**, the letters' height as a share of the picture's.
+- **Lines**: left, centred or right, for text over several lines.
+- **Colour**, from the swatches.
+- **Shadow** (soft, behind the letters) and **Outline** with its width and colour. White with a shadow reads over most footage; an outline helps over busy, bright ground such as snow.
+
+The ✕ at the top closes it, deselecting the title.
+
+### Placing them
+
+Pause with a title or picture showing, and select it. A box with corner squares and a knob above it appears around it in the view:
+
+- **Drag it** to move it. Its centre snaps to the middle of the picture when it comes close.
+- **Drag a corner** to make it bigger or smaller, about its centre.
+- **Drag the knob** to turn it. Hold **Shift** to turn in 15° steps.
+- **Click another** title or picture in the view to select it (where it shows: the see-through parts of a picture don't count, so you can still look around past it).
+
+The same settings are sliders at the top of the [Effects panel](#10-effects-colour-opacity-and-fades) while an item is selected: **Across**, **Down**, **Size** and **Rotation**, with the item's own effects below them. Use **Opacity** there to fade a title in and out.
+
+**They move with keyframes.** Every change of place sets a **motion** keyframe at the playhead, shown in the item's **Motion** row; set a different place further on and the item moves there smoothly, eased like the camera's keyframes. The Effects panel's keyframe buttons and Ease picker act on the item's motion and effects together. A title with one keyframe stays put.
+
+Overlays are drawn over the graded picture, and the edit's fades cover them too. The export burns them in exactly as the player shows them; **Clips** export leaves them out, for the other editor to add.
+
+## 12. Framing: the aspect lock
 
 The **Aspect** picker in the top bar sets the shape of the picture: Free, 16:9, 9:16, 4:3, 1:1 or 2:1. The view is letterboxed to that shape, so you frame exactly what will be exported. Use 9:16 for phone video such as Reels, Shorts or TikTok:
 
@@ -331,15 +393,17 @@ The **Aspect** picker in the top bar sets the shape of the picture: Free, 16:9, 
 
 Exports and saved views take the same shape. With **Free**, exports are 16:9.
 
-## 12. Projects
+## 13. Projects
 
-A project saves the edit: the cuts, their keyframes, stabilisation, crossfades, effects and sound levels, the music, the fades, and the aspect lock.
+A project saves the edit: the cuts, their keyframes, stabilisation, crossfades, effects and sound levels, the music, the titles and overlays, the fades, and the aspect lock.
 
 - **Save**: Ctrl+S, or the diskette. **Save as**: Ctrl+Shift+S, or the diskette with a pencil.
 - **Open**: Ctrl+Shift+O, or the folder.
 - **New**: Ctrl+N, or the page with a plus, starts an empty project without closing the window. Clips you had open stay loaded, so adding them again is instant.
 
-**A project saves keyframes, not where you happen to be looking.** If you frame a cut by dragging the view but set no keyframe, the project doesn't keep that view: it opens looking straight ahead again. Press **K** to keyframe the view you want before saving; one keyframe at the start of the first cut is enough to frame cuts after it that have none (see [Keyframes](#7-keyframes-moving-the-camera)).
+**The view you framed is kept.** If you frame cuts by dragging the view but set no keyframe, saving gives the first of them a keyframe of that view, so the project opens, and exports, framed as you left it (see [Keyframes](#7-keyframes-moving-the-camera)).
+
+Changing the **Aspect** counts as a change to save too.
 
 The window title shows the project's name, with a dot (•) when there are unsaved changes. If you close the window, open another project or start a new one with unsaved changes, rOsmo360 asks whether to **Save**, **Don't save** or **Cancel**.
 
@@ -347,24 +411,24 @@ Clips in the project's folder, or in folders inside it, are remembered by relati
 
 A project starts playing as soon as its first cut's clip has loaded; the others load behind it, with the bar in the top bar. If playback reaches a cut whose clip isn't in yet, it waits there.
 
-## 13. Exporting video
+## 14. Exporting video
 
 1. Pick the resolution next to the export icon (an arrow out of a tray): 720p, 1080p (the default, good for sharing online), 1440p or 2160p (4K). It's the short side of the picture, so 1080p is 1920 × 1080 for 16:9, or 1080 × 1920 for 9:16.
 2. Set the shape with the **Aspect** picker.
 3. Click the export icon and choose where to save the MP4.
 
-The export renders the whole edit at full resolution, with the sound joined across the cuts and the music mixed in. Each cut uses its own keyframes, stabilisation and effects; crossfades, volume points, levels and the fades are applied; and the export follows the rolling-shutter setting. Progress shows in the top bar, with a crossed circle to stop it; a cancelled export leaves no half-finished file.
+The export renders the whole edit at full resolution, with the sound joined across the cuts and the music mixed in. Each cut uses its own keyframes, stabilisation and effects; crossfades, volume points, levels and the fades are applied; titles and overlays are drawn in; and the export follows the rolling-shutter setting. Progress shows in the top bar, with a crossed circle to stop it; a cancelled export leaves no half-finished file.
 
 Exports render on the GPU. On an RTX 3090 that's about 21 frames a second at 1080p, so a one-minute edit takes about a minute and a half. You can keep using the player while it runs.
 
 Two checkboxes next to the resolution change what gets written:
 
-- **Clips** writes each cut to its own file instead of one video, for finishing in another editor. Export then asks for a folder, and the files are named after the project: `My hike - 001.mp4`, `My hike - 002.mp4` and so on, in timeline order. Each piece of music is written beside them as `My hike - music 001.wav` and on (48 kHz, 24-bit). The clips are left for the other editor to finish: no crossfades, fades or sound levels, and the music unfaded at its own level. A **Graded** checkbox appears next to Clips: tick it to give the clips their effects, or leave it off to have them as shot, to grade in the other editor.
+- **Clips** writes each cut to its own file instead of one video, for finishing in another editor. Export then asks for a folder, and the files are named after the project: `My hike - 001.mp4`, `My hike - 002.mp4` and so on, in timeline order. Each piece of music is written beside them as `My hike - music 001.wav` and on (48 kHz, 24-bit). The clips are left for the other editor to finish: no crossfades, fades, sound levels, titles or overlays, and the music unfaded at its own level. A **Graded** checkbox appears next to Clips: tick it to give the clips their effects, or leave it off to have them as shot, to grade in the other editor.
 - **Resolve** writes DNxHR HQ video with uncompressed PCM sound in a `.mov`, instead of H.264 and AAC in an MP4. Use it for DaVinci Resolve: its free version on Linux can't read H.264, H.265 or AAC. The files are large, about 27 MB a second at 1080p (110 at 4K), as editing formats are.
 
 Both are remembered, and they combine: Clips and Resolve together give one `.mov` per cut, ready to drop into Resolve.
 
-## 14. Saving photos
+## 15. Saving photos
 
 Pause, then:
 
@@ -373,7 +437,7 @@ Pause, then:
 
 Both are rendered from fresh full-resolution frames, which takes a few seconds.
 
-## 15. Keyboard shortcuts
+## 16. Keyboard shortcuts
 
 | Key | Action |
 |---|---|
@@ -393,7 +457,7 @@ Both are rendered from fresh full-resolution frames, which takes a few seconds.
 | K | Add a keyframe here, or update the one here (with a song or a volume point selected: a volume point) |
 | J | Cycle the keyframe's ease: smooth, linear, hold |
 | `[` / `]` | Previous / next keyframe |
-| Delete | Delete the keyframe here (or the selected song or volume point) |
+| Delete | Delete the keyframe here (or the selected song, volume point, title or overlay) |
 | C | Split the cut at the playhead (or the selected song) |
 | G | Open or close the Effects panel |
 | Shift+Delete | Delete the selected cut |
@@ -405,26 +469,30 @@ Both are rendered from fresh full-resolution frames, which takes a few seconds.
 | Ctrl+S / Ctrl+Shift+S | Save the project / save as |
 | Ctrl+Shift+O | Open a project |
 | Esc | Cancel drawing a colour box |
+| Shift (turning an overlay) | Turn in 15° steps |
 
-With the mouse: drag in the view to look around, right-drag to roll, scroll to zoom. On the timeline, click to seek, click a keyframe mark to jump to it, drag a mark to retime it, drag a cut to move it or its edges to trim it, and scroll to zoom. **Shift**-drag a cut's left edge to set its crossfade, or a song onto its neighbour to crossfade them; **Ctrl**-click a cut or the music lane to add a volume point.
+With the mouse: drag in the view to look around, right-drag to roll, scroll to zoom. On the timeline, click to seek, click a keyframe mark to jump to it, drag a mark to retime it, drag a cut to move it or its edges to trim it, and scroll to zoom. **Shift**-drag a cut's left edge to set its crossfade, or a song onto its neighbour to crossfade them; **Ctrl**-click a cut or the music lane to add a volume point. Paused, drag a selected title or overlay in the view to move it, a corner to size it and the knob above it to turn it.
 
-## 16. Tips and troubleshooting
+Keys only work while you're not typing: in the Text panel's box, the keys type.
 
-- **Playback stutters.** Use the **Proxy (LRF)** source; it needs far less than the full `.OSV`, and through a crossfade the player decodes two cuts at once. If a clip has no `.LRF`, copy it from the camera's card; DJI records one next to every clip. Footage on an SSD plays and scrubs more smoothly than on a spinning disk or a network drive.
-- **Clips open slowly the first time.** That's rOsmo360 reading the camera's motion data; the second time the clip opens almost at once. To have a whole card ready before you start, see [the clip cache](#18-the-clip-cache).
+## 17. Tips and troubleshooting
+
+- **Playback stutters.** Use the **Proxy (LRF)** source; it needs far less than the full `.OSV`, and through a crossfade the player decodes two cuts at once. Ordinary videos play at up to 1920 px whatever the source says. If a clip has no `.LRF`, copy it from the camera's card; DJI records one next to every clip. Footage on an SSD plays and scrubs more smoothly than on a spinning disk or a network drive.
+- **Clips open slowly the first time.** That's rOsmo360 reading the camera's motion data; the second time the clip opens almost at once. To have a whole card ready before you start, see [the clip cache](#19-the-clip-cache).
 - **The paused picture keeps changing sharpness.** Turn off **Full res when paused** while keyframing.
 - **Something close to the camera looks doubled or cut at the edges.** That's the seam where the two lenses meet. rOsmo360 lines up close subjects and cuts cleanly where it can't, but a hand or face very close to the seam can still show it, most of all next to the selfie stick, where the two lenses overlap least. Turn the view so close subjects sit away from the sides of the camera.
 - **"World lock" starts tilted.** It holds the clip's first orientation. Use **Level** instead: it holds the direction but keeps the horizon level.
 - **No sound.** Check the speaker icon isn't showing muted (mute is remembered between runs). On Linux, sound goes through ALSA, which PipeWire and PulseAudio both provide.
 - **Export says it's stitching on the CPU.** No usable GPU was found, so it falls back to the slower CPU stitcher. Update your GPU drivers. The result looks the same.
-- **A saved project opens looking straight ahead.** The view you framed had no keyframe, and only keyframes are saved. Press **K** on the view you want, then save.
+- **The meter goes red.** The mix goes over 0 dBFS there and the export's sound would clip. Lower **Clip sound** or **Music**, or add a volume point to dip the loud stretch.
+- **A title shows in another font than you chose.** The project uses a font this computer doesn't have; rOsmo360 says which, and uses Inter. Pick one of the built-in fonts to have it look the same everywhere.
 - **Your settings** (stabilisation, playback source, rolling shutter, full res when paused, volume and mute, export resolution and options, and aspect) are remembered between runs.
 
 ---
 
 # Part 2: Advanced
 
-## 17. The command line
+## 18. The command line
 
 Everything the player does can also be done from a terminal, which is handy for batches and scripts, and a few tools exist only there. `rosmo360 --help` and `rosmo360 <command> --help` list every option. If you use the AppImage, write `./rOsmo360-x86_64.AppImage` where these say `rosmo360`; with the Flatpak, `flatpak run io.github.ravelund.rOsmo360`. The Flatpak has a `/tmp` of its own, so give it output paths elsewhere.
 
@@ -451,14 +519,23 @@ rosmo360 export edit.json --format resolve -o edit.mov         # for DaVinci Res
 
 `--handles` adds footage before and after each clip, where the camera recorded it, so another editor has room for its own transitions; the music's WAVs get the same handles from the song.
 
-**Preview** an edit or a clip as one image. For a project you get a row per cut, each tile framed as the export will frame it:
+**Preview** an edit or a clip as one image. For a project you get a row per cut, headed by where it starts in the edit, its number, its clip and its in and out points (`2:16.4 #23 0036 18.0-25.0`; the clip by the last digits of its file name). Each tile is framed as the export will frame it, with the titles and overlays drawn, and labelled with its edit time and clip time. With music, its waveform runs under each row, lined up with the tiles, so you see where the cuts fall on the song. Small tiles keep a long edit in one image:
 
 ```sh
 rosmo360 preview edit.json --every 2 -o check.png
+rosmo360 preview edit.json --tile 200 --columns 6 -o check.png  # a long edit, six moments a cut
 rosmo360 preview clip.OSV -o sheet.png                        # 24 moments of a clip, the whole sphere
 ```
 
-![A contact sheet of a four-cut project: rows of small framed views of a ridge, a rock tower, a boulder slope, a lake valley turning into an upward little planet, and a boulder field, each labelled with its cut number and time](guide/contact-sheet.jpg)
+![A contact sheet of a four-cut project: a row per cut headed like "0:11.0 #2 0034 40.0-52.0", with views of a rock tower under the title, a boulder slope, a lake valley turning into an upward little planet, and a boulder field, each tile labelled with its edit and clip time, a small logo in each corner, and the music's waveform in orange under each row](guide/contact-sheet.jpg)
+
+**Check an edit** for likely mistakes:
+
+```sh
+rosmo360 check edit.json
+```
+
+It lists, a line each with the edit time and cut: cuts out of the order they were filmed in, a cut showing footage the cut before already shows, crossfades between two cuts of one clip only seconds apart (one scene, so it looks like a stutter), pans faster than 30° a second (`--fast-pan` changes it), saying whether your keyframes or the camera's own turning make them (with Horizon, **Level** holds the view while the camera turns), cuts under a second, and music that ends before the edit does or runs far past it. Not all of them are mistakes; it's a list to look through.
 
 **Track a subject by colour**, the command-line version of the eyedropper (see [Follow](#follow-a-third-person-shot)):
 
@@ -468,7 +545,7 @@ rosmo360 track clip.OSV --colour "#c8302a" -s 40 -d 20 > friend.csv
 
 Then give a keyframe `"follow": "friend.csv"` in the project file. Read the colour off a preview or a saved photo. If something else nearby has the same colour, add `--near YAW,PITCH` with where the subject is at the start, as shown on a `--stabilize level` preview.
 
-**Find good moments**: `rosmo360 scan clip.OSV > scan.csv` gives, per second, where the camera points, how fast it turns or shakes, and how loud it is. Add `--image` for three columns from the picture: how much of the sky is open (`sky`), how high the skyline is around you (`skyline`, in degrees: near 0 on a summit, higher in a valley) and in how many directions you can see out to the horizon (`open`). Sort by `open` to find the panoramas. It needs the `.LRF` proxy and takes a little longer: about 20 s for a 13-minute clip. `rosmo360 info clip.OSV` prints the clip's length, frame rate and recording time.
+**Find good moments**: `rosmo360 scan clip.OSV > scan.csv` gives, per second, where the camera points, how fast it turns or shakes, and how loud it is. Give it a folder (or several clips) and an output folder, `rosmo360 scan ~/Videos/Hike -o scans/`, for a CSV per clip, four at a time. Add `--image` for three columns from the picture: how much of the sky is open (`sky`), how high the skyline is around you (`skyline`, in degrees: near 0 on a summit, higher in a valley) and in how many directions you can see out to the horizon (`open`). Sort by `open` to find the panoramas. It needs the `.LRF` proxy and takes a little longer: about 20 s for a 13-minute clip. `rosmo360 info clip.OSV` prints the clip's length, frame rate and recording time, and whether it's an Osmo clip, an ordinary video or a picture. `scan`, `track` and the other commands that need the camera's motion data work only on Osmo clips.
 
 **Stitch** whole clips or frames to equirectangular video or images, for other 360° tools:
 
@@ -477,11 +554,11 @@ rosmo360 render clip.OSV -s 48 -d 12 -w 3840 --stabilize horizon -o out.mp4
 rosmo360 stitch clip.OSV -t 10 -w 4096 --stabilize horizon -o frame.png
 ```
 
-Projects are small JSON files you can also write or change by hand; the [README](../README.md#usage) describes the project and reframe formats, including cut notes (`"note": "summit arrival"`), per-cut stabilisation, following keyframes, crossfades, effects, volume points, music and fades.
+Projects are small JSON files you can also write or change by hand; the [README](../README.md#usage) describes the project and reframe formats, including cut notes (`"note": "summit arrival"`), per-cut stabilisation, following keyframes, crossfades, effects, volume points, music, titles, overlays and fades.
 
-## 18. The clip cache
+## 19. The clip cache
 
-What rOsmo360 reads from a clip the first time, the calibration, the motion data and the timeline's thumbnails, is kept in a cache, so the next time the clip opens in a fraction of a second, in any project and from the command line too. (One 7-minute clip on a network share: 46 s the first time, 0.4 s after.) It recognises a clip by its contents, so moving or renaming footage doesn't matter, and a changed file is read afresh.
+What rOsmo360 reads from a clip the first time, the calibration, the motion data and the timeline's thumbnails, and each song's waveform, is kept in a cache, so the next time the clip opens in a fraction of a second, in any project and from the command line too. (One 7-minute clip on a network share: 46 s the first time, 0.4 s after.) It recognises a clip by its contents, so moving or renaming footage doesn't matter, and a changed file is read afresh.
 
 ```sh
 rosmo360 cache                                  # where it is, how many clips, how big

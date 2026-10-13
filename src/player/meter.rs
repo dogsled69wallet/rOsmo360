@@ -19,7 +19,7 @@ const FALL: f32 = 24.0;
 /// How long a peak's mark stays, seconds.
 const HOLD: f32 = 1.5;
 
-pub const WIDTH: f32 = 120.0;
+pub const WIDTH: f32 = 90.0;
 pub const HEIGHT: f32 = 14.0;
 
 pub struct Meter {

@@ -2818,7 +2818,7 @@ impl App {
                 tooltip::Position::Bottom,
             ),
             tip(icon_button(ADD_OVERLAY, Some(Message::AddOverlay)), text("Add pictures over the picture, at the playhead (PNG transparency shows through)"), tooltip::Position::Bottom),
-            tip(icon_button(ADD_TEXT, Some(Message::AddText)), text("Add text over the picture, at the playhead (typed in the Effects panel)"), tooltip::Position::Bottom),
+            tip(icon_button(ADD_TEXT, Some(Message::AddText)), text("Add text over the picture, at the playhead (typed in the Text panel at the left)"), tooltip::Position::Bottom),
             tip(icon_button(OPEN_PROJECT, Some(Message::OpenProject)), text("Open a saved edit (Ctrl+Shift+O)"), tooltip::Position::Bottom),
             tip(
                 icon_button(SAVE, self.unsaved().then_some(Message::SaveProject(false))),
@@ -2838,6 +2838,22 @@ impl App {
                 tooltip::Position::Bottom,
             ),
             space().width(Length::Fill),
+            // Beside what's playing: the transport row is full at the
+            // window's default width, and cut it off.
+            tip(
+                row![
+                    canvas(self.meter.view()).width(meter::WIDTH).height(meter::HEIGHT),
+                    // The loudest since play started, red past 0 dBFS.
+                    text(self.meter.loudest.map_or("–".to_string(), |l| if l > -48.0 { format!("{l:+.1}") } else { "–".to_string() }))
+                        .size(12)
+                        .width(34)
+                        .color_maybe(self.meter.loudest.filter(|&l| l >= 0.0).map(|_| iced::Color::from_rgb8(0xe5, 0x3e, 0x3e))),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+                text("The mix as it plays, left and right: peak (faint) and RMS, red past 0 dBFS; the number is the loudest peak since play started, dBFS. It sums the clip sound and music at their levels, as the export mixes them, whatever the speakers are set to."),
+                tooltip::Position::Bottom,
+            ),
             status
         ]
             .spacing(12)
@@ -3021,20 +3037,6 @@ impl App {
                 tooltip::Position::Top,
             ),
             slider(0.0..=1.0, self.volume(), Message::Volume).step(0.01f32).width(90),
-            tip(
-                row![
-                    canvas(self.meter.view()).width(meter::WIDTH).height(meter::HEIGHT),
-                    // The loudest since play started, red past 0 dBFS.
-                    text(self.meter.loudest.map_or("–".to_string(), |l| if l > -48.0 { format!("{l:+.1}") } else { "–".to_string() }))
-                        .size(12)
-                        .width(38)
-                        .color_maybe(self.meter.loudest.filter(|&l| l >= 0.0).map(|_| iced::Color::from_rgb8(0xe5, 0x3e, 0x3e))),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-                text("The mix as it plays, left and right: peak (faint) and RMS, red past 0 dBFS; the number is the loudest peak since play started, dBFS. It sums the clip sound and music at their levels, as the export mixes them, whatever the speakers are set to."),
-                tooltip::Position::Top,
-            ),
         ]
         .spacing(12)
         .padding([4, 10])
