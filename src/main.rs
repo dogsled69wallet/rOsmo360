@@ -1184,8 +1184,9 @@ fn is_project(input: &Path) -> bool {
 /// A contact sheet of a project: per cut, `columns` moments spread across
 /// it (or one every `every` seconds), framed as `export` frames them. Each
 /// cut starts a row, headed by its edit time, number, clip and span
-/// (`2:16 #23 0036 18.0-25.0`); each tile says its edit and clip time, and
-/// with music the mix's waveform runs under each row, lined up with the
+/// (`2:16 #23 0036 18.0-25.0`); each tile says its edit and clip time and
+/// shows the overlays and text there, and with music the mix's waveform
+/// runs under each row, lined up with the
 /// tiles. Blank tiles fill out the last. Returns the sheet and how many
 /// tiles it shows.
 fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<f64>, tile: usize, columns: usize, proxy: bool) -> Result<(stitch::Frame, usize)> {
@@ -1237,6 +1238,9 @@ fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<
         shots.extend(times.iter().map(|&t| Some((n, i, p.snap(t).clamp(cut.start, cut.end)))));
         shots.extend((times.len()..row_end).map(|_| None));
     }
+    // Overlays and text as the export burns them in, so a title's place
+    // shows on the sheet; the tiles leave out the edit's fades, so do they.
+    let overlays = overlay::Overlays::new(project.overlays.iter().chain(&project.text).collect(), size, Default::default(), project.duration())?;
     let tiles = shots
         .par_iter()
         .map(|shot| {
@@ -1244,7 +1248,9 @@ fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<
             let p = &pipelines[i];
             let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &Shot::View { camera: Box::new(project::camera_at(&project.cuts, n, t, &|f, t| p.aim(f, t))), size });
             let cut = &project.cuts[n];
-            sheet::label(&mut f, 4, 4, &format!("{} {t:.1}s", check::clock(offsets[n] + t - cut.start)));
+            let edit = offsets[n] + t - cut.start;
+            overlays.draw(&mut f, edit);
+            sheet::label(&mut f, 4, 4, &format!("{} {t:.1}s", check::clock(edit)));
             Ok(f)
         })
         .collect::<Result<Vec<_>>>()?;

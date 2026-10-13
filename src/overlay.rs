@@ -345,25 +345,22 @@ pub fn look(item: &Item, t: f64) -> (Place, Grade) {
     (place_at(&item.motion, local), grade_at(&item.effects, local))
 }
 
-/// Burns the overlays into an export's frames, between the cuts (and their
-/// crossfades) and the encoder: frame `n` of the edit is at `n / fps`.
-pub struct Burn<'a> {
-    out: &'a mut dyn FrameSink,
+/// The overlays of an edit, their pictures loaded, to draw over frames at
+/// edit times: the export's `Burn` and project previews' tiles.
+pub struct Overlays<'a> {
     /// Lowest first: the overlay lanes, then the text's.
     lanes: Vec<&'a Lane>,
     /// Each item's picture, by its `Item::key`.
     pictures: Vec<(String, Arc<Picture>)>,
-    fps: f64,
     fades: crate::project::Fades,
     length: f64,
-    n: usize,
 }
 
-impl<'a> Burn<'a> {
+impl<'a> Overlays<'a> {
     /// Loads every picture `lanes` uses, at most twice the frame's `size`
-    /// (none drawn bigger than the frame needs more). With no lanes it
-    /// passes frames on.
-    pub fn new(out: &'a mut dyn FrameSink, lanes: Vec<&'a Lane>, size: (usize, usize), fps: f64, fades: crate::project::Fades, length: f64) -> Result<Self> {
+    /// (none drawn bigger than the frame needs more); `fades` and the
+    /// edit's `length` darken them with the picture under them.
+    pub fn new(lanes: Vec<&'a Lane>, size: (usize, usize), fades: crate::project::Fades, length: f64) -> Result<Self> {
         let mut pictures: Vec<(String, Arc<Picture>)> = Vec::new();
         for item in lanes.iter().flat_map(|l| &l.items) {
             let key = item.key();
@@ -375,7 +372,40 @@ impl<'a> Burn<'a> {
                 pictures.push((key, Arc::new(picture)));
             }
         }
-        Ok(Burn { out, lanes, pictures, fps, fades, length, n: 0 })
+        Ok(Overlays { lanes, pictures, fades, length })
+    }
+
+    /// Whether anything shows at edit time `t`.
+    pub fn any_at(&self, t: f64) -> bool {
+        self.lanes.iter().any(|l| l.at(t).is_some())
+    }
+
+    /// Draws what shows at edit time `t` over `frame`.
+    pub fn draw(&self, frame: &mut Frame, t: f64) {
+        let black = self.fades.black(t, self.length);
+        for item in self.lanes.iter().filter_map(|l| l.at(t).map(|(_, it)| it)) {
+            let key = item.key();
+            let picture = &self.pictures.iter().find(|(k, _)| *k == key).unwrap().1;
+            let (place, grade) = look(item, t);
+            let quad = Quad::new(&place, picture, (frame.width, frame.height));
+            composite(frame, picture, &quad, &grade, black);
+        }
+    }
+}
+
+/// Burns the overlays into an export's frames, between the cuts (and their
+/// crossfades) and the encoder: frame `n` of the edit is at `n / fps`.
+pub struct Burn<'a> {
+    out: &'a mut dyn FrameSink,
+    overlays: Overlays<'a>,
+    fps: f64,
+    n: usize,
+}
+
+impl<'a> Burn<'a> {
+    /// With no lanes it passes frames on.
+    pub fn new(out: &'a mut dyn FrameSink, lanes: Vec<&'a Lane>, size: (usize, usize), fps: f64, fades: crate::project::Fades, length: f64) -> Result<Self> {
+        Ok(Burn { out, overlays: Overlays::new(lanes, size, fades, length)?, fps, n: 0 })
     }
 }
 
@@ -383,19 +413,11 @@ impl FrameSink for Burn<'_> {
     fn write(&mut self, frame: &Frame) -> Result<()> {
         let t = self.n as f64 / self.fps;
         self.n += 1;
-        let showing: Vec<_> = self.lanes.iter().filter_map(|l| l.at(t).map(|(_, it)| it)).collect();
-        if showing.is_empty() {
+        if !self.overlays.any_at(t) {
             return self.out.write(frame);
         }
         let mut frame = Frame { width: frame.width, height: frame.height, rgb: frame.rgb.clone() };
-        let black = self.fades.black(t, self.length);
-        for item in showing {
-            let key = item.key();
-            let picture = &self.pictures.iter().find(|(k, _)| *k == key).unwrap().1;
-            let (place, grade) = look(item, t);
-            let quad = Quad::new(&place, picture, (frame.width, frame.height));
-            composite(&mut frame, picture, &quad, &grade, black);
-        }
+        self.overlays.draw(&mut frame, t);
         self.out.write(&frame)
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rosmo360"
-version = "0.2.10"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
