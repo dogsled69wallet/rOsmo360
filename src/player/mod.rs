@@ -837,7 +837,26 @@ impl App {
         // they were added and split in).
         let mut music = self.edit.music.clone();
         music.clips.sort_by(|a, b| a.at.total_cmp(&b.at));
-        Project { aspect, cuts: self.edit.cuts.clone(), sound: self.edit.sound, music, fades: self.edit.fades, overlays: self.edit.overlays.clone(), text: self.edit.texts.clone() }
+        let mut cuts = self.edit.cuts.clone();
+        // Cuts with no keyframes of their own nor any before them show the
+        // free look; the file alone would frame them straight ahead (and an
+        // ordinary video whole). Each kind's look is held as a keyframe at
+        // the in point of its first such cut, so the export, the CLI and the
+        // next open frame them as seen (later 360 cuts carry it on, ordinary
+        // videos don't carry keyframes, so each of those gets one).
+        let (look_360, look_flat) = if self.look_flat { (self.other_look, self.look) } else { (self.look, self.other_look) };
+        let hold = |cut: &mut Cut, look: View| {
+            if cut.keyframes.is_empty() && look != View::home(Projection::Perspective) {
+                cut.keyframes.set(cut.start, look, 0.0, &|_, _| None);
+            }
+        };
+        if let Some(cut) = cuts.iter_mut().find(|c| !c.flat) {
+            hold(cut, look_360);
+        }
+        for cut in cuts.iter_mut().filter(|c| c.flat) {
+            hold(cut, look_flat);
+        }
+        Project { aspect, cuts, sound: self.edit.sound, music, fades: self.edit.fades, overlays: self.edit.overlays.clone(), text: self.edit.texts.clone() }
     }
 
     /// Renders the edit to `path` on its own thread with the export the
@@ -845,16 +864,7 @@ impl App {
     /// shape (16:9 when free), stabilised as the player is.
     fn start_export(&mut self, path: PathBuf) -> Task<Message> {
         use iced::futures::{SinkExt, StreamExt};
-        let mut project = self.to_project();
-        // Cuts with no keyframes of their own nor any before them show the
-        // view as it is; the export would frame them straight ahead. The
-        // first cut holding that view frames them all as seen (later ones
-        // carry an earlier cut's keyframes on).
-        if let Some(first) = project.cuts.first_mut()
-            && first.keyframes.is_empty()
-        {
-            first.keyframes = crate::view::Reframe::fixed(self.look).keyframes;
-        }
+        let project = self.to_project();
         let [w, h] = project.aspect.unwrap_or(crate::view::Aspect(16, 9)).size(self.resolution.short_side());
         let target = if self.export_clips {
             crate::Target::Clips { dir: path, name: self.export_name(), handles: 0.0, graded: self.export_graded }
