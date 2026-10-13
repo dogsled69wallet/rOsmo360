@@ -8,13 +8,14 @@
 //! through the overlap the earlier cut is the one located, the later one
 //! dissolving in over it.
 
+use crate::overlay::Lane;
 use crate::project::{Cut, Fades, Music, Sound};
 
 /// The shortest a split or trim may leave a cut, in seconds.
 pub const MIN_CUT: f64 = 0.2;
 
 /// What undo brings back: everything an edit changes.
-type Snapshot = (Vec<Cut>, Music, Sound, Fades);
+type Snapshot = (Vec<Cut>, Music, Sound, Fades, Vec<Lane>);
 
 #[derive(Default)]
 pub struct Edit {
@@ -22,6 +23,8 @@ pub struct Edit {
     pub music: Music,
     pub sound: Sound,
     pub fades: Fades,
+    /// The overlay lanes; the player shows and edits the first.
+    pub overlays: Vec<Lane>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     /// Counts changes, so the app can tell whether the edit was saved.
@@ -36,7 +39,8 @@ impl Edit {
     /// The timeline's length: the video's, or the music's while it runs on
     /// beyond it (the frame still to fill). The export ends with the video.
     pub fn frame(&self) -> f64 {
-        self.duration().max(self.music.end())
+        let overlays = self.overlays.iter().flat_map(|l| &l.items).map(crate::overlay::Item::ends).fold(0.0, f64::max);
+        self.duration().max(self.music.end()).max(overlays)
     }
 
     /// Where cut `i` starts on the timeline (the edit's end for `i` past
@@ -72,12 +76,12 @@ impl Edit {
     }
 
     fn snapshot(&self) -> Snapshot {
-        (self.cuts.clone(), self.music.clone(), self.sound, self.fades)
+        (self.cuts.clone(), self.music.clone(), self.sound, self.fades, self.overlays.clone())
     }
 
-    fn restore(&mut self, (cuts, music, sound, fades): Snapshot) -> Snapshot {
+    fn restore(&mut self, (cuts, music, sound, fades, overlays): Snapshot) -> Snapshot {
         let now = self.snapshot();
-        (self.cuts, self.music, self.sound, self.fades) = (cuts, music, sound, fades);
+        (self.cuts, self.music, self.sound, self.fades, self.overlays) = (cuts, music, sound, fades, overlays);
         now
     }
 
@@ -104,9 +108,10 @@ impl Edit {
         true
     }
 
-    /// Starts over with `cuts` and their music and mix (an opened or new
-    /// project), forgetting undo.
-    pub fn replace(&mut self, cuts: Vec<Cut>, music: Music, sound: Sound, fades: Fades) {
+    /// Starts over with `cuts` and their music, mix and overlays (an opened
+    /// or new project), forgetting undo.
+    pub fn replace(&mut self, cuts: Vec<Cut>, music: Music, sound: Sound, fades: Fades, overlays: Vec<Lane>) {
+        self.overlays = overlays;
         self.cuts = cuts;
         self.music = music;
         self.sound = sound;

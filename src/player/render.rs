@@ -268,3 +268,63 @@ pub fn encode(
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     iced::futures::executor::block_on(f)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::overlay::{self, Place, Quad};
+
+    /// The player's overlay pass draws what `overlay::composite` does.
+    #[test]
+    fn gpu_overlays_match_the_cpu() {
+        let Ok(mut gpu) = Gpu::new() else { return };
+        let (w, h) = (320, 180);
+        // A mid-grey ordinary video frame (limited-range NV12).
+        let mut data = vec![126u8; w * h];
+        data.extend(vec![128u8; w * h / 2]);
+        let frame = Frame { pts: 0.0, layout: source::Layout::PerTrack, pictures: vec![source::Picture { width: w as u32, height: h as u32, data }] };
+        let shown = Shown::new(frame, SeamFix::default());
+        let rig = Rig::flat(0);
+        let camera = crate::view::View::home(crate::view::Projection::Perspective).camera();
+        // A 4×2 picture: opaque red left, half-transparent green right.
+        let mut rgba = Vec::new();
+        for _ in 0..2 {
+            rgba.extend([255, 0, 0, 255, 255, 0, 0, 255, 0, 128, 0, 128, 0, 128, 0, 128]);
+        }
+        let picture = Arc::new(overlay::Picture { width: 4, height: 2, rgba });
+        let place = Place { x: 0.4, y: 0.6, size: 0.5, rotation: 20.0 };
+        let grade = crate::grade::Grade { opacity: 0.8, saturation: -0.5, ..Default::default() };
+        let draw = gpu::OverlayDraw { id: 1, picture: picture.clone(), place, grade, black: 0.25 };
+        let mut render = |overlays: &[gpu::OverlayDraw]| {
+            gpu.size = (0, 0);
+            gpu.targets = vec![gpu.make_target(w, h)];
+            gpu.stitcher.prepare_frame(&gpu.device, &gpu.queue, &rig, &shown, &camera, &[stitch::IDENTITY], [w as f32, h as f32], [0.0, 0.0]);
+            gpu.stitcher.prepare_overlays(&gpu.device, &gpu.queue, overlays, [w as f32, h as f32], [0.0, 0.0], [w as f32, h as f32]);
+            let target = &gpu.targets[0];
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            gpu.stitcher.draw(&mut encoder, &target.view, &Rectangle { x: 0, y: 0, width: w as u32, height: h as u32 });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &target.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &target.readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(target.row as u32), rows_per_image: Some(h as u32) } },
+                wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+            );
+            gpu.queue.submit([encoder.finish()]);
+            let (tx, rx) = channel();
+            target.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            gpu.pending.push_back((0, rx));
+            gpu.size = (w, h);
+            gpu.finish().unwrap().unwrap()
+        };
+        let mut want = render(&[]);
+        let got = render(&[draw]);
+        overlay::composite(&mut want, &picture, &Quad::new(&place, (4, 2), (w, h)), &grade, 0.25);
+        let diff: Vec<i32> = want.rgb.iter().zip(&got.rgb).map(|(a, b)| (*a as i32 - *b as i32).abs()).collect();
+        let big = diff.iter().filter(|&&d| d > 8).count();
+        let mean = diff.iter().sum::<i32>() as f64 / diff.len() as f64;
+        eprintln!("mean diff {mean:.3}, {big} of {} values off by more than 8", diff.len());
+        // Edge pixels differ by filtering; the inside must agree.
+        assert!(mean < 0.3 && big < 50, "mean {mean}, {big} off");
+    }
+}

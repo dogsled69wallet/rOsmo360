@@ -5,10 +5,15 @@
 //! Through a crossfade between cuts the pipeline draws a second layer, the
 //! incoming cut, over the first with a blend constant: each layer keeps its
 //! own uniforms and pictures, so neither re-uploads while both play.
+//!
+//! The overlays then go on top, each a turned quad of its picture
+//! (`overlay.wgsl`), blended premultiplied.
 
 use super::source::{Frame, Layout};
 use crate::align::{Aligner, CELLS_ALPHA, CELLS_PHI, Field, Strips};
 use crate::exposure::{self, BINS, FADE_FROM, FADE_TO, Gains, Seam};
+use crate::grade::Grade;
+use crate::overlay::{Picture, Place, Quad};
 use crate::stitch::{Lens, M3};
 use crate::view::Camera;
 use bytemuck::{Pod, Zeroable};
@@ -31,6 +36,37 @@ struct LensU {
     a1: [f32; 4],
     lim: [f32; 4],
     calib: [f32; 4],
+}
+
+/// `overlay.wgsl`'s uniforms.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct OverlayU {
+    frame: [f32; 4],
+    target: [f32; 4],
+    quad: [f32; 4],
+    turn: [f32; 4],
+    grade: [[f32; 4]; 3],
+}
+
+/// An overlay picture to draw over the view: where, graded how, and how far
+/// faded to black with the edit.
+#[derive(Clone)]
+pub struct OverlayDraw {
+    /// Tells pictures apart, so each is uploaded once.
+    pub id: u64,
+    pub picture: Arc<Picture>,
+    pub place: Place,
+    pub grade: Grade,
+    pub black: f64,
+}
+
+/// One overlay drawn: its uniforms and picture.
+struct OverlaySlot {
+    uniforms: wgpu::Buffer,
+    texture: Plane,
+    bind_group: wgpu::BindGroup,
+    picture: u64,
 }
 
 #[repr(C)]
@@ -169,6 +205,8 @@ pub struct Primitive {
     pub rig_from_view: Vec<M3>,
     /// Through a crossfade: the next cut, drawn over this one.
     pub incoming: Option<Incoming>,
+    /// The overlays showing, lowest first.
+    pub overlays: Vec<OverlayDraw>,
 }
 
 /// The cut crossfading in: its own picture and framing, and how far in it
@@ -203,6 +241,11 @@ pub struct Pipeline {
     layers: [Layer; 2],
     /// How far the second layer is in, if it's drawn.
     mix: Option<f32>,
+    overlay: wgpu::RenderPipeline,
+    overlay_layout: wgpu::BindGroupLayout,
+    /// Kept between frames; the first `overlays` are drawn.
+    overlay_slots: Vec<OverlaySlot>,
+    overlays: usize,
 }
 
 /// One picture's resources: uniforms, textures and what they hold.
@@ -227,7 +270,7 @@ impl Pipeline {
     pub fn create(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("stitch"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(concat!(include_str!("shader.wgsl"), include_str!("grade.wgsl")).into()),
         });
         let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -317,7 +360,48 @@ impl Pipeline {
             let bind_group = bind(device, &layout, &uniforms, &sampler, &slots, &masks);
             Layer { uniforms, slots, masks, bind_group, lens_u: [LensU::zeroed(); 2], rig_id: 0, shown_id: 0 }
         });
-        Pipeline { pipeline, blend, layout, sampler, srgb: format.is_srgb(), layers, mix: None }
+        let (overlay, overlay_layout) = overlay_pipeline(device, format);
+        Pipeline { pipeline, blend, layout, sampler, srgb: format.is_srgb(), layers, mix: None, overlay, overlay_layout, overlay_slots: Vec::new(), overlays: 0 }
+    }
+
+    /// Gets `overlays` ready to draw over the view (`size` pixels at
+    /// `origin` in a `target` pixel target), uploading each picture once.
+    pub fn prepare_overlays(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, overlays: &[OverlayDraw], size: [f32; 2], origin: [f32; 2], target: [f32; 2]) {
+        self.overlays = overlays.len();
+        for (k, d) in overlays.iter().enumerate() {
+            let pic = &d.picture;
+            if self.overlay_slots.len() <= k {
+                let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("overlay"),
+                    size: std::mem::size_of::<OverlayU>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let texture = plane(device, 1, 1, wgpu::TextureFormat::Rgba8Unorm);
+                let bind_group = bind_overlay(device, &self.overlay_layout, &uniforms, &self.sampler, &texture);
+                self.overlay_slots.push(OverlaySlot { uniforms, texture, bind_group, picture: 0 });
+            }
+            let slot = &mut self.overlay_slots[k];
+            if slot.picture != d.id {
+                slot.texture = plane(device, pic.width as u32, pic.height as u32, wgpu::TextureFormat::Rgba8Unorm);
+                write(queue, &slot.texture.texture, &pic.rgba, pic.width as u32, pic.height as u32, 4);
+                slot.bind_group = bind_overlay(device, &self.overlay_layout, &slot.uniforms, &self.sampler, &slot.texture);
+                slot.picture = d.id;
+            }
+            let q = Quad::new(&d.place, (pic.width, pic.height), (size[0].round() as usize, size[1].round() as usize));
+            let f = |v: f64| v as f32;
+            let (s, c) = q.turn.sin_cos();
+            // Its opacity and fade are applied on their own, after the grade.
+            let shade = Grade { opacity: 1.0, black: 0.0, ..d.grade };
+            let u = OverlayU {
+                frame: [size[0], size[1], origin[0], origin[1]],
+                target: [target[0], target[1], self.srgb as u8 as f32, f(d.black)],
+                quad: [f(q.centre[0]), f(q.centre[1]), f(q.half[0]), f(q.half[1])],
+                turn: [f(c), f(s), f(d.grade.opacity), if shade.is_neutral() { 0.0 } else { 1.0 }],
+                grade: shade.uniforms(),
+            };
+            queue.write_buffer(&slot.uniforms, 0, bytemuck::bytes_of(&u));
+        }
     }
 
     /// Gets ready to draw `shown` through `camera` into a `size` pixel
@@ -326,6 +410,7 @@ impl Pipeline {
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rig: &Rig, shown: &Shown, camera: &Camera, rig_from_view: &[M3], size: [f32; 2], origin: [f32; 2]) {
         self.mix = None;
+        self.overlays = 0;
         self.prepare_layer(0, device, queue, rig, shown, camera, rig_from_view, size, origin);
     }
 
@@ -407,6 +492,13 @@ impl Pipeline {
             pass.set_bind_group(0, &self.layers[1].bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        if self.overlays > 0 {
+            pass.set_pipeline(&self.overlay);
+            for slot in &self.overlay_slots[..self.overlays] {
+                pass.set_bind_group(0, &slot.bind_group, &[]);
+                pass.draw(0..4, 0..1);
+            }
+        }
     }
 }
 
@@ -478,6 +570,8 @@ impl shader::Primitive for Primitive {
             p.prepare_layer(1, device, queue, &i.rig, &i.shown, &i.camera, &i.rig_from_view, size, origin);
             p.mix = Some(i.mix);
         }
+        let target = viewport.physical_size();
+        p.prepare_overlays(device, queue, &self.overlays, size, origin, [target.width as f32, target.height as f32]);
     }
 
     fn render(&self, p: &Pipeline, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, clip: &Rectangle<u32>) {
@@ -525,6 +619,64 @@ fn write(queue: &wgpu::Queue, texture: &wgpu::Texture, data: &[u8], w: u32, h: u
         wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * bpp), rows_per_image: Some(h) },
         wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
     );
+}
+
+/// The overlays' pipeline: `overlay.wgsl` over a triangle strip, blended
+/// premultiplied over what's drawn.
+fn overlay_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("overlay"),
+        source: wgpu::ShaderSource::Wgsl(concat!(include_str!("overlay.wgsl"), include_str!("grade.wgsl")).into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("overlay"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                count: None,
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&layout], push_constant_ranges: &[] });
+    let over = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("overlay"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState { module: &shader, entry_point: Some("ovs"), compilation_options: Default::default(), buffers: &[] },
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("ofs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState { color: over, alpha: over }), write_mask: wgpu::ColorWrites::ALL })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+    (pipeline, layout)
+}
+
+fn bind_overlay(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, uniforms: &wgpu::Buffer, sampler: &wgpu::Sampler, texture: &Plane) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("overlay"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&texture.view) },
+        ],
+    })
 }
 
 fn bind(

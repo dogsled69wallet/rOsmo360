@@ -5,6 +5,7 @@ mod exposure;
 mod grade;
 mod ffmpeg;
 mod imu;
+mod overlay;
 mod player;
 mod project;
 mod ring;
@@ -892,7 +893,10 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
         let mix = ffmpeg::Mix { sound_db: project.sound.volume, music: &project.music, length, fades: project.fades };
         let mix = matches!(out.target, Target::One(_)).then_some(&mix);
         let mut encoder = ffmpeg::Encoder::new(&path, out.size, fps, &sound, mix, out.format)?;
-        let mut sink = dissolve::Dissolve::new(&mut encoder);
+        // Overlays over the whole edit only; a file per cut has none.
+        let lanes = if matches!(out.target, Target::One(_)) { &project.overlays[..] } else { &[] };
+        let mut burn = overlay::Burn::new(&mut encoder, lanes, out.size, fps, project.fades, project.duration())?;
+        let mut sink = dissolve::Dissolve::new(&mut burn);
         for (n, &(i, start, frames)) in cuts.clone().zip(&plan[cuts.clone()]) {
             let tail = if n + 1 < cuts.end { overlap[n + 1] } else { 0 };
             let head = if n > cuts.start { overlap[n] } else { 0 };
@@ -920,6 +924,7 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
             };
             if let Err(e) = result {
                 drop(sink);
+                drop(burn);
                 encoder.abort();
                 let _ = std::fs::remove_file(&path);
                 return Err(e);
@@ -927,6 +932,7 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
             done += frames;
         }
         drop(sink);
+        drop(burn);
         encoder.finish()?;
         written.push(path);
     }

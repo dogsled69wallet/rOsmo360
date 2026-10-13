@@ -279,7 +279,8 @@ impl Out {
             _ => {}
         }
         if let Some((w, h)) = self.size {
-            filters.push(format!("scale={w}:{h}:flags=bilinear"));
+            // A picture is scaled once, so it may as well be scaled well.
+            filters.push(format!("scale={w}:{h}:flags={}", if self.picture { "lanczos" } else { "bilinear" }));
         }
     }
 
@@ -392,6 +393,26 @@ pub fn nv12(input: &Path, track: u32, start: f64, out: Out, hw: Hwaccel) -> Resu
 /// complaining about a closed pipe.
 pub fn still(input: &Path, track: u32, t: f64, hw: Hwaccel) -> Result<Frame> {
     still_out(input, track, t, hw, dimensions(input, track)?, Out::default())
+}
+
+/// A picture's one frame as RGBA, upright and premultiplied (`Out`'s
+/// picture filters), at `(w, h)`.
+pub fn picture_rgba(input: &Path, flat: Flat, (w, h): (u32, u32)) -> Result<Vec<u8>> {
+    let out = flat.out(Some((w, h)), None);
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-nostdin"]);
+    out.input_args(&mut cmd);
+    let mut filters = Vec::new();
+    out.filters(&mut filters);
+    cmd.arg("-i").arg(input).args(["-map", &format!("0:v:{}", flat.track)]);
+    if !filters.is_empty() {
+        cmd.args(["-vf", &filters.join(",")]);
+    }
+    let out = cmd.args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"]).stderr(Stdio::inherit()).output().context("running ffmpeg")?;
+    if out.stdout.len() != (w * h * 4) as usize {
+        bail!("couldn't read {}", input.display());
+    }
+    Ok(out.stdout)
 }
 
 /// `still` delivered as `out` says, which comes out `(width, height)`.

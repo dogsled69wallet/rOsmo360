@@ -291,6 +291,17 @@ enum Message {
     MusicPicked(Option<PathBuf>),
     /// A song's waveform, read off the UI thread.
     Waveform(PathBuf, Result<Arc<music::Waveform>, String>),
+    OverlayPicture(PathBuf, Result<Arc<crate::overlay::Picture>, String>),
+    /// Add pictures to the overlay lane at the playhead.
+    AddOverlay,
+    OverlayPicked(Vec<PathBuf>),
+    OverlaySelect(Option<usize>),
+    /// Overlay `i` dragged to start at edit time `at`.
+    OverlayMove(usize, f64),
+    /// Overlay `i`'s in (`true`) or out edge dragged to own time `t`.
+    OverlayTrim(usize, bool, f64),
+    /// To an overlay keyframe's edit time.
+    OverlayJump(f64),
     SelectMusic(usize),
     /// Music clip `i` dragged to start at this edit time; with Shift held
     /// (`true`) it may overlap a neighbour, crossfading.
@@ -404,6 +415,12 @@ struct App {
     thumbs: std::collections::HashMap<PathBuf, Vec<(f64, image::Handle)>>,
     /// Songs' waveforms, and the music clip selected on its lane.
     waveforms: std::collections::HashMap<PathBuf, Arc<music::Waveform>>,
+    /// The overlays' pictures, scaled for the view: `None` while loading.
+    overlay_pictures: std::collections::HashMap<PathBuf, Option<(u64, Arc<crate::overlay::Picture>)>>,
+    /// Their timeline thumbnails.
+    overlay_thumbs: std::collections::HashMap<PathBuf, iced::widget::image::Handle>,
+    /// The overlay item selected, in the lane shown (the first).
+    selected_overlay: Option<usize>,
     selected_music: Option<usize>,
     /// The music volume point selected, and the cut sound point: (cut,
     /// point).
@@ -436,6 +453,9 @@ struct App {
     /// The project file, once opened or saved, and the edit version saved.
     project: Option<PathBuf>,
     saved_version: u64,
+    /// The aspect lock when last saved: it's in the project, so changing it
+    /// is a change to save.
+    saved_aspect: Aspect,
     /// What to do once the project has been saved.
     after_save: Option<Then>,
     /// Exports are this many pixels on the short side.
@@ -505,6 +525,9 @@ impl App {
             library: Vec::new(),
             thumbs: Default::default(),
             waveforms: Default::default(),
+            overlay_pictures: Default::default(),
+            overlay_thumbs: Default::default(),
+            selected_overlay: None,
             selected_music: None,
             selected_volume: None,
             selected_sound: None,
@@ -523,6 +546,7 @@ impl App {
             preroll: None,
             project: None,
             saved_version: 0,
+            saved_aspect: Aspect::Free,
             after_save: None,
             resolution: saved.resolution,
             export_clips: saved.export_clips,
@@ -576,6 +600,7 @@ impl App {
     /// Handles `message`, then saves the settings if it changed any.
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
+        let task = Task::batch([task, self.load_overlay_pictures()]);
         self.settle_look();
         self.follow_crossfade();
         self.follow_music();
@@ -796,7 +821,7 @@ impl App {
         // they were added and split in).
         let mut music = self.edit.music.clone();
         music.clips.sort_by(|a, b| a.at.total_cmp(&b.at));
-        Project { aspect, cuts: self.edit.cuts.clone(), sound: self.edit.sound, music, fades: self.edit.fades }
+        Project { aspect, cuts: self.edit.cuts.clone(), sound: self.edit.sound, music, fades: self.edit.fades, overlays: self.edit.overlays.clone() }
     }
 
     /// Renders the edit to `path` on its own thread with the export the
@@ -1063,7 +1088,7 @@ impl App {
     }
 
     fn unsaved(&self) -> bool {
-        self.edit.version != self.saved_version && self.has_edit()
+        (self.edit.version != self.saved_version || self.aspect != self.saved_aspect) && self.has_edit()
     }
 
     /// Whether there is anything to save: cuts, or music to fill.
@@ -1174,11 +1199,12 @@ impl App {
                 // Back to the start screen with an empty edit. Loaded clips
                 // stay in the library, so adding them again is instant; one
                 // still loading finishes there without becoming a cut.
-                self.edit.replace(Vec::new(), Default::default(), Default::default(), Default::default());
+                self.edit.replace(Vec::new(), Default::default(), Default::default(), Default::default(), Vec::new());
                 self.selected_music = None;
                 self.selected_volume = None;
                 self.selected_sound = None;
                 self.saved_version = self.edit.version;
+                self.saved_aspect = self.aspect;
                 self.project = None;
                 self.clip = None;
                 self.held = None;
@@ -1201,6 +1227,7 @@ impl App {
                 Choice::Discard => {
                     // Let the changes go: the next save starts fresh.
                     self.saved_version = self.edit.version;
+                    self.saved_aspect = self.aspect;
                     return self.proceed(then);
                 }
                 Choice::Cancel => {}
@@ -1251,12 +1278,25 @@ impl App {
                     let said = self.error.take().map_or(String::new(), |e| e + ". ");
                     self.error = Some(format!("{said}Left out missing music: {}", names.join(", ")));
                 }
+                // And overlay pictures.
+                let mut overlays = project.overlays;
+                let mut lost = Vec::new();
+                for lane in &mut overlays {
+                    let (here, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut lane.items).into_iter().partition(|it| it.input.exists());
+                    lane.items = here;
+                    lost.extend(gone.into_iter().map(|it| it.input.display().to_string()));
+                }
+                if !lost.is_empty() {
+                    let said = self.error.take().map_or(String::new(), |e| e + ". ");
+                    self.error = Some(format!("{said}Left out missing overlays: {}", lost.join(", ")));
+                }
                 let waves: Vec<_> = music.clips.iter().map(|c| self.load_waveform(&c.input)).collect();
                 self.queue.extend(cuts.iter().map(|c| (c.input.clone(), false)));
-                let complete = missing.is_empty() && gone.is_empty();
-                self.edit.replace(cuts, music, project.sound, project.fades);
+                let complete = missing.is_empty() && gone.is_empty() && lost.is_empty();
+                self.edit.replace(cuts, music, project.sound, project.fades, overlays);
                 self.mark_flat();
                 self.saved_version = if complete { self.edit.version } else { 0 };
+                self.saved_aspect = self.aspect;
                 self.project = Some(path);
                 self.selected_music = None;
                 self.selected_volume = None;
@@ -1398,6 +1438,7 @@ impl App {
             Message::SaveProjectTo(Some(path)) => match self.to_project().save(&path) {
                 Ok(()) => {
                     self.saved_version = self.edit.version;
+                    self.saved_aspect = self.aspect;
                     self.save_status = Some(format!("Saved {}", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())));
                     self.project = Some(path);
                     if let Some(then) = self.after_save.take() {
@@ -1464,6 +1505,82 @@ impl App {
                 self.selected_music = None;
                 self.selected_volume = None;
                 self.selected_sound = None;
+                self.selected_overlay = None;
+            }
+            Message::AddOverlay => {
+                let dir = self.project.as_ref().and_then(|p| p.parent().map(Path::to_owned));
+                return Task::perform(
+                    async move {
+                        let mut dialog = rfd::AsyncFileDialog::new()
+                            .set_title("Add overlay pictures")
+                            .add_filter("Pictures", &["png", "PNG", "jpg", "JPG", "jpeg", "JPEG", "webp", "WEBP", "bmp", "BMP", "tif", "TIF", "tiff", "TIFF"]);
+                        if let Some(dir) = dir {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog.pick_files().await.unwrap_or_default().iter().map(|f| f.path().to_owned()).collect()
+                    },
+                    Message::OverlayPicked,
+                );
+            }
+            Message::OverlayPicked(paths) if !paths.is_empty() => {
+                self.edit.checkpoint();
+                if self.edit.overlays.is_empty() {
+                    self.edit.overlays.push(Default::default());
+                }
+                // One after another from the playhead, each where it fits.
+                let mut at = self.position();
+                let lane = &mut self.edit.overlays[0];
+                for input in paths {
+                    lane.items.push(crate::overlay::Item { input, at, start: 0.0, end: ffmpeg::PICTURE_SECONDS, motion: Vec::new(), effects: Vec::new() });
+                    let i = lane.items.len() - 1;
+                    lane.items[i].at = lane.place(i, at);
+                    at = lane.items[i].ends();
+                    self.selected_overlay = Some(i);
+                }
+                self.selected_music = None;
+                self.selected_volume = None;
+                self.selected_sound = None;
+            }
+            Message::OverlayPicked(_) => {}
+            Message::OverlaySelect(i) => {
+                self.selected_overlay = i;
+                if i.is_some() {
+                    self.selected_music = None;
+                    self.selected_volume = None;
+                    self.selected_sound = None;
+                }
+            }
+            Message::OverlayMove(i, at) => {
+                if self.edit.overlays.first().is_some_and(|l| i < l.items.len()) {
+                    self.begin_drag();
+                    let lane = &mut self.edit.overlays[0];
+                    lane.items[i].at = lane.place(i, at);
+                }
+            }
+            Message::OverlayTrim(i, start, t) => {
+                if self.edit.overlays.first().is_some_and(|l| i < l.items.len()) {
+                    self.begin_drag();
+                    let lane = &mut self.edit.overlays[0];
+                    let (lo, hi) = lane.room(i);
+                    let item = &mut lane.items[i];
+                    if start {
+                        // Its picture stays where it is on the edit; a
+                        // picture has nothing before its own start.
+                        let earliest = (item.start - (item.at - lo)).max(0.0);
+                        let t = t.clamp(earliest, item.end - edit::MIN_CUT);
+                        item.at += t - item.start;
+                        item.start = t;
+                    } else {
+                        let latest = (item.start + (hi - item.at)).min(item.start + ffmpeg::PICTURE_MOST);
+                        item.end = t.clamp(item.start + edit::MIN_CUT, latest);
+                    }
+                }
+            }
+            Message::OverlayJump(at) => {
+                self.follow = true;
+                if let Some((i, t)) = self.edit.locate(at) {
+                    self.goto(i, t, false);
+                }
             }
             Message::AddMusic => {
                 let dir = self.project.as_ref().and_then(|p| p.parent().map(Path::to_owned));
@@ -1493,12 +1610,21 @@ impl App {
                 self.selected = None;
                 return self.load_waveform(&path);
             }
+            Message::OverlayPicture(path, Ok(picture)) => {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                self.overlay_thumbs.insert(path.clone(), overlay_thumb(&picture));
+                self.overlay_pictures.insert(path, Some((NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), picture)));
+            }
+            Message::OverlayPicture(path, Err(e)) => {
+                self.error = Some(format!("Couldn't read the overlay {}: {e}", path.display()));
+            }
             Message::Waveform(path, Ok(wave)) => {
                 self.waveforms.insert(path, wave);
             }
             Message::Waveform(path, Err(e)) => self.error = Some(format!("Can't read {}: {e}", path.display())),
             Message::SelectMusic(i) => {
                 self.selected_music = Some(i);
+                self.selected_overlay = None;
                 self.selected = None;
                 self.selected_volume = None;
                 self.selected_sound = None;
@@ -1655,6 +1781,13 @@ impl App {
                     self.selected = Some(i + 1);
                 } else {
                     self.edit.undo();
+                }
+            }
+            Message::DeleteCut if self.selected_overlay.is_some() => {
+                let i = self.selected_overlay.take().unwrap();
+                if self.edit.overlays.first().is_some_and(|l| i < l.items.len()) {
+                    self.edit.checkpoint();
+                    self.edit.overlays[0].items.remove(i);
                 }
             }
             Message::DeleteCut if self.selected_sound.is_some() => {
@@ -1981,6 +2114,44 @@ impl App {
         grade
     }
 
+    /// Starts reading each overlay picture the edit uses that isn't read
+    /// yet, at the view's quality (4096 px on its long side at most).
+    fn load_overlay_pictures(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for item in self.edit.overlays.iter().flat_map(|l| &l.items) {
+            if self.overlay_pictures.contains_key(&item.input) {
+                continue;
+            }
+            self.overlay_pictures.insert(item.input.clone(), None);
+            let path = item.input.clone();
+            tasks.push(Task::perform(
+                blocking({
+                    let path = path.clone();
+                    move || crate::overlay::Picture::load(&path, 4096).map(Arc::new).map_err(|e| format!("{e:#}"))
+                }),
+                move |r| Message::OverlayPicture(path.clone(), r),
+            ));
+        }
+        Task::batch(tasks)
+    }
+
+    /// The overlays showing at the playhead, lowest first, as the export
+    /// burns them in.
+    fn overlay_draws(&self) -> Vec<gpu::OverlayDraw> {
+        let t = self.position();
+        let black = self.edit.fades.black(t, self.edit.duration());
+        self.edit
+            .overlays
+            .iter()
+            .filter_map(|lane| lane.at(t).map(|(_, it)| it))
+            .filter_map(|item| {
+                let (id, picture) = self.overlay_pictures.get(&item.input)?.clone()?;
+                let (place, grade) = crate::overlay::look(item, t);
+                Some(gpu::OverlayDraw { id, picture, place, grade, black })
+            })
+            .collect()
+    }
+
     /// The 360 view as it should be drawn now, once a frame is decoded.
     fn sphere(&self) -> Option<Sphere> {
         let c = self.clip.as_ref()?;
@@ -1992,6 +2163,7 @@ impl App {
             fov_deg: self.shown_view().fov,
             picking: self.picking.is_some(),
             incoming: self.partner_layer(),
+            overlays: self.overlay_draws(),
         })
     }
 
@@ -2374,7 +2546,7 @@ impl App {
             Key::Named(Named::ArrowUp) => self.free_look().pitch += step,
             Key::Named(Named::ArrowDown) => self.free_look().pitch -= step,
             Key::Named(Named::Home) => self.free_look().reset(),
-            Key::Named(Named::Delete | Named::Backspace) if mods.shift() || self.selected_music.is_some() || self.selected_volume.is_some() || self.selected_sound.is_some() => {
+            Key::Named(Named::Delete | Named::Backspace) if mods.shift() || self.selected_music.is_some() || self.selected_volume.is_some() || self.selected_sound.is_some() || self.selected_overlay.is_some() => {
                 return self.update(Message::DeleteCut);
             }
             Key::Named(Named::Delete | Named::Backspace) => return self.update(Message::KeyDelete),
@@ -2548,6 +2720,7 @@ impl App {
                 text(if self.edit.music.clips.is_empty() { "Add music under the edit" } else { "Add more music, after the last song" }),
                 tooltip::Position::Bottom,
             ),
+            tip(icon_button(ADD_OVERLAY, Some(Message::AddOverlay)), text("Add pictures over the picture, at the playhead (PNG transparency shows through)"), tooltip::Position::Bottom),
             tip(icon_button(OPEN_PROJECT, Some(Message::OpenProject)), text("Open a saved edit (Ctrl+Shift+O)"), tooltip::Position::Bottom),
             tip(
                 icon_button(SAVE, self.unsaved().then_some(Message::SaveProject(false))),
@@ -2646,6 +2819,21 @@ impl App {
             position: self.position(),
             selected: self.selected,
             current: current.map(|k| (self.current, k)),
+            overlays: self.edit.overlays.first().map_or_else(Vec::new, |lane| {
+                lane.items
+                    .iter()
+                    .map(|it| timeline::OverlayBlock {
+                        label: it.input.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned()),
+                        from: it.at,
+                        start: it.start,
+                        len: it.end - it.start,
+                        effects: it.effects.iter().map(|k| k.t).collect(),
+                        motion: it.motion.iter().map(|k| (k.t, k.ease)).collect(),
+                        thumb: self.overlay_thumbs.get(&it.input).cloned(),
+                    })
+                    .collect()
+            }),
+            selected_overlay: self.selected_overlay,
         }
         .view();
         // With a song selected, C splits that instead.
@@ -2711,7 +2899,7 @@ impl App {
             ),
             tip(icon_button(SPLIT, can_split.then_some(Message::Split)), text(if music.is_some() { "Split the selected music at the playhead (C)" } else { "Split the cut at the playhead (C)" }), tooltip::Position::Top),
             tip(
-                icon_button(DELETE_CUT, (self.selected.is_some() || music.is_some() || point).then_some(Message::DeleteCut)),
+                icon_button(DELETE_CUT, (self.selected.is_some() || music.is_some() || point || self.selected_overlay.is_some()).then_some(Message::DeleteCut)),
                 text(if point {
                     "Delete the selected volume point (Del)"
                 } else if music.is_some() {
@@ -2883,6 +3071,7 @@ const KEY_DELETE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 /// a project), a diskette (save) and one with a pencil (save as).
 const ADD_MUSIC: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l10-2v9"/><circle cx="6" cy="18" r="3"/><path d="M19 15v6M16 18h6"/></svg>"#;
 const NEW_PROJECT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4M9 15h6M12 18v-6"/></svg>"#;
+const ADD_OVERLAY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="14" height="14" rx="2"/><circle cx="8" cy="8" r="1.5"/><path d="M17 12l-4-4-8 8"/><path d="M20 15v6M17 18h6"/></svg>"#;
 const ADD_CLIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="14" height="18" rx="2"/><path d="M6 3v18M12 3v18M2 8h4M2 16h4M12 8h4M12 16h4M20 9v6M17 12h6"/></svg>"#;
 const OPEN_PROJECT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>"#;
 const SAVE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7M7 3v4a1 1 0 0 0 1 1h7"/></svg>"#;
@@ -3157,6 +3346,25 @@ fn clock(t: f64) -> String {
 
 /// Runs `f` on its own thread so blocking work (parsing, ffprobe) stays off
 /// the executor.
+/// A small picture of an overlay for its timeline block: 48 px high,
+/// over a dark checker so transparency shows.
+fn overlay_thumb(picture: &crate::overlay::Picture) -> iced::widget::image::Handle {
+    let h = 48usize;
+    let w = (picture.width * h / picture.height.max(1)).clamp(1, 4 * h);
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let (sx, sy) = (x * picture.width / w, y * picture.height / h);
+            let p = &picture.rgba[(sy * picture.width + sx) * 4..][..4];
+            let under = if (x / 6 + y / 6) % 2 == 0 { 60.0 } else { 90.0 };
+            let a = p[3] as f32 / 255.0;
+            rgba.extend([0, 1, 2].map(|c| (p[c] as f32 + under * (1.0 - a)).min(255.0) as u8));
+            rgba.push(255);
+        }
+    }
+    iced::widget::image::Handle::from_rgba(w as u32, h as u32, rgba)
+}
+
 fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl Future<Output = T> {
     let (tx, rx) = iced::futures::channel::oneshot::channel();
     std::thread::spawn(move || {
@@ -3179,6 +3387,7 @@ struct Sphere {
     /// Through a crossfade, the next cut drawn over: its rig, frame,
     /// framing, readout views and how far in it is (0..1).
     incoming: Option<(Arc<Rig>, Arc<Shown>, Camera, Vec<M3>, f32)>,
+    overlays: Vec<gpu::OverlayDraw>,
 }
 
 #[derive(Default)]
@@ -3277,6 +3486,7 @@ impl shader::Program<Message> for Sphere {
             camera: self.camera,
             rig_from_view: self.rig_from_view.clone(),
             incoming: self.incoming.clone().map(|(rig, shown, camera, rig_from_view, mix)| gpu::Incoming { rig, shown, camera, rig_from_view, mix }),
+            overlays: self.overlays.clone(),
         }
     }
 

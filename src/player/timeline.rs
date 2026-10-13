@@ -8,6 +8,12 @@
 //! waveforms, moved and trimmed like cuts, and a line where the video ends
 //! (music beyond it fades out in the export).
 //!
+//! Above the cuts is the overlay lane, a canvas of its own (`OverlayLane`):
+//! its pictures as blocks, selected, moved and trimmed like music. Under
+//! each track (the overlays, once there are any, and the cuts) are two rows
+//! of its keyframes: effects, then motion (an overlay's) or view (a cut's),
+//! each marked by its ease; click one to jump there.
+//!
 //! It shows a window of the edit: the wheel zooms around the pointer, Shift
 //! or a sideways wheel pans, and when zoomed in a scrollbar at the bottom
 //! shows and moves the window.
@@ -29,14 +35,22 @@ const BAR: f32 = 8.0;
 /// The cut row's height, and the gap between cut blocks.
 const CUTS: f32 = 40.0;
 const GAP: f32 = 2.0;
-/// The seek bar's row and the music lane's, under the cuts.
-const SEEK: f32 = 28.0;
+/// Under a track, a row of its effect keyframes and one of its view (a
+/// cut's) or motion (an overlay's) keyframes.
+const EFFECTS: f32 = 16.0;
+const KEYS: f32 = 20.0;
+/// The rows under the cuts, top to bottom: their keyframes, the seek bar,
+/// the music lane.
+const EFFECTS_TOP: f32 = CUTS;
+const KEYS_TOP: f32 = EFFECTS_TOP + EFFECTS;
+const SEEK_TOP: f32 = KEYS_TOP + KEYS;
+const SEEK: f32 = 18.0;
 const MUSIC: f32 = 40.0;
-const MUSIC_TOP: f32 = CUTS + SEEK;
+const MUSIC_TOP: f32 = SEEK_TOP + SEEK;
 /// The scrollbar's row at the bottom, and the bar's thickness.
 const SCROLL: f32 = 8.0;
 const SCROLL_BAR: f32 = 5.0;
-pub const HEIGHT: f32 = CUTS + SEEK + MUSIC + SCROLL;
+pub const HEIGHT: f32 = MUSIC_TOP + MUSIC + SCROLL;
 /// A press on a cut that moves less than this is a click, not a drag.
 const DRAG_FROM: f32 = 4.0;
 /// A music edge dragged this close to a cut boundary, the playhead or
@@ -47,8 +61,6 @@ const SNAP: f32 = 8.0;
 const VOLUME_TOP: f64 = 6.0;
 const VOLUME_BOTTOM: f64 = crate::project::OFF_DB;
 const POINT: f32 = 4.0;
-/// How far above a cut block's bottom its effect keyframe marks sit.
-const EFFECT_ROW: f32 = 5.0;
 const EFFECT_MARK: iced::Color = iced::Color::from_rgb(0.78, 0.55, 1.0);
 /// Where a volume line runs: its top and height. The music's over the music
 /// lane, a cut's sound over its block.
@@ -57,6 +69,24 @@ const MUSIC_LANE: Lane = (MUSIC_TOP + 4.0, MUSIC - 8.0);
 const CUT_LANE: Lane = (4.0, CUTS - 8.0);
 const MUSIC_LINE: iced::Color = iced::Color::from_rgb(1.0, 0.78, 0.25);
 const SOUND_LINE: iced::Color = iced::Color::from_rgb(0.35, 0.85, 1.0);
+
+/// The overlay lane's height, above the cuts.
+pub const OVERLAY: f32 = 30.0;
+const OVERLAY_COLOUR: iced::Color = iced::Color::from_rgb(0.95, 0.55, 0.3);
+
+/// An overlay item as its lane shows it.
+pub struct OverlayBlock {
+    pub label: String,
+    /// Where it starts on the edit, its in point in its own time, and its
+    /// length.
+    pub from: f64,
+    pub start: f64,
+    pub len: f64,
+    /// Its effect keyframes' and motion keyframes' own times.
+    pub effects: Vec<f64>,
+    pub motion: Vec<(f64, Ease)>,
+    pub thumb: Option<Handle>,
+}
 
 /// One cut as the timeline shows it.
 pub struct Block {
@@ -125,6 +155,8 @@ pub struct Timeline {
     pub selected: Option<usize>,
     /// The keyframe at the playhead (cut, keyframe), drawn highlighted.
     pub current: Option<(usize, usize)>,
+    pub overlays: Vec<OverlayBlock>,
+    pub selected_overlay: Option<usize>,
 }
 
 #[derive(Default)]
@@ -227,7 +259,7 @@ impl Timeline {
     /// The effect keyframe mark under `p` (they sit along a cut's bottom):
     /// (cut, clip time).
     fn effect_at(&self, p: Point, b: Rectangle) -> Option<(usize, f64)> {
-        if p.y < CUTS - EFFECT_ROW - PICK / 2.0 || p.y > CUTS {
+        if !(EFFECTS_TOP..KEYS_TOP).contains(&p.y) {
             return None;
         }
         self.blocks.iter().enumerate().rev().find_map(|(i, c)| {
@@ -329,11 +361,13 @@ impl Timeline {
         use iced::widget::canvas;
         let layers = iced::widget::stack![
             canvas(Pictures(t.clone())).width(iced::Length::Fill).height(HEIGHT),
-            canvas(Marks(t)).width(iced::Length::Fill).height(HEIGHT),
+            canvas(Marks(t.clone())).width(iced::Length::Fill).height(HEIGHT),
         ];
         // Zoomed in, what is outside the window is drawn outside the widget;
         // canvases don't clip, so the container does.
-        iced::widget::container(layers).clip(true).into()
+        let height = OverlayLane::height(&t);
+        let lane = iced::widget::container(canvas(OverlayLane(t)).width(iced::Length::Fill).height(height)).clip(true);
+        iced::widget::column![lane, iced::widget::container(layers).clip(true)].into()
     }
 
     /// The music lane: its clips with their waveforms and handles, and where
@@ -449,6 +483,196 @@ impl Timeline {
     }
 }
 
+/// The overlay lane, over the cuts: a canvas of its own, so the rows under
+/// it keep their places.
+struct OverlayLane(Arc<Timeline>);
+
+#[derive(Default)]
+enum OverlayDrag {
+    #[default]
+    None,
+    Move { item: usize, x0: f32, at: f64, per_px: f64 },
+    /// An edge, at own time `from` when pressed.
+    Trim { item: usize, start: bool, x0: f32, from: f64, per_px: f64 },
+}
+
+impl OverlayLane {
+    fn item_at(&self, x: f32, b: Rectangle) -> Option<usize> {
+        self.0.overlays.iter().position(|o| x >= self.0.x(o.from, b) && x <= self.0.x(o.from + o.len, b))
+    }
+
+    fn edge_at(&self, i: usize, x: f32, b: Rectangle) -> Option<bool> {
+        let o = &self.0.overlays[i];
+        let (l, r) = (self.0.x(o.from, b), self.0.x(o.from + o.len, b));
+        if r - l < 3.0 * PICK {
+            Some(x - l < r - x)
+        } else if x - l <= PICK {
+            Some(true)
+        } else if r - x <= PICK {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// The lane, and its keyframe rows once it has items.
+    fn height(t: &Timeline) -> f32 {
+        if t.overlays.is_empty() { OVERLAY } else { OVERLAY + EFFECTS + KEYS }
+    }
+
+    /// The keyframe mark under `p` in its row: its edit time.
+    fn key_at(&self, p: Point, b: Rectangle) -> Option<f64> {
+        let effects = (OVERLAY..OVERLAY + EFFECTS).contains(&p.y);
+        if !effects && !(OVERLAY + EFFECTS..OVERLAY + EFFECTS + KEYS).contains(&p.y) {
+            return None;
+        }
+        self.0.overlays.iter().find_map(|o| {
+            let times: Vec<f64> = if effects { o.effects.clone() } else { o.motion.iter().map(|k| k.0).collect() };
+            times.into_iter().filter(|&t| t >= o.start && t <= o.start + o.len).map(|t| o.from + t - o.start).find(|&t| (self.0.x(t, b) - p.x).abs() <= PICK)
+        })
+    }
+}
+
+impl canvas::Program<Message> for OverlayLane {
+    type State = OverlayDrag;
+
+    fn update(&self, drag: &mut OverlayDrag, event: &iced::Event, bounds: Rectangle, cursor: mouse::Cursor) -> Option<canvas::Action<Message>> {
+        use iced::Event::Mouse;
+        let t = &self.0;
+        match event {
+            Mouse(mouse::Event::WheelScrolled { delta }) => {
+                let p = cursor.position_in(bounds)?;
+                let (dx, dy) = match *delta {
+                    mouse::ScrollDelta::Lines { x, y } => (x, y),
+                    mouse::ScrollDelta::Pixels { x, y } => (x / 40.0, y / 40.0),
+                };
+                let message = if dy != 0.0 {
+                    Message::TimelineZoom(1.25f64.powf(dy as f64), Some(t.t(p.x, bounds)))
+                } else if dx != 0.0 {
+                    Message::TimelinePan(t.start - dx as f64 * t.span * 0.1)
+                } else {
+                    return None;
+                };
+                Some(canvas::Action::publish(message).and_capture())
+            }
+            Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let p = cursor.position_in(bounds)?;
+                if let Some(at) = self.key_at(p, bounds) {
+                    return Some(canvas::Action::publish(Message::OverlayJump(at)).and_capture());
+                }
+                // Elsewhere in the keyframe rows: seek there.
+                if p.y >= OVERLAY {
+                    return Some(canvas::Action::publish(Message::OverlayJump(t.t(p.x, bounds))).and_capture());
+                }
+                let Some(item) = self.item_at(p.x, bounds) else {
+                    return Some(canvas::Action::publish(Message::OverlaySelect(None)).and_capture());
+                };
+                let o = &t.overlays[item];
+                let per_px = t.span / Timeline::width(bounds) as f64;
+                *drag = match self.edge_at(item, p.x, bounds) {
+                    Some(start) => OverlayDrag::Trim { item, start, x0: p.x, from: if start { o.start } else { o.start + o.len }, per_px },
+                    None => OverlayDrag::Move { item, x0: p.x, at: o.from, per_px },
+                };
+                Some(canvas::Action::publish(Message::OverlaySelect(Some(item))).and_capture())
+            }
+            Mouse(mouse::Event::CursorMoved { position }) => {
+                let x = position.x - bounds.x;
+                let message = match drag {
+                    OverlayDrag::None => return None,
+                    OverlayDrag::Move { item, x0, at, per_px } => Message::OverlayMove(*item, *at + (x - *x0) as f64 * *per_px),
+                    OverlayDrag::Trim { item, start, x0, from, per_px } => Message::OverlayTrim(*item, *start, *from + (x - *x0) as f64 * *per_px),
+                };
+                Some(canvas::Action::publish(message).and_capture())
+            }
+            Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => match std::mem::take(drag) {
+                OverlayDrag::None => None,
+                _ => Some(canvas::Action::publish(Message::ScrubDone).and_capture()),
+            },
+            _ => None,
+        }
+    }
+
+    fn draw(&self, _: &OverlayDrag, renderer: &Renderer, theme: &Theme, bounds: Rectangle, _: mouse::Cursor) -> Vec<Geometry> {
+        let t = &self.0;
+        let palette = theme.extended_palette();
+        let mut frame = Frame::new(renderer, bounds.size());
+        let (top, h) = (2.0, OVERLAY - 4.0);
+        let lane = Path::rounded_rectangle(Point::new(t.x(0.0, bounds), top), Size::new((t.x(t.duration, bounds) - t.x(0.0, bounds)).max(0.0), h), 4.0.into());
+        frame.fill(&lane, palette.background.weak.color.scale_alpha(0.5));
+        for (i, o) in t.overlays.iter().enumerate() {
+            let (l, r) = (t.x(o.from, bounds) + GAP / 2.0, t.x(o.from + o.len, bounds) - GAP / 2.0);
+            if r < 0.0 || l > bounds.width {
+                continue;
+            }
+            let block = Path::rounded_rectangle(Point::new(l, top), Size::new((r - l).max(1.0), h), 4.0.into());
+            let selected = Some(i) == t.selected_overlay;
+            frame.fill(&block, if selected { OVERLAY_COLOUR } else { OVERLAY_COLOUR.scale_alpha(0.55) });
+            if selected {
+                frame.stroke(&block, Stroke::default().with_width(2.0).with_color(palette.primary.strong.color));
+            }
+            for x in [l + 4.0, r - 4.0] {
+                frame.fill(&Path::rounded_rectangle(Point::new(x - 1.0, top + 4.0), Size::new(2.0, h - 8.0), 1.0.into()), iced::Color::from_rgba(1.0, 1.0, 1.0, 0.8));
+            }
+            // The picture, then its name, where there's room.
+            let mut text_x = l + 9.0;
+            if let Some(thumb) = &o.thumb
+                && r - l > 3.0 * h
+            {
+                frame.draw_image(Rectangle::new(Point::new(l + 8.0, top + 2.0), Size::new(h * 1.5, h - 4.0)), canvas::Image::new(thumb.clone()));
+                text_x += h * 1.5 + 2.0;
+            }
+            if r - text_x > o.label.chars().count() as f32 * 6.0 + 12.0 {
+                frame.fill_text(Text {
+                    content: o.label.clone(),
+                    position: Point::new(text_x, top + h / 2.0),
+                    color: iced::Color::BLACK,
+                    size: 11.0.into(),
+                    align_y: Vertical::Center,
+                    ..Default::default()
+                });
+            }
+        }
+        if !t.overlays.is_empty() {
+            draw_rows(&mut frame, theme, bounds, OVERLAY, "Motion");
+            let inside = |o: &OverlayBlock, k: f64| k >= o.start && k <= o.start + o.len;
+            for o in &t.overlays {
+                for &k in o.effects.iter().filter(|&&k| inside(o, k)) {
+                    let x = t.x(o.from + k - o.start, bounds);
+                    let mark = Path::rectangle(Point::new(x - 3.5, OVERLAY + EFFECTS / 2.0 - 3.5), Size::new(7.0, 7.0));
+                    frame.fill(&mark, EFFECT_MARK);
+                    frame.stroke(&mark, Stroke::default().with_width(1.0).with_color(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.7)));
+                }
+                for &(k, ease) in o.motion.iter().filter(|(k, _)| inside(o, *k)) {
+                    let mark = key_mark(t.x(o.from + k - o.start, bounds), OVERLAY + EFFECTS + KEYS / 2.0, ease);
+                    frame.fill(&mark, OVERLAY_COLOUR);
+                    frame.stroke(&mark, Stroke::default().with_width(1.5).with_color(palette.background.base.color));
+                }
+            }
+        }
+        let at = t.x(t.position, bounds);
+        frame.fill(&Path::rectangle(Point::new(at - 1.0, 0.0), Size::new(2.0, OverlayLane::height(t))), palette.primary.strong.color);
+        vec![frame.into_geometry()]
+    }
+
+    fn mouse_interaction(&self, drag: &OverlayDrag, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
+        match drag {
+            OverlayDrag::Trim { .. } => mouse::Interaction::ResizingHorizontally,
+            OverlayDrag::Move { .. } => mouse::Interaction::Grabbing,
+            OverlayDrag::None => {
+                let Some(p) = cursor.position_in(bounds) else { return mouse::Interaction::default() };
+                if p.y >= OVERLAY {
+                    return mouse::Interaction::Pointer;
+                }
+                match self.item_at(p.x, bounds) {
+                    Some(i) if self.edge_at(i, p.x, bounds).is_some() => mouse::Interaction::ResizingHorizontally,
+                    Some(_) => mouse::Interaction::Grab,
+                    None => mouse::Interaction::default(),
+                }
+            }
+        }
+    }
+}
+
 struct Pictures(Arc<Timeline>);
 
 impl canvas::Program<Message> for Pictures {
@@ -526,6 +750,39 @@ fn draw_line(frame: &mut Frame, b: Rectangle, lane: Lane, colour: iced::Color, e
     }
 }
 
+/// The two keyframe rows under a track from `top`: faint bands with their
+/// names at the left, effects above, `keys` (view or motion) below.
+fn draw_rows(frame: &mut Frame, theme: &Theme, b: Rectangle, top: f32, keys: &str) {
+    let palette = theme.extended_palette();
+    for (y, h, name) in [(top, EFFECTS, "Effects"), (top + EFFECTS, KEYS, keys)] {
+        frame.fill(&Path::rectangle(Point::new(0.0, y + 1.0), Size::new(b.width, h - 2.0)), palette.background.weak.color.scale_alpha(0.25));
+        frame.fill_text(Text {
+            content: name.to_owned(),
+            position: Point::new(PICK + 2.0, y + h / 2.0),
+            color: palette.background.base.text.scale_alpha(0.35),
+            size: 10.0.into(),
+            align_y: Vertical::Center,
+            ..Default::default()
+        });
+    }
+}
+
+/// A keyframe mark at (`x`, `y`) shaped by its ease: smooth a diamond,
+/// linear a circle, hold a square.
+fn key_mark(x: f32, y: f32, ease: Ease) -> Path {
+    match ease {
+        Ease::Smooth => Path::new(|p| {
+            p.move_to(Point::new(x, y - DIAMOND));
+            p.line_to(Point::new(x + DIAMOND, y));
+            p.line_to(Point::new(x, y + DIAMOND));
+            p.line_to(Point::new(x - DIAMOND, y));
+            p.close();
+        }),
+        Ease::Linear => Path::circle(Point::new(x, y), DIAMOND * 0.8),
+        Ease::Hold => Path::rectangle(Point::new(x - DIAMOND * 0.7, y - DIAMOND * 0.7), Size::new(DIAMOND * 1.4, DIAMOND * 1.4)),
+    }
+}
+
 struct Marks(Arc<Timeline>);
 
 impl std::ops::Deref for Marks {
@@ -576,7 +833,7 @@ impl canvas::Program<Message> for Marks {
                     let start = if p.x >= l && p.x <= r { self.start } else { self.start + (p.x - (l + r) / 2.0) as f64 * per_px };
                     *drag = Drag::Scroll { x0: p.x, start };
                     Message::TimelinePan(start)
-                } else if p.y < CUTS && let Some((cut, t)) = self.effect_at(p, bounds) {
+                } else if let Some((cut, t)) = self.effect_at(p, bounds) {
                     Message::Effect(super::effects::EffectMsg::Jump(cut, t))
                 } else if p.y < CUTS && let Some((cut, key)) = self.sound_at(p, bounds) {
                     *drag = Drag::Sound { cut, key };
@@ -626,7 +883,7 @@ impl canvas::Program<Message> for Marks {
                         None => Drag::MusicMove { clip, x0: p.x, at: m.from, per_px },
                     };
                     Message::SelectMusic(clip)
-                } else if let Some((cut, key)) = self.key_at(p.x, bounds) {
+                } else if (KEYS_TOP..SEEK_TOP).contains(&p.y) && let Some((cut, key)) = self.key_at(p.x, bounds) {
                     *drag = Drag::Key { cut, key };
                     Message::KeyJump(cut, key)
                 } else {
@@ -690,6 +947,7 @@ impl canvas::Program<Message> for Marks {
         let drag = &state.drag;
         let palette = theme.extended_palette();
         let mut frame = Frame::new(renderer, bounds.size());
+        draw_rows(&mut frame, theme, bounds, EFFECTS_TOP, "View");
         for (i, c) in self.blocks.iter().enumerate() {
             let (l, r) = self.block_x(c, bounds);
             let block = Path::rounded_rectangle(Point::new(l, 0.0), Size::new((r - l).max(1.0), CUTS), 4.0.into());
@@ -721,7 +979,7 @@ impl canvas::Program<Message> for Marks {
         for c in &self.blocks {
             for &t in c.effects.iter().filter(|&&t| t >= c.start && t <= c.start + c.len) {
                 let x = self.x(c.from + t - c.start, bounds);
-                let mark = Path::rectangle(Point::new(x - 3.5, CUTS - EFFECT_ROW - 3.5), Size::new(7.0, 7.0));
+                let mark = Path::rectangle(Point::new(x - 3.5, EFFECTS_TOP + EFFECTS / 2.0 - 3.5), Size::new(7.0, 7.0));
                 frame.fill(&mark, EFFECT_MARK);
                 frame.stroke(&mark, Stroke::default().with_width(1.0).with_color(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.7)));
             }
@@ -745,7 +1003,8 @@ impl canvas::Program<Message> for Marks {
         }
 
         self.draw_music(&mut frame, theme, bounds);
-        let mid = CUTS + SEEK / 2.0;
+        let mid = SEEK_TOP + SEEK / 2.0;
+        let keys_mid = KEYS_TOP + KEYS / 2.0;
         let (x0, x1) = (self.x(0.0, bounds), self.x(self.duration, bounds));
         let bar = |from: f32, to: f32| Path::rounded_rectangle(Point::new(from, mid - BAR / 2.0), Size::new((to - from).max(0.0), BAR), (BAR / 2.0).into());
         frame.fill(&bar(x0, x1), palette.background.strong.color);
@@ -758,19 +1017,9 @@ impl canvas::Program<Message> for Marks {
         }
         for (ci, c) in self.blocks.iter().enumerate() {
             for &(ki, t, ease, follows) in &c.keys {
-                let x = self.x(c.from + t - c.start, bounds);
+                let (x, mid) = (self.x(c.from + t - c.start, bounds), keys_mid);
                 // Smooth is a diamond, linear a circle, hold a square.
-                let mark = match ease {
-                    Ease::Smooth => Path::new(|p| {
-                        p.move_to(Point::new(x, mid - DIAMOND));
-                        p.line_to(Point::new(x + DIAMOND, mid));
-                        p.line_to(Point::new(x, mid + DIAMOND));
-                        p.line_to(Point::new(x - DIAMOND, mid));
-                        p.close();
-                    }),
-                    Ease::Linear => Path::circle(Point::new(x, mid), DIAMOND * 0.8),
-                    Ease::Hold => Path::rectangle(Point::new(x - DIAMOND * 0.7, mid - DIAMOND * 0.7), Size::new(DIAMOND * 1.4, DIAMOND * 1.4)),
-                };
+                let mark = key_mark(x, mid, ease);
                 let fill = if Some((ci, ki)) == self.current { palette.primary.strong.color } else { palette.background.base.text };
                 frame.fill(&mark, fill);
                 frame.stroke(&mark, Stroke::default().with_width(1.5).with_color(palette.background.base.color));
@@ -781,7 +1030,7 @@ impl canvas::Program<Message> for Marks {
             }
         }
         self.draw_sound(&mut frame, bounds);
-        frame.fill(&Path::rectangle(Point::new(at - 1.0, 0.0), Size::new(2.0, CUTS)), palette.primary.strong.color);
+        frame.fill(&Path::rectangle(Point::new(at - 1.0, 0.0), Size::new(2.0, SEEK_TOP)), palette.primary.strong.color);
         frame.fill(&Path::rectangle(Point::new(at - 1.0, MUSIC_TOP), Size::new(2.0, MUSIC)), palette.primary.strong.color);
         frame.fill(&Path::circle(Point::new(at, mid), BAR), palette.primary.strong.color);
         if self.zoomed() {
@@ -817,13 +1066,11 @@ impl canvas::Program<Message> for Marks {
                     };
                 }
                 if p.y >= CUTS {
-                    return if self.key_at(p.x, bounds).is_some() { mouse::Interaction::Grab } else { mouse::Interaction::Pointer };
+                    let on = if p.y < KEYS_TOP { self.effect_at(p, bounds).is_some() } else { p.y < SEEK_TOP && self.key_at(p.x, bounds).is_some() };
+                    return if on && p.y >= KEYS_TOP { mouse::Interaction::Grab } else { mouse::Interaction::Pointer };
                 }
                 if self.sound_at(p, bounds).is_some() {
                     return mouse::Interaction::Grab;
-                }
-                if self.effect_at(p, bounds).is_some() {
-                    return mouse::Interaction::Pointer;
                 }
                 if state.ctrl && self.block_at(p.x, bounds).is_some() {
                     return mouse::Interaction::Crosshair;

@@ -35,6 +35,9 @@ pub struct Project {
     /// Fades from black at the start and to black at the end.
     #[serde(default, skip_serializing_if = "Fades::is_none")]
     pub fades: Fades,
+    /// Lanes of pictures over the picture, the first lowest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlays: Vec<crate::overlay::Lane>,
 }
 
 /// The edit's fades from black at its start and to black at its end, in
@@ -379,6 +382,20 @@ impl Project {
             }
             clip.input = dir.join(&clip.input);
         }
+        for (n, item) in project.overlays.iter_mut().flat_map(|l| &mut l.items).enumerate() {
+            if item.end <= item.start || item.at < 0.0 {
+                bail!("overlay {} is empty or starts before the edit", n + 1);
+            }
+            if item.motion.iter().any(|k| !k.t.is_finite() || k.place.values().iter().any(|v| !v.is_finite())) {
+                bail!("an overlay's motion keyframe isn't a number");
+            }
+            if item.effects.iter().any(|k| !k.t.is_finite() || k.grade.values().iter().any(|v| !v.is_finite())) {
+                bail!("an overlay's effect keyframe isn't a number");
+            }
+            item.input = dir.join(&item.input);
+            item.motion.sort_by(|a, b| a.t.total_cmp(&b.t));
+            item.effects.sort_by(|a, b| a.t.total_cmp(&b.t));
+        }
         if project.cuts.iter().any(|c| !c.crossfade.is_finite()) {
             bail!("a crossfade isn't a number");
         }
@@ -417,6 +434,11 @@ impl Project {
         for clip in &mut project.music.clips {
             if let Ok(rel) = clip.input.strip_prefix(dir) {
                 clip.input = rel.to_owned();
+            }
+        }
+        for item in project.overlays.iter_mut().flat_map(|l| &mut l.items) {
+            if let Ok(rel) = item.input.strip_prefix(dir) {
+                item.input = rel.to_owned();
             }
         }
         std::fs::write(path, serde_json::to_string_pretty(&project)? + "\n").with_context(|| format!("writing {}", path.display()))
