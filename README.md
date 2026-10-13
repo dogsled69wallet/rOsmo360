@@ -18,10 +18,10 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 
 ### Playing
 
-- **Stitching** with DJI's own calibration, read from each clip. Per frame it also:
-  - evens out the two lenses' exposure along the seam;
-  - shifts the lenses to line up close subjects, such as the hand on a selfie stick, so they don't ghost.
-  - fades each lens out smoothly where DJI's masks hide the selfie stick, so sun glare in one lens leaves no line in the sky.
+- **Stitching** with DJI's own calibration, read from each clip, keeping each lens's colours as the camera recorded them. Per frame it also:
+  - shifts the lenses to line up close subjects, such as the hand on a selfie stick, so they don't ghost;
+  - cuts cleanly to one lens where the two see different things (a fist in front of the sky), and blends everywhere else, so sun glare in one lens doesn't draw a line across the landscape;
+  - fades each lens out smoothly where DJI's masks hide the selfie stick, so glare leaves no line in the sky.
 - **Stabilisation** from the camera's built-in 1 kHz motion data, with rolling-shutter correction:
   - **Horizon**: a level horizon that follows where you point the camera.
   - **Level**: a level horizon that stays pointing one way in the world while the camera turns.
@@ -259,7 +259,7 @@ Clips' telemetry and thumbnails are cached in `~/.cache/rosmo360`, so a clip ope
 
 ## Roadmap
 
-- Version 0.3: ordinary video files (MP4, MOV from a phone or drone) as cuts beside the Osmo clips.
+- Version 0.3: ordinary video files (MP4, MOV from a phone or drone) and pictures as cuts beside the Osmo clips, an opacity effect, and an overlay track for pictures, text and picture-in-picture video.
 - 360° metadata on equirectangular exports, so YouTube and VR players show them as 360° video.
 - Smooth full-resolution playback on modest hardware (zero-copy decoding).
 - Windows and macOS builds.
