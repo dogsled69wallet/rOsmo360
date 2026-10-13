@@ -5,6 +5,10 @@
 //! frame matches the samples actually heard, so the two cannot drift apart
 //! however long the clip. If decoding falls behind, the device gets silence
 //! and the clock stops with it.
+//!
+//! Each stream's volume is its level in the mix; the listening volume is one
+//! for them all (`set_listening`), so the meter (`levels`) can sum what the
+//! streams send as the export mixes them, whatever the speakers are set to.
 
 use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -14,12 +18,59 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How much decoded audio to keep ahead of the device.
 const BUFFER_SECONDS: f64 = 0.5;
+
+/// The speakers' volume (f32 bits), on top of every stream's own.
+static LISTENING: AtomicU32 = AtomicU32::new(0x3f80_0000);
+
+pub fn set_listening(volume: f32) {
+    LISTENING.store(volume.to_bits(), Ordering::Relaxed);
+}
+
+/// What every stream sends at its mix level, summed per output frame (left
+/// and right) by when it reaches the speakers, for the meter. The streams
+/// share one device, so one rate; a callback's frames are placed by the
+/// time it ran plus the device's latency, which aligns them within a
+/// callback's jitter, plenty for a meter.
+struct Meter {
+    rate: f64,
+    /// A ring of (output frame, summed left and right); a slot holding
+    /// another frame is silence.
+    slots: Vec<(u64, [f32; 2])>,
+}
+
+/// Seconds the meter's ring covers.
+const METER_SECONDS: f64 = 0.5;
+
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+static METER: Mutex<Meter> = Mutex::new(Meter { rate: 0.0, slots: Vec::new() });
+
+/// Peak and RMS per channel (left, right), linear, of the mix reaching the
+/// speakers over the last `window` seconds; silence when nothing plays.
+pub fn levels(window: f64) -> ([f32; 2], [f32; 2]) {
+    let m = METER.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut peak, mut sum) = ([0f32; 2], [0f64; 2]);
+    if m.rate <= 0.0 || m.slots.is_empty() {
+        return (peak, [0.0; 2]);
+    }
+    let now = (EPOCH.elapsed().as_secs_f64() * m.rate) as u64;
+    let n = ((window * m.rate) as u64).clamp(1, m.slots.len() as u64);
+    for f in now.saturating_sub(n)..now {
+        let (at, s) = m.slots[(f % m.slots.len() as u64) as usize];
+        if at == f {
+            for c in 0..2 {
+                peak[c] = peak[c].max(s[c].abs());
+                sum[c] += (s[c] as f64).powi(2);
+            }
+        }
+    }
+    (peak, sum.map(|s| (s / n as f64).sqrt() as f32))
+}
 
 struct Shared {
     samples: Mutex<VecDeque<f32>>,
@@ -156,6 +207,8 @@ impl Drop for Audio {
 
 fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: &StreamConfig, shared: Arc<Shared>) -> Result<cpal::Stream> {
     let channels = config.channels as usize;
+    let rate = config.sample_rate as f64;
+    let mut next = 0u64;
     let stream = device.build_output_stream(
         *config,
         move |data: &mut [T], info: &OutputCallbackInfo| {
@@ -167,13 +220,37 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: &Strea
                 return;
             }
             let volume = f32::from_bits(shared.volume.load(Ordering::Relaxed));
+            let listening = f32::from_bits(LISTENING.load(Ordering::Relaxed));
             let mut q = shared.samples.lock().unwrap();
             // Only whole frames count towards the clock; an underrun plays
             // silence without advancing it.
             let frames = (q.len() / channels).min(data.len() / channels);
-            for (i, s) in data.iter_mut().enumerate() {
-                *s = T::from_sample(if i < frames * channels { q.pop_front().unwrap_or(0.0) * volume } else { 0.0 });
+            let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+            if meter.rate != rate {
+                *meter = Meter { rate, slots: vec![(u64::MAX, [0.0; 2]); (METER_SECONDS * rate) as usize] };
             }
+            // Never over this stream's last frames, which would count it twice.
+            let first = (((EPOCH.elapsed() + latency).as_secs_f64() * rate) as u64).max(next);
+            next = first + (data.len() / channels) as u64;
+            let len = meter.slots.len() as u64;
+            for (i, frame) in data.chunks_mut(channels).enumerate() {
+                let slot = &mut meter.slots[((first + i as u64) % len) as usize];
+                if slot.0 != first + i as u64 {
+                    *slot = (first + i as u64, [0.0; 2]);
+                }
+                for (c, s) in frame.iter_mut().enumerate() {
+                    let v = if i < frames { q.pop_front().unwrap_or(0.0) * volume } else { 0.0 };
+                    // Mono counts on both sides; past the front pair, none.
+                    if c < 2 {
+                        slot.1[c] += v;
+                        if channels == 1 {
+                            slot.1[1] += v;
+                        }
+                    }
+                    *s = T::from_sample(v * listening);
+                }
+            }
+            drop(meter);
             drop(q);
             shared.played.fetch_add(frames as u64, Ordering::Relaxed);
         },

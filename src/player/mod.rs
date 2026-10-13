@@ -6,6 +6,7 @@ mod audio;
 mod edit;
 mod export;
 mod gpu;
+mod meter;
 mod playback;
 pub mod render;
 mod settings;
@@ -422,6 +423,8 @@ struct App {
     thumbs: std::collections::HashMap<PathBuf, Vec<(f64, image::Handle)>>,
     /// Songs' waveforms, and the music clip selected on its lane.
     waveforms: std::collections::HashMap<PathBuf, Arc<music::Waveform>>,
+    /// The mix's level as it plays.
+    meter: meter::Meter,
     /// The overlays' pictures, scaled for the view: `None` while loading.
     overlay_pictures: std::collections::HashMap<String, Option<(u64, Arc<crate::overlay::Picture>)>>,
     /// Their timeline thumbnails.
@@ -529,6 +532,7 @@ struct App {
 
 impl App {
     fn new(opts: Options, saved: settings::Settings) -> Self {
+        audio::set_listening(if saved.muted { 0.0 } else { saved.volume });
         App {
             opts,
             followed: Default::default(),
@@ -537,6 +541,7 @@ impl App {
             library: Vec::new(),
             thumbs: Default::default(),
             waveforms: Default::default(),
+            meter: Default::default(),
             overlay_pictures: Default::default(),
             overlay_thumbs: Default::default(),
             text_content: Default::default(),
@@ -631,7 +636,6 @@ impl App {
     /// Keeps the music in step with the edit: playing where playback is, at
     /// its level, or stopped while playback is.
     fn follow_music(&mut self) {
-        let listen = self.volume();
         let (playing, t) = match &self.clip {
             // Only while the clock runs: waiting for its first frame it stands
             // still, and music started then took it as drift and restarted
@@ -639,7 +643,8 @@ impl App {
             Some(c) if self.current < self.edit.cuts.len() => (c.playback.running(), self.edit.edit_time(self.current, c.playback.now())),
             _ => (false, 0.0),
         };
-        self.music.follow(&self.edit.music, t, self.edit.duration(), listen, playing);
+        self.music.follow(&self.edit.music, t, self.edit.duration(), playing);
+        self.meter.follow(playing);
         // The cut's own volume points move its level as it plays, and
         // through a crossfade the two cuts trade places, equal power.
         let shares = self.crossfade_shares();
@@ -650,7 +655,7 @@ impl App {
         }
         if let (Some((_, theirs)), Some((i, inc))) = (shares, &self.partner) {
             let points = self.edit.cuts.get(*i).map_or(0.0, |c| crate::project::volume_at(&c.volume, inc.playback.now()));
-            let v = self.volume() * music::gain(self.edit.sound.volume + points) * quarter(theirs);
+            let v = music::gain(self.edit.sound.volume + points) * quarter(theirs);
             if let Some((_, inc)) = &mut self.partner {
                 inc.playback.set_volume(v);
             }
@@ -773,14 +778,14 @@ impl App {
         (startup * 1.5).max(0.5)
     }
 
-    /// The clips' sound at the speakers: the listening volume, its level in
-    /// the mix, and the playing cut's volume points where it is.
+    /// The clips' sound in the mix: its level and the playing cut's volume
+    /// points where it is (the listening volume is `audio::set_listening`'s).
     fn clip_volume(&self) -> f32 {
         let points = match (&self.clip, self.edit.cuts.get(self.current)) {
             (Some(c), Some(cut)) => crate::project::volume_at(&cut.volume, c.playback.now()),
             _ => 0.0,
         };
-        self.volume() * music::gain(self.edit.sound.volume + points)
+        music::gain(self.edit.sound.volume + points)
     }
 
     /// Reads `path`'s waveform for the music lane, unless it has it.
@@ -2032,14 +2037,12 @@ impl App {
             },
             Message::Mute => {
                 self.muted = !self.muted;
-                let v = self.clip_volume();
-                self.with_playback(|p| p.set_volume(v));
+                audio::set_listening(self.volume());
             }
             Message::Volume(v) => {
                 self.volume = v;
                 self.muted = false;
-                let v = self.clip_volume();
-                self.with_playback(|p| p.set_volume(v));
+                audio::set_listening(self.volume());
             }
             Message::ResetView => self.free_look().reset(),
             Message::Fullscreen => {
@@ -2998,6 +3001,20 @@ impl App {
                 tooltip::Position::Top,
             ),
             slider(0.0..=1.0, self.volume(), Message::Volume).step(0.01f32).width(90),
+            tip(
+                row![
+                    canvas(self.meter.view()).width(meter::WIDTH).height(meter::HEIGHT),
+                    // The loudest since play started, red past 0 dBFS.
+                    text(self.meter.loudest.map_or("–".to_string(), |l| if l > -48.0 { format!("{l:+.1}") } else { "–".to_string() }))
+                        .size(12)
+                        .width(38)
+                        .color_maybe(self.meter.loudest.filter(|&l| l >= 0.0).map(|_| iced::Color::from_rgb8(0xe5, 0x3e, 0x3e))),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                text("The mix as it plays, left and right: peak (faint) and RMS, red past 0 dBFS; the number is the loudest peak since play started, dBFS. It sums the clip sound and music at their levels, as the export mixes them, whatever the speakers are set to."),
+                tooltip::Position::Top,
+            ),
         ]
         .spacing(12)
         .padding([4, 10])
