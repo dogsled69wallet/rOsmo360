@@ -1,7 +1,8 @@
 //! What loading a clip reads from it, kept so the next load doesn't: the
 //! calibration and attitude (telemetry-parser walks the whole `.OSV` for
 //! them: 0047, 7.4 min, took 53 s from a network share and 5.5 s from
-//! memory) and the timeline thumbnails.
+//! memory), the timeline thumbnails and songs' waveforms for the music
+//! lane (a second's decode each).
 //!
 //! Entries are named by a fingerprint of the clip's contents, not its path,
 //! so moved or renamed footage still finds its entry: the size and a hash of
@@ -29,6 +30,8 @@ use telemetry_parser::rig::CameraRig;
 /// they outlive updates, so a new version doesn't re-read every clip.
 const FORMAT: u32 = 1;
 const MAGIC: &[u8; 8] = b"rOsmo360";
+/// What entries are named, after the fingerprint.
+const KINDS: [&str; 3] = ["telemetry", "thumbs", "wave"];
 
 static OFF: AtomicBool = AtomicBool::new(false);
 
@@ -105,6 +108,34 @@ pub fn thumbs(input: &Path, (width, height): (usize, usize)) -> Option<Vec<Thumb
 pub fn store_thumbs(input: &Path, size: (usize, usize), thumbs: &[Thumb]) {
     if let Some(e) = entry(input, "thumbs") {
         store(&e, |w| write_thumbs(w, size, thumbs));
+    }
+}
+
+/// `song`'s cached waveform, if it was made with peaks `step` seconds apart:
+/// the peaks and the song's length.
+pub fn waveform(song: &Path, step: f64) -> Option<(Vec<f32>, f64)> {
+    hit(&entry(song, "wave")?, |r| {
+        if f64::from_le_bytes(take(r)?) != step {
+            return None;
+        }
+        let duration = f64::from_le_bytes(take(r)?);
+        let n = u64_from(r)? as usize;
+        let peaks = (0..n).map(|_| take(r).map(f32::from_le_bytes)).collect::<Option<Vec<_>>>()?;
+        Some((peaks, duration))
+    })
+}
+
+pub fn store_waveform(song: &Path, step: f64, peaks: &[f32], duration: f64) {
+    if let Some(e) = entry(song, "wave") {
+        store(&e, |w| {
+            w.extend(step.to_le_bytes());
+            w.extend(duration.to_le_bytes());
+            w.extend((peaks.len() as u64).to_le_bytes());
+            for p in peaks {
+                w.extend(p.to_le_bytes());
+            }
+            Ok(())
+        });
     }
 }
 
@@ -295,7 +326,7 @@ pub fn has(input: &Path) -> bool {
 
 /// Drops `input`'s entries, so it is read afresh (`cache add --force`).
 pub fn forget(input: &Path) -> Result<()> {
-    for kind in ["telemetry", "thumbs"] {
+    for kind in KINDS {
         if let Some(e) = entry(input, kind) {
             match fs::remove_file(&e) {
                 Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err).with_context(|| format!("removing {}", e.display())),
@@ -363,7 +394,7 @@ pub fn clear(older_than: Option<f64>) -> Result<()> {
 fn entries(dir: &Path) -> impl Iterator<Item = (PathBuf, fs::Metadata)> {
     fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| {
         let path = e.path();
-        let ours = path.extension().is_some_and(|x| x == "telemetry" || x == "thumbs");
+        let ours = path.extension().is_some_and(|x| KINDS.iter().any(|k| x == *k));
         (ours && e.file_type().ok()?.is_file()).then(|| Some((path, e.metadata().ok()?))).flatten()
     })
 }

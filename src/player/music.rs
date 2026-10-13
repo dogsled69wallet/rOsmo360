@@ -33,9 +33,13 @@ pub struct Waveform {
 }
 
 impl Waveform {
-    /// Decodes `path` to mono at 8 kHz, which is plenty for a picture of its
-    /// loudness: a 6-minute song takes about a second.
+    /// From the clip cache, else decoded from `path` to mono at 8 kHz, which
+    /// is plenty for a picture of its loudness: a 6-minute song takes about
+    /// a second.
     pub fn read(path: &Path) -> Result<Waveform> {
+        if let Some((peaks, duration)) = crate::cache::waveform(path, WAVE_STEP) {
+            return Ok(Waveform { peaks, duration });
+        }
         const RATE: usize = 8000;
         let mut child = Command::new("ffmpeg")
             .args(["-v", "error", "-nostdin", "-i"])
@@ -53,8 +57,10 @@ impl Waveform {
         if samples.is_empty() {
             anyhow::bail!("{} has no sound", path.display());
         }
-        let peaks = samples.chunks(per).map(|c| c.iter().fold(0.0f32, |m, &v| m.max(v)).min(1.0)).collect();
-        Ok(Waveform { peaks, duration: samples.len() as f64 / RATE as f64 })
+        let peaks: Vec<f32> = samples.chunks(per).map(|c| c.iter().fold(0.0f32, |m, &v| m.max(v)).min(1.0)).collect();
+        let duration = samples.len() as f64 / RATE as f64;
+        crate::cache::store_waveform(path, WAVE_STEP, &peaks, duration);
+        Ok(Waveform { peaks, duration })
     }
 }
 
