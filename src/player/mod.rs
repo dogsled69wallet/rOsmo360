@@ -1828,7 +1828,7 @@ impl App {
                         // Even sizes keep image tools that halve chroma happy.
                         let px = |v: f32| ((v * k / 2.0).round() as usize).max(1) * 2;
                         export::Shot::View {
-                            camera: self.camera(),
+                            camera: Box::new(self.camera()),
                             size: (px(self.view_size.width), px(self.view_size.height)),
                         }
                     }

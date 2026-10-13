@@ -256,7 +256,7 @@ fn exposure_gain(lens: u32, d: vec3f, theta: f32) -> vec3f {
 }
 
 // Mirrors `Grade::apply` in grade.rs: exposure and white balance on light,
-// tone and colour on display values, then the vignette and fade.
+// tone and colour on display values, then the vignette, opacity and fade.
 fn grade(rgb: vec3f, at: vec2f, aspect: f32) -> vec3f {
     let g0 = u.grade[0];
     let g1 = u.grade[1];
@@ -277,7 +277,7 @@ fn grade(rgb: vec3f, at: vec2f, aspect: f32) -> vec3f {
     let s = (1.0 + g1.z) * (1.0 + g1.w * (1.0 - clamp(spread, 0.0, 1.0)));
     c = vec3f(l) + (c - vec3f(l)) * s;
     let r = length(vec2f(at.x * aspect, at.y)) / sqrt(aspect * aspect + 1.0);
-    let keep = (1.0 - g2.x * smoothstep(0.3, 1.0, r)) * (1.0 - g2.y);
+    let keep = (1.0 - g2.x * smoothstep(0.3, 1.0, r)) * g2.w * (1.0 - g2.y);
     return clamp(c * keep, vec3f(0.0), vec3f(1.0));
 }
 

@@ -1,6 +1,6 @@
 //! Colour effects on the framed picture: exposure, white balance, tone,
-//! saturation and a vignette, keyframed per cut, plus the edit's fades from
-//! and to black.
+//! saturation, a vignette and opacity, keyframed per cut, plus the edit's
+//! fades from and to black.
 //!
 //! They act on the stitched view, after framing, so the player and both
 //! export paths grade the same picture and a crossfade blends two graded
@@ -12,8 +12,9 @@
 use crate::view::Ease;
 use serde::{Deserialize, Serialize};
 
-/// The effects' values; all 0 is the picture untouched.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// The effects' values; the default (all 0, opacity 1) is the picture
+/// untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Grade {
     /// Stops, −3..3.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -40,14 +41,35 @@ pub struct Grade {
     /// 0..1: how dark the corners go.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub vignette: f64,
+    /// 0..1: how much of the picture shows. On the main track what's left
+    /// is black, as in a fade; an overlay will show what's beneath.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub opacity: f64,
     /// 0..1: how far faded to black, from the edit's fades; not keyframed.
     #[serde(skip)]
     pub black: f64,
 }
 
+impl Default for Grade {
+    fn default() -> Self {
+        Grade::from_values(NEUTRAL)
+    }
+}
+
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
 }
+
+fn one() -> f64 {
+    1.0
+}
+
+fn is_one(v: &f64) -> bool {
+    *v == 1.0
+}
+
+/// `Grade::values` of the picture untouched.
+pub const NEUTRAL: [f64; 10] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 
 /// Stops of colour per unit of temperature or tint: at ±1, red and blue
 /// are four times apart, enough to neutralise shade or low sun.
@@ -59,13 +81,13 @@ impl Grade {
     }
 
     /// The fields as a list, for blending and the panel.
-    pub fn values(&self) -> [f64; 9] {
-        [self.exposure, self.contrast, self.highlights, self.shadows, self.temperature, self.tint, self.saturation, self.vibrance, self.vignette]
+    pub fn values(&self) -> [f64; 10] {
+        [self.exposure, self.contrast, self.highlights, self.shadows, self.temperature, self.tint, self.saturation, self.vibrance, self.vignette, self.opacity]
     }
 
-    pub fn from_values(v: [f64; 9]) -> Grade {
-        let [exposure, contrast, highlights, shadows, temperature, tint, saturation, vibrance, vignette] = v;
-        Grade { exposure, contrast, highlights, shadows, temperature, tint, saturation, vibrance, vignette, black: 0.0 }
+    pub fn from_values(v: [f64; 10]) -> Grade {
+        let [exposure, contrast, highlights, shadows, temperature, tint, saturation, vibrance, vignette, opacity] = v;
+        Grade { exposure, contrast, highlights, shadows, temperature, tint, saturation, vibrance, vignette, opacity, black: 0.0 }
     }
 
     /// Grades display-encoded `rgb` (0..1) at screen point `at` (−1..1 each
@@ -99,23 +121,23 @@ impl Grade {
         let spread = c.iter().fold(f64::MIN, |a, &v| a.max(v)) - c.iter().fold(f64::MAX, |a, &v| a.min(v));
         let s = (1.0 + self.saturation) * (1.0 + self.vibrance * (1.0 - spread.clamp(0.0, 1.0)));
         c = c.map(|v| l + (v - l) * s);
-        // The vignette, by distance from the centre (1 at the corners), and
-        // the fade to black.
+        // The vignette, by distance from the centre (1 at the corners), the
+        // opacity over black and the fade to black.
         let r = ((at[0] * aspect).powi(2) + at[1].powi(2)).sqrt() / (aspect * aspect + 1.0).sqrt();
-        let keep = (1.0 - self.vignette * smooth(0.3, 1.0, r)) * (1.0 - self.black);
+        let keep = (1.0 - self.vignette * smooth(0.3, 1.0, r)) * self.opacity * (1.0 - self.black);
         c.map(|v| (v * keep).clamp(0.0, 1.0))
     }
 
     /// For the shader: (exposure gain, temperature and tint in stops,
     /// contrast gain),
     /// (highlights, shadows, saturation, vibrance), (vignette, black, 1 if
-    /// it does anything, 0).
+    /// it does anything, opacity).
     pub fn uniforms(&self) -> [[f32; 4]; 3] {
         let f = |v: f64| v as f32;
         [
             [f(2f64.powf(self.exposure)), f(WB_STOPS * self.temperature), f(WB_STOPS * self.tint), f(2f64.powf(self.contrast))],
             [f(self.highlights), f(self.shadows), f(self.saturation), f(self.vibrance)],
-            [f(self.vignette), f(self.black), if self.is_neutral() { 0.0 } else { 1.0 }, 0.0],
+            [f(self.vignette), f(self.black), if self.is_neutral() { 0.0 } else { 1.0 }, f(self.opacity)],
         ]
     }
 }
@@ -183,6 +205,9 @@ mod tests {
         assert_eq!(v.apply(grey, mid, 1.6), grey);
         assert!(v.apply(grey, [1.0, 1.0], 1.6)[0] < 0.01);
         assert_eq!(Grade { black: 1.0, ..Default::default() }.apply(grey, mid, 1.6), [0.0; 3]);
+        // Opacity goes towards black, and its default is the picture whole.
+        assert!(Grade::default().opacity == 1.0 && Grade::default().is_neutral());
+        assert!((Grade { opacity: 0.25, ..Default::default() }.apply(grey, mid, 1.6)[0] - 0.125).abs() < 1e-9);
     }
 
     #[test]
@@ -205,5 +230,12 @@ mod tests {
         // Only what's set is written.
         let json = serde_json::to_string(&key(10.0, 0.5, Ease::Smooth)).unwrap();
         assert_eq!(json, r#"{"t":10.0,"exposure":0.5}"#);
+        let old: EffectKey = serde_json::from_str(r#"{"t":1.0,"vignette":0.5}"#).unwrap();
+        assert_eq!(old.grade.opacity, 1.0);
+        let faded = EffectKey { t: 2.0, grade: Grade { opacity: 0.5, ..Default::default() }, ease: Ease::Smooth };
+        assert_eq!(serde_json::to_string(&faded).unwrap(), r#"{"t":2.0,"opacity":0.5}"#);
+        // Eased like the rest.
+        let keys = [EffectKey { t: 0.0, ..faded }, EffectKey { t: 10.0, grade: Grade::default(), ease: Ease::Linear }];
+        assert!((grade_at(&[EffectKey { ease: Ease::Linear, ..keys[0] }, keys[1]], 5.0).opacity - 0.75).abs() < 1e-9);
     }
 }

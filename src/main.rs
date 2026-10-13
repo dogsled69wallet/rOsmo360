@@ -502,7 +502,7 @@ impl Default for StitchOpts {
 enum Shot {
     /// The whole sphere, this wide.
     Equirect(usize),
-    View { camera: view::Camera, size: (usize, usize) },
+    View { camera: Box<view::Camera>, size: (usize, usize) },
 }
 
 /// Everything needed to turn decoded lens frames at a given time into a
@@ -665,8 +665,8 @@ impl Pipeline {
                     let size = (width, (width * picture.height / picture.width).max(2) / 2 * 2);
                     stitch::flat(picture, size, &view::View::home(view::Projection::Perspective).camera())
                 }
-                Shot::View { camera, size } => {
-                    let mut frame = stitch::flat(picture, size, &camera);
+                Shot::View { ref camera, size } => {
+                    let mut frame = stitch::flat(picture, size, camera);
                     if !camera.grade.is_neutral() {
                         grade_frame(&mut frame, &camera.grade);
                     }
@@ -691,7 +691,7 @@ impl Pipeline {
         let seam = stitch::Seam { exposure: exposure.as_ref().map(|(s, g)| (*s, g)), align: align.as_ref().map(|(a, f)| (*a, f)), cut: self.cut };
         match *shot {
             Shot::Equirect(width) => stitch::equirect(&self.lenses, frames, width, self.only, &views, &seam),
-            Shot::View { camera, size: (w, h) } => {
+            Shot::View { ref camera, size: (w, h) } => {
                 let ray = |x: f64, y: f64| stitch::apply(camera.user, camera.ray(w as f64 / h as f64, [x / w as f64 * 2.0 - 1.0, y / h as f64 * 2.0 - 1.0]));
                 let mut frame = stitch::render(&self.lenses, frames, (w, h), ray, self.only, &views, &seam);
                 if !camera.grade.is_neutral() {
@@ -916,7 +916,7 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
             };
             let result = match &mut gpu {
                 Some(gpu) => player::render::encode(gpu, &pipelines[i], &clips[i], start, frames, &mut sink, camera, size, &mut tick),
-                None => encode(&pipelines[i], start, Some(frames), &mut sink, |t| Shot::View { camera: camera(t), size }, &mut tick),
+                None => encode(&pipelines[i], start, Some(frames), &mut sink, |t| Shot::View { camera: Box::new(camera(t)), size }, &mut tick),
             };
             if let Err(e) = result {
                 drop(sink);
@@ -1091,7 +1091,7 @@ fn main() -> Result<()> {
                 None => Shot::Equirect(tile),
                 Some(r) => {
                     let view::Aspect(w, h) = r.aspect.unwrap_or(view::Aspect(16, 9));
-                    Shot::View { camera: r.camera_at(t, &|f, t| p.aim(f, t)), size: (tile, ((tile * h as usize / w as usize) / 2).max(8) * 2) }
+                    Shot::View { camera: Box::new(r.camera_at(t, &|f, t| p.aim(f, t))), size: (tile, ((tile * h as usize / w as usize) / 2).max(8) * 2) }
                 }
             };
             let tiles = times
@@ -1151,7 +1151,7 @@ fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<
         .map(|shot| {
             let Some((n, i, t)) = *shot else { return Ok(stitch::Frame { width: size.0, height: size.1, rgb: vec![0; size.0 * size.1 * 3] }) };
             let p = &pipelines[i];
-            let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &Shot::View { camera: project::camera_at(&project.cuts, n, t, &|f, t| p.aim(f, t)), size });
+            let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &Shot::View { camera: Box::new(project::camera_at(&project.cuts, n, t, &|f, t| p.aim(f, t))), size });
             sheet::label(&mut f, 4, 4, &format!("#{} {t:.1}s", n + 1));
             Ok(f)
         })

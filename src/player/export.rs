@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 pub enum Shot {
     /// What is on screen, at this many pixels.
-    View { camera: Camera, size: (usize, usize) },
+    View { camera: Box<Camera>, size: (usize, usize) },
     /// The whole sphere, `width` × `width / 2`.
     Sphere { width: usize },
 }

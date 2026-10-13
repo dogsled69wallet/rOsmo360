@@ -36,8 +36,9 @@ pub enum EffectMsg {
     Jump(usize, f64),
 }
 
-/// Each effect: its name, range, and what it does.
-const PARAMS: [(&str, f64, f64, &str); 9] = [
+/// Each effect: its name, range, and what it does. Untouched, each is
+/// `grade::NEUTRAL`'s.
+const PARAMS: [(&str, f64, f64, &str); 10] = [
     ("Exposure", -3.0, 3.0, "Brighter or darker, in stops, like the camera's EV"),
     ("Contrast", -1.0, 1.0, "More or less contrast, around mid-grey"),
     ("Highlights", -1.0, 1.0, "Pull back (−) or lift the bright parts, such as the sky"),
@@ -47,6 +48,7 @@ const PARAMS: [(&str, f64, f64, &str); 9] = [
     ("Saturation", -1.0, 1.0, "Less or more colour; −1 is black and white"),
     ("Vibrance", -1.0, 1.0, "More colour mostly where there is little, sparing skin and sky"),
     ("Vignette", 0.0, 1.0, "Darker corners"),
+    ("Opacity", 0.0, 1.0, "How much of the picture shows; on the main track it fades towards black"),
 ];
 
 /// The panel's width.
@@ -57,6 +59,7 @@ fn label(i: usize, v: f64) -> String {
     match i {
         0 => format!("{v:+.2} EV"),
         8 => format!("{v:.2}"),
+        9 => format!("{:.0} %", v * 100.0),
         _ => format!("{v:+.2}"),
     }
 }
@@ -119,7 +122,7 @@ impl App {
                 self.edit.checkpoint();
                 self.change_effects(|g| {
                     let mut values = g.values();
-                    values[p] = 0.0;
+                    values[p] = crate::grade::NEUTRAL[p];
                     *g = Grade::from_values(values);
                 });
             }
@@ -189,7 +192,7 @@ impl App {
         let mut sliders = column![].spacing(6);
         for (p, (name, lo, hi, hint)) in PARAMS.iter().enumerate() {
             let v = grade.values()[p];
-            let reset = button(text("↺").size(13)).padding([0, 5]).style(button::text).on_press_maybe((enabled && v != 0.0).then(|| m(EffectMsg::Reset(Some(p)))));
+            let reset = button(text("↺").size(13)).padding([0, 5]).style(button::text).on_press_maybe((enabled && v != crate::grade::NEUTRAL[p]).then(|| m(EffectMsg::Reset(Some(p)))));
             let control = slider(*lo..=*hi, v, move |v| Message::Effect(EffectMsg::Set(p, v))).step(0.01).on_release(m(EffectMsg::Done));
             sliders = sliders.push(tip(
                 column![row![text(*name).width(Length::Fill), text(label(p, v)).size(13), reset].spacing(4).align_y(Alignment::Center), control].spacing(2),
