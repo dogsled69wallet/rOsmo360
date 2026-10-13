@@ -143,13 +143,9 @@ pub fn run(inputs: Vec<PathBuf>, launch: Launch) -> Result<()> {
         imu_axes: launch.imu_axes,
         world_z_down: launch.world_z_down,
     };
-    // A daemon, for windows of its own: the player's, and the text panel's
-    // while a text overlay is selected. Closing the player's ends it.
-    iced::daemon(
+    iced::application(
         move || {
             let mut app = App::new(opts.clone(), settings.clone());
-            let (main, opened) = window::open(window_settings(iced::Size::new(1280.0, 820.0)));
-            app.main_window = Some(main);
             let is_project = |p: &PathBuf| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
             let task = match inputs.iter().find(|p| is_project(p)) {
                 Some(project) => app.update(Message::ProjectPicked(Some(project.clone()))),
@@ -158,23 +154,17 @@ pub fn run(inputs: Vec<PathBuf>, launch: Launch) -> Result<()> {
                     app.open_next()
                 }
             };
-            (app, Task::batch([opened.discard(), task]))
+            (app, task)
         },
         App::update,
         App::view,
     )
     .title(App::title)
     .subscription(App::subscription)
-    .theme(|app: &App, _| Some(app.theme.clone()))
-    .run()
-    .context("running the player window")
-}
-
-/// A window `size` big, closing only when the app says so (the player
-/// asks first when the edit has unsaved changes).
-fn window_settings(size: iced::Size) -> window::Settings {
-    window::Settings {
-        size,
+    .theme(|app: &App| app.theme.clone())
+    .window(window::Settings {
+        size: iced::Size::new(1280.0, 820.0),
+        // Closing asks first when the edit has unsaved changes.
         exit_on_close_request: false,
         // Wayland matches the window to its menu entry and icon by this id: in a
         // Flatpak that's the Flatpak's own (io.github.ravelund.rOsmo360).
@@ -184,7 +174,9 @@ fn window_settings(size: iced::Size) -> window::Settings {
             ..Default::default()
         },
         ..Default::default()
-    }
+    })
+    .run()
+    .context("running the player window")
 }
 
 /// What "save" writes: the view as framed, or the whole sphere.
@@ -273,7 +265,7 @@ enum Message {
     OpenProject,
     ProjectPicked(Option<PathBuf>),
     /// The window's close button was pressed.
-    CloseRequested(window::Id),
+    CloseRequested,
     /// The answer to "save changes first?" before doing `.0`.
     Confirmed(Then, Choice),
     /// Save the project; to a new file if true or never saved.
@@ -310,11 +302,11 @@ enum Message {
     /// Add pictures to the overlay lane at the playhead.
     AddOverlay,
     OverlayPicked(Vec<PathBuf>),
-    OverlaySelect(Option<usize>),
-    /// Overlay `i` dragged to start at edit time `at`.
-    OverlayMove(usize, f64),
-    /// Overlay `i`'s in (`true`) or out edge dragged to own time `t`.
-    OverlayTrim(usize, bool, f64),
+    OverlaySelect(Option<crate::overlay::ItemRef>),
+    /// An overlay dragged to start at edit time `at`.
+    OverlayMove(crate::overlay::ItemRef, f64),
+    /// An overlay's in (`true`) or out edge dragged to own time `t`.
+    OverlayTrim(crate::overlay::ItemRef, bool, f64),
     /// To an overlay keyframe's edit time.
     OverlayJump(f64),
     SelectMusic(usize),
@@ -437,12 +429,10 @@ struct App {
     /// The selected text overlay's words as edited in the panel, and which
     /// overlay they're of.
     text_content: iced::widget::text_editor::Content,
-    text_of: Option<usize>,
-    /// The player's window, and the text panel's while it's open.
-    main_window: Option<window::Id>,
-    text_window: Option<window::Id>,
-    /// The overlay item selected, in the lane shown (the first).
-    selected_overlay: Option<usize>,
+    text_of: Option<crate::overlay::ItemRef>,
+
+    /// The overlay or text item selected, in the lane shown of its track.
+    selected_overlay: Option<crate::overlay::ItemRef>,
     selected_music: Option<usize>,
     /// The music volume point selected, and the cut sound point: (cut,
     /// point).
@@ -551,8 +541,7 @@ impl App {
             overlay_thumbs: Default::default(),
             text_content: Default::default(),
             text_of: None,
-            main_window: None,
-            text_window: None,
+
             selected_overlay: None,
             selected_music: None,
             selected_volume: None,
@@ -629,7 +618,6 @@ impl App {
         let task = Task::batch([task, self.load_overlay_pictures()]);
         self.settle_look();
         self.settle_text();
-        let task = Task::batch([task, self.settle_text_window()]);
         self.follow_crossfade();
         self.follow_music();
         let now = self.settings();
@@ -849,7 +837,7 @@ impl App {
         // they were added and split in).
         let mut music = self.edit.music.clone();
         music.clips.sort_by(|a, b| a.at.total_cmp(&b.at));
-        Project { aspect, cuts: self.edit.cuts.clone(), sound: self.edit.sound, music, fades: self.edit.fades, overlays: self.edit.overlays.clone() }
+        Project { aspect, cuts: self.edit.cuts.clone(), sound: self.edit.sound, music, fades: self.edit.fades, overlays: self.edit.overlays.clone(), text: self.edit.texts.clone() }
     }
 
     /// Renders the edit to `path` on its own thread with the export the
@@ -1135,10 +1123,7 @@ impl App {
         Task::perform(blocking(move || Media::load(path, &opts, &progress).map_err(|e| format!("{e:#}"))), |r| Message::Loaded(Arc::new(r)))
     }
 
-    fn title(&self, window: window::Id) -> String {
-        if Some(window) == self.text_window {
-            return format!("Text · {NAME}");
-        }
+    fn title(&self) -> String {
         let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         // A dot marks unsaved changes, as in many editors.
         let project = match &self.project {
@@ -1162,7 +1147,7 @@ impl App {
         // The crossfade's partner too: paused, its frame came in only with
         // the next event.
         let busy = self.clip.iter().chain(self.partner.as_ref().map(|(_, c)| c)).any(|c| c.playback.busy());
-        let close = window::close_requests().map(Message::CloseRequested);
+        let close = window::close_requests().map(|_| Message::CloseRequested);
         if busy {
             Subscription::batch([keys, theme, close, window::frames().map(|_| Message::Tick)])
         } else if self.loading.is_some() {
@@ -1230,7 +1215,7 @@ impl App {
                 // Back to the start screen with an empty edit. Loaded clips
                 // stay in the library, so adding them again is instant; one
                 // still loading finishes there without becoming a cut.
-                self.edit.replace(Vec::new(), Default::default(), Default::default(), Default::default(), Vec::new());
+                self.edit.replace(Vec::new(), Default::default(), Default::default(), Default::default(), Vec::new(), Vec::new());
                 self.selected_music = None;
                 self.selected_volume = None;
                 self.selected_sound = None;
@@ -1248,10 +1233,8 @@ impl App {
                 self.timeline_zoom = 1.0;
                 self.timeline_start = 0.0;
             }
-            // The text panel's window closed: done with the text.
-            Message::CloseRequested(id) if Some(id) == self.text_window => self.selected_overlay = None,
-            Message::CloseRequested(_) if self.unsaved() => return self.confirm(Then::Close),
-            Message::CloseRequested(_) => return iced::exit(),
+            Message::CloseRequested if self.unsaved() => return self.confirm(Then::Close),
+            Message::CloseRequested => return iced::exit(),
             Message::Confirmed(then, choice) => match choice {
                 Choice::Save => {
                     self.after_save = Some(then);
@@ -1312,7 +1295,7 @@ impl App {
                     self.error = Some(format!("{said}Left out missing music: {}", names.join(", ")));
                 }
                 // And overlay pictures.
-                let mut overlays = project.overlays;
+                let (mut overlays, texts) = (project.overlays, project.text);
                 let mut lost = Vec::new();
                 for lane in &mut overlays {
                     let (here, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut lane.items).into_iter().partition(|it| it.text.is_some() || it.input.exists());
@@ -1326,7 +1309,7 @@ impl App {
                 let waves: Vec<_> = music.clips.iter().map(|c| self.load_waveform(&c.input)).collect();
                 self.queue.extend(cuts.iter().map(|c| (c.input.clone(), false)));
                 let complete = missing.is_empty() && gone.is_empty() && lost.is_empty();
-                self.edit.replace(cuts, music, project.sound, project.fades, overlays);
+                self.edit.replace(cuts, music, project.sound, project.fades, overlays, texts);
                 self.mark_flat();
                 self.saved_version = if complete { self.edit.version } else { 0 };
                 self.saved_aspect = self.aspect;
@@ -1557,18 +1540,15 @@ impl App {
             }
             Message::OverlayPicked(paths) if !paths.is_empty() => {
                 self.edit.checkpoint();
-                if self.edit.overlays.is_empty() {
-                    self.edit.overlays.push(Default::default());
-                }
                 // One after another from the playhead, each where it fits.
                 let mut at = self.position();
-                let lane = &mut self.edit.overlays[0];
+                let lane = self.edit.lane_mut(crate::overlay::Track::Overlay);
                 for input in paths {
                     lane.items.push(crate::overlay::Item { input, text: None, at, start: 0.0, end: ffmpeg::PICTURE_SECONDS, motion: Vec::new(), effects: Vec::new() });
                     let i = lane.items.len() - 1;
                     lane.items[i].at = lane.place(i, at);
                     at = lane.items[i].ends();
-                    self.selected_overlay = Some(i);
+                    self.selected_overlay = Some((crate::overlay::Track::Overlay, i));
                 }
                 self.selected_music = None;
                 self.selected_volume = None;
@@ -1585,17 +1565,17 @@ impl App {
                     self.selected_sound = None;
                 }
             }
-            Message::OverlayMove(i, at) => {
-                if self.edit.overlays.first().is_some_and(|l| i < l.items.len()) {
+            Message::OverlayMove((track, i), at) => {
+                if self.edit.item((track, i)).is_some() {
                     self.begin_drag();
-                    let lane = &mut self.edit.overlays[0];
+                    let lane = self.edit.lane_mut(track);
                     lane.items[i].at = lane.place(i, at);
                 }
             }
-            Message::OverlayTrim(i, start, t) => {
-                if self.edit.overlays.first().is_some_and(|l| i < l.items.len()) {
+            Message::OverlayTrim((track, i), start, t) => {
+                if self.edit.item((track, i)).is_some() {
                     self.begin_drag();
-                    let lane = &mut self.edit.overlays[0];
+                    let lane = self.edit.lane_mut(track);
                     let (lo, hi) = lane.room(i);
                     let item = &mut lane.items[i];
                     if start {
@@ -1658,15 +1638,12 @@ impl App {
             }
             Message::AddText => {
                 self.edit.checkpoint();
-                if self.edit.overlays.is_empty() {
-                    self.edit.overlays.push(Default::default());
-                }
                 let at = self.position();
-                let lane = &mut self.edit.overlays[0];
+                let lane = self.edit.lane_mut(crate::overlay::Track::Text);
                 lane.items.push(crate::overlay::Item { input: PathBuf::new(), text: Some(Default::default()), at, start: 0.0, end: ffmpeg::PICTURE_SECONDS, motion: Vec::new(), effects: Vec::new() });
                 let i = lane.items.len() - 1;
                 lane.items[i].at = lane.place(i, at);
-                self.selected_overlay = Some(i);
+                self.selected_overlay = Some((crate::overlay::Track::Text, i));
                 self.selected_music = None;
                 self.selected_volume = None;
                 self.selected_sound = None;
@@ -1839,10 +1816,10 @@ impl App {
                 }
             }
             Message::DeleteCut if self.selected_overlay.is_some() => {
-                let i = self.selected_overlay.take().unwrap();
-                if self.edit.overlays.first().is_some_and(|l| i < l.items.len()) {
+                let (track, i) = self.selected_overlay.take().unwrap();
+                if self.edit.item((track, i)).is_some() {
                     self.edit.checkpoint();
-                    self.edit.overlays[0].items.remove(i);
+                    self.edit.lane_mut(track).items.remove(i);
                 }
             }
             Message::DeleteCut if self.selected_sound.is_some() => {
@@ -2058,7 +2035,7 @@ impl App {
             Message::Fullscreen => {
                 self.fullscreen = !self.fullscreen;
                 let mode = if self.fullscreen { window::Mode::Fullscreen } else { window::Mode::Windowed };
-                return self.main_window.map_or_else(Task::none, |id| window::set_mode(id, mode));
+                return window::latest().and_then(move |id| window::set_mode(id, mode));
             }
         }
         Task::none()
@@ -2175,7 +2152,7 @@ impl App {
     /// (text since retyped) are let go.
     fn load_overlay_pictures(&mut self) -> Task<Message> {
         let mut tasks = Vec::new();
-        let items: Vec<_> = self.edit.overlays.iter().flat_map(|l| &l.items).cloned().collect();
+        let items: Vec<_> = self.edit.lanes().flat_map(|l| &l.items).cloned().collect();
         let keys: std::collections::HashSet<String> = items.iter().map(crate::overlay::Item::key).collect();
         self.overlay_pictures.retain(|k, _| keys.contains(k));
         self.overlay_thumbs.retain(|k, _| keys.contains(k));
@@ -2193,28 +2170,10 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// Opens the text panel's window while a text overlay is selected, and
-    /// closes it after.
-    fn settle_text_window(&mut self) -> Task<Message> {
-        let text = self.selected_overlay.and_then(|i| self.edit.overlays.first()?.items.get(i)).is_some_and(|it| it.text.is_some());
-        match (text, self.text_window) {
-            (true, None) => {
-                let (id, opened) = window::open(window_settings(iced::Size::new(320.0, 600.0)));
-                self.text_window = Some(id);
-                opened.discard()
-            }
-            (false, Some(id)) => {
-                self.text_window = None;
-                window::close(id)
-            }
-            _ => Task::none(),
-        }
-    }
-
     /// Fills the panel's text box with the selected text overlay's words
     /// when the selection moves to another one.
     fn settle_text(&mut self) {
-        let words = self.selected_overlay.and_then(|i| self.edit.overlays.first()?.items.get(i)?.text.as_ref().map(|t| (i, t.content.clone())));
+        let words = self.selected_overlay.and_then(|r| self.edit.item(r)?.text.as_ref().map(|t| (r, t.content.clone())));
         match words {
             Some((i, content)) if self.text_of != Some(i) || self.text_content.text().trim_end_matches('\n') != content => {
                 self.text_content = iced::widget::text_editor::Content::with_text(&content);
@@ -2231,8 +2190,7 @@ impl App {
         let t = self.position();
         let black = self.edit.fades.black(t, self.edit.duration());
         self.edit
-            .overlays
-            .iter()
+            .lanes()
             .filter_map(|lane| lane.at(t).map(|(_, it)| it))
             .filter_map(|item| {
                 let (id, picture) = self.overlay_pictures.get(&item.key())?.clone()?;
@@ -2240,6 +2198,24 @@ impl App {
                 Some(gpu::OverlayDraw { id, picture, place, grade, black })
             })
             .collect()
+    }
+
+    /// The timeline's blocks for `track`'s lane.
+    fn overlay_blocks(&self, track: crate::overlay::Track) -> Vec<timeline::OverlayBlock> {
+        self.edit.lane(track).map_or_else(Vec::new, |lane| {
+            lane.items
+                .iter()
+                .map(|it| timeline::OverlayBlock {
+                    label: it.name(),
+                    from: it.at,
+                    start: it.start,
+                    len: it.end - it.start,
+                    effects: it.effects.iter().map(|k| k.t).collect(),
+                    motion: it.motion.iter().map(|k| (k.t, k.ease)).collect(),
+                    thumb: self.overlay_thumbs.get(&it.key()).cloned(),
+                })
+                .collect()
+        })
     }
 
     /// The 360 view as it should be drawn now, once a frame is decoded.
@@ -2754,14 +2730,7 @@ impl App {
         row![text(label), progress_bar(0.0..=1.0, self.load_progress()).length(length).girth(8)].spacing(8).align_y(Alignment::Center).into()
     }
 
-    fn view(&self, window: window::Id) -> Element<'_, Message> {
-        if Some(window) == self.text_window {
-            return self.text_panel().unwrap_or_else(|| text("").into());
-        }
-        self.player_view()
-    }
-
-    fn player_view(&self) -> Element<'_, Message> {
+    fn view(&self) -> Element<'_, Message> {
         let open_hint = if self.edit.cuts.is_empty() { "Open clips (Ctrl+O)" } else { "Add clips to the edit as cuts (Ctrl+O)" };
         let error = self.error.as_ref().map(|e| text(e.clone()).style(text::danger));
         let Some(clip) = &self.clip else {
@@ -2868,6 +2837,11 @@ impl App {
         };
         let view = container(view).width(Length::Fill).height(Length::Fill).style(|_| container::background(iced::Color::BLACK));
         let view: Element<'_, Message> = if self.effects_open { row![view, self.effects_panel()].into() } else { view.into() };
+        // A text item's words and look, at the left while it's selected.
+        let view: Element<'_, Message> = match self.text_panel() {
+            Some(panel) => row![panel, view].into(),
+            None => view,
+        };
 
         let current = self.current_key();
         let aiming = current.map(|k| Aiming::of(&self.edit.cuts[self.current].keyframes[k].follow));
@@ -2917,20 +2891,8 @@ impl App {
             position: self.position(),
             selected: self.selected,
             current: current.map(|k| (self.current, k)),
-            overlays: self.edit.overlays.first().map_or_else(Vec::new, |lane| {
-                lane.items
-                    .iter()
-                    .map(|it| timeline::OverlayBlock {
-                        label: it.name(),
-                        from: it.at,
-                        start: it.start,
-                        len: it.end - it.start,
-                        effects: it.effects.iter().map(|k| k.t).collect(),
-                        motion: it.motion.iter().map(|k| (k.t, k.ease)).collect(),
-                        thumb: self.overlay_thumbs.get(&it.key()).cloned(),
-                    })
-                    .collect()
-            }),
+            overlays: self.overlay_blocks(crate::overlay::Track::Overlay),
+            texts: self.overlay_blocks(crate::overlay::Track::Text),
             selected_overlay: self.selected_overlay,
         }
         .view();

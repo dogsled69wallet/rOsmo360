@@ -5,8 +5,9 @@
 //! Items sit at times on the edit, like music, so recutting the video
 //! leaves them where they are; their keyframes are in their own clip time,
 //! so moving an item keeps its moves. The project holds a list of lanes
-//! (the first lowest); the player shows one. The edit's fades cover the
-//! overlays too. Clips export leaves them out: another editor does them.
+//! (the first lowest), and text has lanes of its own, drawn over all of
+//! them; the player shows one of each. The edit's fades cover the overlays
+//! too. Clips export leaves them out: another editor does them.
 
 use crate::ffmpeg::{self, FrameSink};
 use crate::grade::{EffectKey, Grade, grade_at};
@@ -17,6 +18,18 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Which kind of track: pictures (and later video), or text, which lies
+/// over them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Track {
+    Overlay,
+    Text,
+}
+
+/// An item of the edit's overlays: its track (the first lane of it, the
+/// one the player shows) and its place in it.
+pub type ItemRef = (Track, usize);
 
 /// One overlay lane: items one after another, never two at once.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -336,7 +349,8 @@ pub fn look(item: &Item, t: f64) -> (Place, Grade) {
 /// crossfades) and the encoder: frame `n` of the edit is at `n / fps`.
 pub struct Burn<'a> {
     out: &'a mut dyn FrameSink,
-    lanes: &'a [Lane],
+    /// Lowest first: the overlay lanes, then the text's.
+    lanes: Vec<&'a Lane>,
     /// Each item's picture, by its `Item::key`.
     pictures: Vec<(String, Arc<Picture>)>,
     fps: f64,
@@ -349,7 +363,7 @@ impl<'a> Burn<'a> {
     /// Loads every picture `lanes` uses, at most twice the frame's `size`
     /// (none drawn bigger than the frame needs more). With no lanes it
     /// passes frames on.
-    pub fn new(out: &'a mut dyn FrameSink, lanes: &'a [Lane], size: (usize, usize), fps: f64, fades: crate::project::Fades, length: f64) -> Result<Self> {
+    pub fn new(out: &'a mut dyn FrameSink, lanes: Vec<&'a Lane>, size: (usize, usize), fps: f64, fades: crate::project::Fades, length: f64) -> Result<Self> {
         let mut pictures: Vec<(String, Arc<Picture>)> = Vec::new();
         for item in lanes.iter().flat_map(|l| &l.items) {
             let key = item.key();

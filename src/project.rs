@@ -38,6 +38,9 @@ pub struct Project {
     /// Lanes of pictures over the picture, the first lowest.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlays: Vec<crate::overlay::Lane>,
+    /// Lanes of text, over the overlays.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text: Vec<crate::overlay::Lane>,
 }
 
 /// The edit's fades from black at its start and to black at its end, in
@@ -382,7 +385,7 @@ impl Project {
             }
             clip.input = dir.join(&clip.input);
         }
-        for (n, item) in project.overlays.iter_mut().flat_map(|l| &mut l.items).enumerate() {
+        for (n, item) in project.overlays.iter_mut().chain(&mut project.text).flat_map(|l| &mut l.items).enumerate() {
             if item.end <= item.start || item.at < 0.0 {
                 bail!("overlay {} is empty or starts before the edit", n + 1);
             }
@@ -441,7 +444,7 @@ impl Project {
                 clip.input = rel.to_owned();
             }
         }
-        for item in project.overlays.iter_mut().flat_map(|l| &mut l.items) {
+        for item in project.overlays.iter_mut().chain(&mut project.text).flat_map(|l| &mut l.items) {
             if let Ok(rel) = item.input.strip_prefix(dir) {
                 item.input = rel.to_owned();
             }

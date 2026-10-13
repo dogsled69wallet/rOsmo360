@@ -8,14 +8,14 @@
 //! through the overlap the earlier cut is the one located, the later one
 //! dissolving in over it.
 
-use crate::overlay::Lane;
+use crate::overlay::{Item, ItemRef, Lane, Track};
 use crate::project::{Cut, Fades, Music, Sound};
 
 /// The shortest a split or trim may leave a cut, in seconds.
 pub const MIN_CUT: f64 = 0.2;
 
 /// What undo brings back: everything an edit changes.
-type Snapshot = (Vec<Cut>, Music, Sound, Fades, Vec<Lane>);
+type Snapshot = (Vec<Cut>, Music, Sound, Fades, Vec<Lane>, Vec<Lane>);
 
 #[derive(Default)]
 pub struct Edit {
@@ -23,8 +23,10 @@ pub struct Edit {
     pub music: Music,
     pub sound: Sound,
     pub fades: Fades,
-    /// The overlay lanes; the player shows and edits the first.
+    /// The overlay lanes and the text's; the player shows and edits the
+    /// first of each.
     pub overlays: Vec<Lane>,
+    pub texts: Vec<Lane>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     /// Counts changes, so the app can tell whether the edit was saved.
@@ -39,7 +41,7 @@ impl Edit {
     /// The timeline's length: the video's, or the music's while it runs on
     /// beyond it (the frame still to fill). The export ends with the video.
     pub fn frame(&self) -> f64 {
-        let overlays = self.overlays.iter().flat_map(|l| &l.items).map(crate::overlay::Item::ends).fold(0.0, f64::max);
+        let overlays = self.lanes().flat_map(|l| &l.items).map(Item::ends).fold(0.0, f64::max);
         self.duration().max(self.music.end()).max(overlays)
     }
 
@@ -76,12 +78,12 @@ impl Edit {
     }
 
     fn snapshot(&self) -> Snapshot {
-        (self.cuts.clone(), self.music.clone(), self.sound, self.fades, self.overlays.clone())
+        (self.cuts.clone(), self.music.clone(), self.sound, self.fades, self.overlays.clone(), self.texts.clone())
     }
 
-    fn restore(&mut self, (cuts, music, sound, fades, overlays): Snapshot) -> Snapshot {
+    fn restore(&mut self, (cuts, music, sound, fades, overlays, texts): Snapshot) -> Snapshot {
         let now = self.snapshot();
-        (self.cuts, self.music, self.sound, self.fades, self.overlays) = (cuts, music, sound, fades, overlays);
+        (self.cuts, self.music, self.sound, self.fades, self.overlays, self.texts) = (cuts, music, sound, fades, overlays, texts);
         now
     }
 
@@ -110,8 +112,9 @@ impl Edit {
 
     /// Starts over with `cuts` and their music, mix and overlays (an opened
     /// or new project), forgetting undo.
-    pub fn replace(&mut self, cuts: Vec<Cut>, music: Music, sound: Sound, fades: Fades, overlays: Vec<Lane>) {
+    pub fn replace(&mut self, cuts: Vec<Cut>, music: Music, sound: Sound, fades: Fades, overlays: Vec<Lane>, texts: Vec<Lane>) {
         self.overlays = overlays;
+        self.texts = texts;
         self.cuts = cuts;
         self.music = music;
         self.sound = sound;
@@ -119,6 +122,44 @@ impl Edit {
         self.undo.clear();
         self.redo.clear();
         self.version += 1;
+    }
+
+    /// Every overlay lane, lowest first: the overlays', then the text's.
+    pub fn lanes(&self) -> impl Iterator<Item = &Lane> {
+        self.overlays.iter().chain(&self.texts)
+    }
+
+    /// The lane of `track` the player shows, if there is one yet.
+    pub fn lane(&self, track: Track) -> Option<&Lane> {
+        match track {
+            Track::Overlay => self.overlays.first(),
+            Track::Text => self.texts.first(),
+        }
+    }
+
+    /// The lane of `track` the player shows, made if there's none yet.
+    pub fn lane_mut(&mut self, track: Track) -> &mut Lane {
+        let lanes = match track {
+            Track::Overlay => &mut self.overlays,
+            Track::Text => &mut self.texts,
+        };
+        if lanes.is_empty() {
+            lanes.push(Lane::default());
+        }
+        &mut lanes[0]
+    }
+
+    pub fn item(&self, (track, i): ItemRef) -> Option<&Item> {
+        self.lane(track)?.items.get(i)
+    }
+
+    pub fn item_mut(&mut self, (track, i): ItemRef) -> Option<&mut Item> {
+        match track {
+            Track::Overlay => self.overlays.first_mut(),
+            Track::Text => self.texts.first_mut(),
+        }?
+        .items
+        .get_mut(i)
     }
 
     /// Splits cut `i` at clip time `t`. Both halves keep all its keyframes,

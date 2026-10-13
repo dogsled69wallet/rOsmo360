@@ -19,6 +19,7 @@
 //! shows and moves the window.
 
 use super::{Message, music, thumbs};
+use crate::overlay::Track;
 use crate::view::Ease;
 use iced::alignment::Vertical;
 use iced::mouse;
@@ -73,6 +74,7 @@ const SOUND_LINE: iced::Color = iced::Color::from_rgb(0.35, 0.85, 1.0);
 /// The overlay lane's height, above the cuts.
 pub const OVERLAY: f32 = 30.0;
 const OVERLAY_COLOUR: iced::Color = iced::Color::from_rgb(0.95, 0.55, 0.3);
+const TEXT_COLOUR: iced::Color = iced::Color::from_rgb(0.3, 0.8, 0.75);
 
 /// An overlay item as its lane shows it.
 pub struct OverlayBlock {
@@ -155,8 +157,10 @@ pub struct Timeline {
     pub selected: Option<usize>,
     /// The keyframe at the playhead (cut, keyframe), drawn highlighted.
     pub current: Option<(usize, usize)>,
+    /// The overlay track's lane and the text track's.
     pub overlays: Vec<OverlayBlock>,
-    pub selected_overlay: Option<usize>,
+    pub texts: Vec<OverlayBlock>,
+    pub selected_overlay: Option<crate::overlay::ItemRef>,
 }
 
 #[derive(Default)]
@@ -365,9 +369,12 @@ impl Timeline {
         ];
         // Zoomed in, what is outside the window is drawn outside the widget;
         // canvases don't clip, so the container does.
-        let height = OverlayLane::height(&t);
-        let lane = iced::widget::container(canvas(OverlayLane(t)).width(iced::Length::Fill).height(height)).clip(true);
-        iced::widget::column![lane, iced::widget::container(layers).clip(true)].into()
+        let lane = |track| {
+            let lane = OverlayLane(t.clone(), track);
+            let height = lane.height();
+            iced::widget::container(canvas(lane).width(iced::Length::Fill).height(height)).clip(true)
+        };
+        iced::widget::column![lane(Track::Text), lane(Track::Overlay), iced::widget::container(layers).clip(true)].into()
     }
 
     /// The music lane: its clips with their waveforms and handles, and where
@@ -483,9 +490,9 @@ impl Timeline {
     }
 }
 
-/// The overlay lane, over the cuts: a canvas of its own, so the rows under
-/// it keep their places.
-struct OverlayLane(Arc<Timeline>);
+/// An overlay track's lane (the text's on top, then the pictures'), over
+/// the cuts: a canvas of its own, so the rows under it keep their places.
+struct OverlayLane(Arc<Timeline>, Track);
 
 #[derive(Default)]
 enum OverlayDrag {
@@ -497,12 +504,19 @@ enum OverlayDrag {
 }
 
 impl OverlayLane {
+    fn blocks(&self) -> &[OverlayBlock] {
+        match self.1 {
+            Track::Overlay => &self.0.overlays,
+            Track::Text => &self.0.texts,
+        }
+    }
+
     fn item_at(&self, x: f32, b: Rectangle) -> Option<usize> {
-        self.0.overlays.iter().position(|o| x >= self.0.x(o.from, b) && x <= self.0.x(o.from + o.len, b))
+        self.blocks().iter().position(|o| x >= self.0.x(o.from, b) && x <= self.0.x(o.from + o.len, b))
     }
 
     fn edge_at(&self, i: usize, x: f32, b: Rectangle) -> Option<bool> {
-        let o = &self.0.overlays[i];
+        let o = &self.blocks()[i];
         let (l, r) = (self.0.x(o.from, b), self.0.x(o.from + o.len, b));
         if r - l < 3.0 * PICK {
             Some(x - l < r - x)
@@ -516,8 +530,8 @@ impl OverlayLane {
     }
 
     /// The lane, and its keyframe rows once it has items.
-    fn height(t: &Timeline) -> f32 {
-        if t.overlays.is_empty() { OVERLAY } else { OVERLAY + EFFECTS + KEYS }
+    fn height(&self) -> f32 {
+        if self.blocks().is_empty() { OVERLAY } else { OVERLAY + EFFECTS + KEYS }
     }
 
     /// The keyframe mark under `p` in its row: its edit time.
@@ -526,7 +540,7 @@ impl OverlayLane {
         if !effects && !(OVERLAY + EFFECTS..OVERLAY + EFFECTS + KEYS).contains(&p.y) {
             return None;
         }
-        self.0.overlays.iter().find_map(|o| {
+        self.blocks().iter().find_map(|o| {
             let times: Vec<f64> = if effects { o.effects.clone() } else { o.motion.iter().map(|k| k.0).collect() };
             times.into_iter().filter(|&t| t >= o.start && t <= o.start + o.len).map(|t| o.from + t - o.start).find(|&t| (self.0.x(t, b) - p.x).abs() <= PICK)
         })
@@ -567,20 +581,20 @@ impl canvas::Program<Message> for OverlayLane {
                 let Some(item) = self.item_at(p.x, bounds) else {
                     return Some(canvas::Action::publish(Message::OverlaySelect(None)).and_capture());
                 };
-                let o = &t.overlays[item];
+                let o = &self.blocks()[item];
                 let per_px = t.span / Timeline::width(bounds) as f64;
                 *drag = match self.edge_at(item, p.x, bounds) {
                     Some(start) => OverlayDrag::Trim { item, start, x0: p.x, from: if start { o.start } else { o.start + o.len }, per_px },
                     None => OverlayDrag::Move { item, x0: p.x, at: o.from, per_px },
                 };
-                Some(canvas::Action::publish(Message::OverlaySelect(Some(item))).and_capture())
+                Some(canvas::Action::publish(Message::OverlaySelect(Some((self.1, item)))).and_capture())
             }
             Mouse(mouse::Event::CursorMoved { position }) => {
                 let x = position.x - bounds.x;
                 let message = match drag {
                     OverlayDrag::None => return None,
-                    OverlayDrag::Move { item, x0, at, per_px } => Message::OverlayMove(*item, *at + (x - *x0) as f64 * *per_px),
-                    OverlayDrag::Trim { item, start, x0, from, per_px } => Message::OverlayTrim(*item, *start, *from + (x - *x0) as f64 * *per_px),
+                    OverlayDrag::Move { item, x0, at, per_px } => Message::OverlayMove((self.1, *item), *at + (x - *x0) as f64 * *per_px),
+                    OverlayDrag::Trim { item, start, x0, from, per_px } => Message::OverlayTrim((self.1, *item), *start, *from + (x - *x0) as f64 * *per_px),
                 };
                 Some(canvas::Action::publish(message).and_capture())
             }
@@ -599,14 +613,26 @@ impl canvas::Program<Message> for OverlayLane {
         let (top, h) = (2.0, OVERLAY - 4.0);
         let lane = Path::rounded_rectangle(Point::new(t.x(0.0, bounds), top), Size::new((t.x(t.duration, bounds) - t.x(0.0, bounds)).max(0.0), h), 4.0.into());
         frame.fill(&lane, palette.background.weak.color.scale_alpha(0.5));
-        for (i, o) in t.overlays.iter().enumerate() {
+        let (name, colour) = match self.1 {
+            Track::Overlay => ("Overlay", OVERLAY_COLOUR),
+            Track::Text => ("Text", TEXT_COLOUR),
+        };
+        frame.fill_text(Text {
+            content: name.to_owned(),
+            position: Point::new(PICK + 12.0, top + h / 2.0),
+            color: palette.background.base.text.scale_alpha(0.35),
+            size: 10.0.into(),
+            align_y: Vertical::Center,
+            ..Default::default()
+        });
+        for (i, o) in self.blocks().iter().enumerate() {
             let (l, r) = (t.x(o.from, bounds) + GAP / 2.0, t.x(o.from + o.len, bounds) - GAP / 2.0);
             if r < 0.0 || l > bounds.width {
                 continue;
             }
             let block = Path::rounded_rectangle(Point::new(l, top), Size::new((r - l).max(1.0), h), 4.0.into());
-            let selected = Some(i) == t.selected_overlay;
-            frame.fill(&block, if selected { OVERLAY_COLOUR } else { OVERLAY_COLOUR.scale_alpha(0.55) });
+            let selected = Some((self.1, i)) == t.selected_overlay;
+            frame.fill(&block, if selected { colour } else { colour.scale_alpha(0.55) });
             if selected {
                 frame.stroke(&block, Stroke::default().with_width(2.0).with_color(palette.primary.strong.color));
             }
@@ -632,10 +658,10 @@ impl canvas::Program<Message> for OverlayLane {
                 });
             }
         }
-        if !t.overlays.is_empty() {
+        if !self.blocks().is_empty() {
             draw_rows(&mut frame, theme, bounds, OVERLAY, "Motion");
             let inside = |o: &OverlayBlock, k: f64| k >= o.start && k <= o.start + o.len;
-            for o in &t.overlays {
+            for o in self.blocks() {
                 for &k in o.effects.iter().filter(|&&k| inside(o, k)) {
                     let x = t.x(o.from + k - o.start, bounds);
                     let mark = Path::rectangle(Point::new(x - 3.5, OVERLAY + EFFECTS / 2.0 - 3.5), Size::new(7.0, 7.0));
@@ -644,13 +670,13 @@ impl canvas::Program<Message> for OverlayLane {
                 }
                 for &(k, ease) in o.motion.iter().filter(|(k, _)| inside(o, *k)) {
                     let mark = key_mark(t.x(o.from + k - o.start, bounds), OVERLAY + EFFECTS + KEYS / 2.0, ease);
-                    frame.fill(&mark, OVERLAY_COLOUR);
+                    frame.fill(&mark, colour);
                     frame.stroke(&mark, Stroke::default().with_width(1.5).with_color(palette.background.base.color));
                 }
             }
         }
         let at = t.x(t.position, bounds);
-        frame.fill(&Path::rectangle(Point::new(at - 1.0, 0.0), Size::new(2.0, OverlayLane::height(t))), palette.primary.strong.color);
+        frame.fill(&Path::rectangle(Point::new(at - 1.0, 0.0), Size::new(2.0, self.height())), palette.primary.strong.color);
         vec![frame.into_geometry()]
     }
 

@@ -96,7 +96,7 @@ const SWATCHES: [[u8; 3]; 9] = [[255, 255, 255], [0, 0, 0], [255, 214, 10], [255
 #[derive(Clone, Copy, PartialEq)]
 enum Target {
     Cut(usize),
-    Overlay(usize),
+    Overlay(crate::overlay::ItemRef),
 }
 
 /// Where an overlay is, as sliders: its name, range and what it does.
@@ -114,7 +114,7 @@ impl App {
     fn effect_target(&self) -> Option<(Target, f64)> {
         let t = self.position();
         if let Some(i) = self.selected_overlay
-            && let Some(item) = self.edit.overlays.first().and_then(|l| l.items.get(i))
+            && let Some(item) = self.edit.item(i)
             && t >= item.at
             && t <= item.ends()
         {
@@ -126,14 +126,14 @@ impl App {
     fn effects_of(&self, target: Target) -> &[EffectKey] {
         match target {
             Target::Cut(i) => &self.edit.cuts[i].effects,
-            Target::Overlay(i) => &self.edit.overlays[0].items[i].effects,
+            Target::Overlay(i) => &self.edit.item(i).expect("the selected overlay").effects,
         }
     }
 
     fn effects_mut(&mut self, target: Target) -> &mut Vec<EffectKey> {
         match target {
             Target::Cut(i) => &mut self.edit.cuts[i].effects,
-            Target::Overlay(i) => &mut self.edit.overlays[0].items[i].effects,
+            Target::Overlay(i) => &mut self.edit.item_mut(i).expect("the selected overlay").effects,
         }
     }
 
@@ -144,9 +144,9 @@ impl App {
     }
 
     /// Overlay `i`'s motion keyframe at its time `t`, if there's one.
-    fn motion_key_at(&self, i: usize, t: f64) -> Option<usize> {
+    fn motion_key_at(&self, i: crate::overlay::ItemRef, t: f64) -> Option<usize> {
         let tolerance = self.tolerance();
-        self.edit.overlays[0].items[i].motion.iter().position(|k| (k.t - t).abs() <= tolerance)
+        self.edit.item(i)?.motion.iter().position(|k| (k.t - t).abs() <= tolerance)
     }
 
     /// Sets `target`'s effects at the playhead with `change`: in the
@@ -171,7 +171,8 @@ impl App {
     fn change_place(&mut self, change: impl FnOnce(&mut Place)) {
         let Some((Target::Overlay(i), t)) = self.effect_target() else { return };
         let at = self.motion_key_at(i, t);
-        let keys = &mut self.edit.overlays[0].items[i].motion;
+        let Some(item) = self.edit.item_mut(i) else { return };
+        let keys = &mut item.motion;
         let k = match at {
             Some(k) => k,
             None => {
@@ -258,8 +259,10 @@ impl App {
                 if let Some(k) = effect {
                     self.effects_mut(target).remove(k);
                 }
-                if let (Target::Overlay(i), Some(k)) = (target, motion) {
-                    self.edit.overlays[0].items[i].motion.remove(k);
+                if let (Target::Overlay(i), Some(k)) = (target, motion)
+                    && let Some(item) = self.edit.item_mut(i)
+                {
+                    item.motion.remove(k);
                 }
             }
             EffectMsg::Ease(ease) => {
@@ -271,8 +274,10 @@ impl App {
                 if let Some(k) = effect {
                     self.effects_mut(target)[k].ease = ease;
                 }
-                if let (Target::Overlay(i), Some(k)) = (target, motion) {
-                    self.edit.overlays[0].items[i].motion[k].ease = ease;
+                if let (Target::Overlay(i), Some(k)) = (target, motion)
+                    && let Some(item) = self.edit.item_mut(i)
+                {
+                    item.motion[k].ease = ease;
                 }
             }
             EffectMsg::Reset(Some(p)) => {
@@ -293,12 +298,14 @@ impl App {
             }
             EffectMsg::Reset(None) => {
                 let Some((target, _)) = target else { return };
-                let moves = matches!(target, Target::Overlay(i) if !self.edit.overlays[0].items[i].motion.is_empty());
+                let moves = matches!(target, Target::Overlay(i) if self.edit.item(i).is_some_and(|it| !it.motion.is_empty()));
                 if !self.effects_of(target).is_empty() || moves {
                     self.edit.checkpoint();
                     self.effects_mut(target).clear();
-                    if let Target::Overlay(i) = target {
-                        self.edit.overlays[0].items[i].motion.clear();
+                    if let Target::Overlay(i) = target
+                        && let Some(item) = self.edit.item_mut(i)
+                    {
+                        item.motion.clear();
                     }
                 }
             }
@@ -344,15 +351,15 @@ impl App {
     /// The selected overlay's text, if it's a text overlay.
     fn selected_text(&mut self) -> Option<&mut crate::text::Text> {
         let i = self.selected_overlay?;
-        self.edit.overlays.first_mut()?.items.get_mut(i)?.text.as_mut()
+        self.edit.item_mut(i)?.text.as_mut()
     }
 
-    /// The text panel, in a window of its own while a text overlay is
-    /// selected: its words and look, wherever the playhead is (where it is
-    /// and its effects stay in the Effects panel).
+    /// The text panel, at the player's left while a text item is selected:
+    /// its words and look, wherever the playhead is (where it is and its
+    /// effects stay in the Effects panel).
     pub(super) fn text_panel(&self) -> Option<Element<'_, Message>> {
         let i = self.selected_overlay?;
-        let words = self.edit.overlays.first()?.items.get(i)?.text.as_ref()?;
+        let words = self.edit.item(i)?.text.as_ref()?;
         let t = |c: TextChange| Message::Effect(EffectMsg::Text(c));
         let swatches = |chosen: Colour, f: fn(Colour) -> TextChange| {
             let mut r = row![].spacing(4);
@@ -373,8 +380,13 @@ impl App {
             r
         };
         let families = crate::text::families();
+        let close = tip(
+            button(text("✕").size(14)).padding([0, 6]).style(button::text).on_press(Message::OverlaySelect(None)),
+            text("Close (deselects the text)"),
+            tooltip::Position::Bottom,
+        );
         let mut controls = column![
-            text("Text").size(16),
+            row![text("Text").size(18).width(Length::Fill), close].align_y(Alignment::Center),
             iced::widget::text_editor(&self.text_content).placeholder("Type the text here").height(80).on_action(|a| Message::Effect(EffectMsg::TextEdit(a))),
             row![
                 pick_list(families, Some(words.font.clone()), |f| Message::Effect(EffectMsg::Text(TextChange::Font(f)))).width(Length::Fill),
@@ -396,7 +408,7 @@ impl App {
             controls = controls.push(slider(0.01..=0.3, o.width, move |v| Message::Effect(EffectMsg::Text(TextChange::OutlineWidth(v)))).step(0.005).on_release(Message::Effect(EffectMsg::Done)));
             controls = controls.push(swatches(o.colour, TextChange::OutlineColour));
         }
-        Some(container(scrollable(controls.padding(12))).width(Length::Fill).height(Length::Fill).into())
+        Some(container(scrollable(controls.spacing(8).padding(12))).width(WIDTH).height(Length::Fill).into())
     }
 
     /// Neutralises the playing cut's colour cast from `rgb`, the median of
@@ -427,7 +439,7 @@ impl App {
         let mut sliders = column![].spacing(6);
         // An overlay's place first: where it is is what's set most.
         if let Some((i, t)) = overlay {
-            let place = place_at(&self.edit.overlays[0].items[i].motion, t);
+            let place = self.edit.item(i).map_or_else(Place::default, |it| place_at(&it.motion, t));
             for (p, (name, lo, hi, hint)) in PLACE.iter().enumerate() {
                 let v = place.values()[p];
                 let shown = if p == 3 { format!("{v:+.0}°") } else { format!("{v:.2}") };
@@ -453,13 +465,17 @@ impl App {
         }
         let cut_name = match target {
             Some((Target::Cut(i), _)) => format!("Cut {} · {}", i + 1, super::clip_name(&self.edit.cuts[i].input)),
-            Some((Target::Overlay(i), _)) => format!("Overlay · {}", super::clip_name(&self.edit.overlays[0].items[i].input)),
+            Some((Target::Overlay(i), _)) => match self.edit.item(i) {
+                Some(it) if it.text.is_some() => format!("Text · {}", it.name()),
+                Some(it) => format!("Overlay · {}", super::clip_name(&it.input)),
+                None => String::new(),
+            },
             None => "No cut".to_owned(),
         };
         let any_key = key.or(motion_key);
         let ease = match (key, motion_key, target) {
             (Some(k), _, Some((tg, _))) => Some(self.effects_of(tg)[k].ease),
-            (None, Some(k), _) => overlay.map(|(i, _)| self.edit.overlays[0].items[i].motion[k].ease),
+            (None, Some(k), _) => overlay.and_then(|(i, _)| self.edit.item(i)).map(|it| it.motion[k].ease),
             _ => None,
         };
         let keys = row![
@@ -480,7 +496,7 @@ impl App {
                 icon_button(
                     super::RESET_VIEW,
                     target
-                        .filter(|&(tg, _)| !self.effects_of(tg).is_empty() || matches!(tg, Target::Overlay(i) if !self.edit.overlays[0].items[i].motion.is_empty()))
+                        .filter(|&(tg, _)| !self.effects_of(tg).is_empty() || matches!(tg, Target::Overlay(i) if self.edit.item(i).is_some_and(|it| !it.motion.is_empty())))
                         .map(|_| m(EffectMsg::Reset(None))),
                 ),
                 text(if on_cut { "Reset: remove this cut's effects" } else { "Reset: remove this overlay's effects and moves" }),
