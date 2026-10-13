@@ -611,7 +611,7 @@ impl Pipeline {
             seam: None,
             aligner: None,
             cut: false,
-            hw: ffmpeg::Hwaccel::pick(input, flat.track)?,
+            hw: if flat.picture { ffmpeg::Hwaccel::Software } else { ffmpeg::Hwaccel::pick(input, flat.track)? },
             proxy: None,
             flat: Some(flat),
             rate: None,
@@ -741,7 +741,8 @@ fn span(input: &Path, start: Option<f64>, duration: Option<f64>, reframe: Option
     let end = match (duration, keyed) {
         (Some(d), _) => start + d,
         (None, Some((_, end))) if end > start => end,
-        _ => ffmpeg::duration(input)?,
+        // A picture has no end of its own.
+        _ => Some(ffmpeg::duration(input)?).filter(|&d| d < ffmpeg::PICTURE_MOST).unwrap_or(start + ffmpeg::PICTURE_SECONDS),
     };
     if end <= start {
         bail!("nothing to render between {start} and {end} s");
@@ -774,11 +775,12 @@ fn cut_pipelines(project: &mut project::Project, opts: &StitchOpts, proxy: bool)
         cut.flat = pipelines[i].flat.is_some();
         of_cut.push(i);
     }
-    // The edit runs at its first 360 clip's rate (its first cut's if it has
-    // none); ordinary videos at another rate are decoded at it, frames
-    // repeated or dropped, so they keep their speed and stay in step.
-    let Some(fps) = pipelines.iter().find(|p| p.flat.is_none()).or(pipelines.first()).map(|p| p.fps) else { return Ok((pipelines, of_cut)) };
-    for p in pipelines.iter_mut().filter(|p| p.flat.is_some() && (p.fps - fps).abs() > 0.01) {
+    // The edit runs at its first 360 clip's rate (its first video's if it
+    // has none, else 30 fps); ordinary videos at another rate are decoded
+    // at it, frames repeated or dropped, so they keep their speed and stay
+    // in step, and pictures are repeated at it.
+    let fps = pipelines.iter().find(|p| p.flat.is_none()).or(pipelines.iter().find(|p| p.flat.is_some_and(|f| !f.picture))).map_or(30.0, |p| p.fps);
+    for p in pipelines.iter_mut().filter(|p| p.flat.is_some_and(|f| f.picture) || (p.flat.is_some() && (p.fps - fps).abs() > 0.01)) {
         p.rate = Some(fps);
         p.fps = fps;
     }
@@ -1207,14 +1209,17 @@ fn save_png(path: &Path, f: &stitch::Frame) -> Result<()> {
 /// no `what` (only an Osmo 360's .OSV does).
 fn needs_360(input: &Path, what: &str) -> Result<()> {
     if ffmpeg::flat(input)?.is_some() {
-        bail!("{} is an ordinary video: it has no {what}, only an Osmo 360 clip (.OSV) does", input.display());
+        bail!("{} is an ordinary video or picture: it has no {what}, only an Osmo 360 clip (.OSV) does", input.display());
     }
     Ok(())
 }
 
 fn info(input: &Path) -> Result<()> {
     if let Some(flat) = ffmpeg::flat(input)? {
-        let info = serde_json::json!({
+        let info = if flat.picture {
+            serde_json::json!({ "input": input, "kind": "picture", "size": flat.size() })
+        } else {
+            serde_json::json!({
             "input": input,
             "kind": "video",
             "duration": ffmpeg::duration(input)?,
@@ -1222,7 +1227,8 @@ fn info(input: &Path) -> Result<()> {
             "size": flat.size(),
             "recorded": ffmpeg::creation_time(input)?,
             "audio": ffmpeg::has_audio(input)?,
-        });
+            })
+        };
         println!("{}", serde_json::to_string_pretty(&info)?);
         return Ok(());
     }

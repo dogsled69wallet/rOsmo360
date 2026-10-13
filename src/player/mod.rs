@@ -73,8 +73,10 @@ pub struct Launch {
 #[derive(Clone)]
 pub struct Options {
     pub osv_size: Option<u32>,
-    /// Forced decoder, or the one found by probing the first clip.
+    /// Forced decoder, or the one found by probing the first Osmo clip.
     pub hw: Option<Hwaccel>,
+    /// `hw` was asked for (`--hwaccel`), not found.
+    pub hw_forced: bool,
     pub stabilize: Mode,
     pub imu_axes: ImuAxes,
     pub world_z_down: bool,
@@ -83,7 +85,7 @@ pub struct Options {
 /// Caches `input` the way opening it in the player would: its telemetry and
 /// timeline thumbnails (`rosmo360 cache add`).
 pub fn cache_clip(input: &Path) -> Result<()> {
-    let opts = Options { osv_size: None, hw: Some(Hwaccel::Software), stabilize: Mode::Horizon, imu_axes: ImuAxes::X180, world_z_down: false };
+    let opts = Options { osv_size: None, hw: Some(Hwaccel::Software), hw_forced: true, stabilize: Mode::Horizon, imu_axes: ImuAxes::X180, world_z_down: false };
     thumbs::make(&Media::load(input.to_owned(), &opts, &|_| {})?, |_, _| true)
 }
 
@@ -96,7 +98,11 @@ impl Media {
         let stitch = crate::StitchOpts { stabilize: Some(opts.stabilize), imu_axes: opts.imu_axes, world_z_down: opts.world_z_down, ..Default::default() };
         let p = crate::Pipeline::load(&input, &stitch, opts.stabilize, progress)?;
         let proxy = if p.flat.is_some() { None } else { ffmpeg::proxy(&input) };
+        // An ordinary video or picture has its own (`Pipeline::load_flat`):
+        // a GPU decoder takes no JPEG, and a picture loaded first made every
+        // later OSV decode in software, crawling at 1920 px.
         let hw = match opts.hw {
+            _ if p.flat.is_some() && !opts.hw_forced => p.hw,
             Some(hw) => hw,
             None => {
                 let hw = Hwaccel::pick(&input, p.tracks[0])?;
@@ -129,6 +135,7 @@ pub fn run(inputs: Vec<PathBuf>, launch: Launch) -> Result<()> {
     let opts = Options {
         osv_size: launch.osv_size.or(settings.osv_size),
         hw: launch.hw,
+        hw_forced: launch.hw.is_some(),
         stabilize: launch.stabilize.unwrap_or(settings.stabilize),
         imu_axes: launch.imu_axes,
         world_z_down: launch.world_z_down,
@@ -649,19 +656,40 @@ impl App {
         match &mut self.partner {
             Some((j, inc)) if *j == i && inc.playback.media.input == input => {
                 let p = &mut inc.playback;
+                // Primed to catch up: started as the edit gets there.
+                if let Some(at) = p.go_at {
+                    if !playing {
+                        p.go_at = None;
+                        p.pause();
+                    } else if t >= at - 0.5 / p.media.fps {
+                        p.go();
+                    }
+                    return;
+                }
+                // Played from paused, primed ahead as a resync is: played
+                // from its paused frame, it came up behind and froze for the
+                // 1-2 s of a resync.
                 if p.playing != playing {
-                    if playing { p.play() } else { p.pause() }
+                    if !playing {
+                        p.pause();
+                    } else {
+                        inc.playback = p.primed_again(t + Self::catch_up(p.startup()));
+                        return;
+                    }
                 }
                 // Playing, the two clocks run side by side, once it's running:
                 // waiting for its first frame (a second or more for the OSV)
                 // its clock stands still, and taking that for drift restarted
-                // it over and over, each restart opening more decoders.
-                // Paused, it follows the playhead as the playing cut does when
-                // scrubbed: a frame at a time, skipping those overtaken (a
-                // jump each time started decoders faster than they ended).
+                // it over and over. Drifted, it's primed again further on, by
+                // its decoder's start-up and some: jumped to where the edit
+                // was, it came up as far behind as its start took and jumped
+                // again, showing nothing (OSV 1920 px, 1.1-1.4 s). Paused, it
+                // follows the playhead as the playing cut does when scrubbed:
+                // a frame at a time, skipping those overtaken (a jump each
+                // time started decoders faster than they ended).
                 if playing {
                     if p.running() && (p.now() - t).abs() > 0.25 {
-                        p.jump(t, true);
+                        inc.playback = p.primed_again(t + Self::catch_up(p.startup()));
                     }
                 } else if (p.target() - t).abs() > 1.0 / p.media.fps {
                     p.scrub(t);
@@ -678,11 +706,30 @@ impl App {
                 let mut media = media.clone();
                 media.osv_size = self.opts.osv_size;
                 media.stab.set_mode(self.edit.cuts[i].stabilize.unwrap_or(self.opts.stabilize));
-                let mut playback = Playback::new(media, 0.0, self.full_on_pause);
-                playback.jump(t, playing);
+                // Playing, primed ahead to start as the edit gets there, as
+                // a resync is.
+                let playback = if playing {
+                    let mut p = Playback::primed(media, t + Self::catch_up(0.0), 0.0, self.full_on_pause);
+                    p.go_at = Some(p.target());
+                    p
+                } else {
+                    let mut p = Playback::new(media, 0.0, self.full_on_pause);
+                    p.jump(t, false);
+                    p
+                };
                 self.partner = Some((i, Clip { playback, shown: None }));
             }
         }
+    }
+
+    /// How far ahead of the edit a crossfade's partner is primed to catch
+    /// up, for a decoder that took `startup` seconds to start last time:
+    /// with room for it to take longer (it varied 1.1-1.4 s), at least half
+    /// a second.
+    fn catch_up(startup: f64) -> f64 {
+        // Not measured yet: about an OSV's at 1920 px.
+        let startup = if startup > 0.0 { startup } else { 1.0 };
+        (startup * 1.5).max(0.5)
     }
 
     /// The clips' sound at the speakers: the listening volume, its level in
@@ -1056,7 +1103,9 @@ impl App {
             _ => None,
         });
         let theme = Subscription::run(theme_changes);
-        let busy = self.clip.as_ref().is_some_and(|c| c.playback.busy());
+        // The crossfade's partner too: paused, its frame came in only with
+        // the next event.
+        let busy = self.clip.iter().chain(self.partner.as_ref().map(|(_, c)| c)).any(|c| c.playback.busy());
         let close = window::close_requests().map(|_| Message::CloseRequested);
         if busy {
             Subscription::batch([keys, theme, close, window::frames().map(|_| Message::Tick)])
@@ -1076,7 +1125,12 @@ impl App {
                     async move {
                         let mut dialog = rfd::AsyncFileDialog::new()
                             .set_title("Add clips")
-                            .add_filter("Videos", &["OSV", "osv", "mp4", "MP4", "mov", "MOV", "mkv", "MKV", "m4v", "M4V", "avi", "AVI", "webm", "WEBM", "mts", "MTS"])
+                            .add_filter(
+                                "Videos and pictures",
+                                &[
+                                    "OSV", "osv", "mp4", "MP4", "mov", "MOV", "mkv", "MKV", "m4v", "M4V", "avi", "AVI", "webm", "WEBM", "mts", "MTS", "jpg", "JPG", "jpeg", "JPEG", "png", "PNG", "webp", "WEBP", "bmp", "BMP", "tif", "TIF", "tiff", "TIFF",
+                                ],
+                            )
                             .add_filter("Osmo 360 video", &["OSV", "osv"]);
                         if let Some(dir) = dir {
                             dialog = dialog.set_directory(dir);
@@ -1097,7 +1151,9 @@ impl App {
                 self.loaded += 1;
                 match Arc::into_inner(result).expect("loaded clip is not shared") {
                     Ok(media) => {
-                        self.opts.hw = Some(media.hw);
+                        if media.flat.is_none() {
+                            self.opts.hw = Some(media.hw);
+                        }
                         let (input, duration) = (media.input.clone(), media.duration);
                         let thumbs = (!self.thumbs.contains_key(&input)).then(|| Task::run(thumbs::stream(media.clone()), |m| m));
                         self.thumbs.entry(input.clone()).or_default();
@@ -2001,7 +2057,10 @@ impl App {
     /// ones leave playback where it is.
     fn add_cut(&mut self, input: PathBuf, duration: f64) {
         self.edit.checkpoint();
-        self.edit.cuts.push(Cut { input, start: 0.0, end: duration, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new(), flat: false });
+        // A picture has no length of its own: a few seconds, trimmed at will.
+        let picture = self.library.iter().find(|m| m.input == input).and_then(|m| m.flat).is_some_and(|f| f.picture);
+        let end = if picture { ffmpeg::PICTURE_SECONDS } else { duration };
+        self.edit.cuts.push(Cut { input, start: 0.0, end, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new(), flat: false });
         self.mark_flat();
         let i = self.edit.cuts.len() - 1;
         self.selected = Some(i);
@@ -2151,6 +2210,7 @@ impl App {
     fn tick(&mut self) {
         let volume = self.clip_volume();
         if let Some((_, inc)) = &mut self.partner
+            && inc.playback.go_at.is_none()
             && let Some((frame, fix)) = inc.playback.tick()
         {
             inc.shown = Some(Arc::new(Shown::new(frame, fix)));
@@ -2235,7 +2295,10 @@ impl App {
             }
             // Out of a crossfade: the cut that came in plays on.
             Some(_) if self.partner.as_ref().is_some_and(|(i, _)| *i == next) => {
-                let (_, incoming) = self.partner.take().unwrap();
+                let (_, mut incoming) = self.partner.take().unwrap();
+                if incoming.playback.go_at.is_some() {
+                    incoming.playback.go();
+                }
                 self.clip = Some(incoming);
                 self.current = next;
                 self.preroll = None;
@@ -2441,7 +2504,7 @@ impl App {
             let status: Element<'_, Message> = match (&self.loading, song) {
                 (Some(_), _) => self.loading_bar(280.0),
                 (None, Some(song)) => text(song).into(),
-                (None, None) => text("Open DJI Osmo 360 .OSV clips or other videos, or a saved project, to start. Or start from a song.").into(),
+                (None, None) => text("Open DJI Osmo 360 .OSV clips, other videos or pictures, or a saved project, to start. Or start from a song.").into(),
             };
             let idle = self.loading.is_none();
             let buttons = row![
@@ -2696,12 +2759,12 @@ impl App {
         let (lo, hi) = shown_view.fov_range();
         let controls = row![
             if media.flat.is_some() {
-                tip(labelled("Stabilisation", text("—")), text("An ordinary video has no motion data to steady it with"), tooltip::Position::Top)
+                tip(labelled("Stabilisation", text("—")), text("An ordinary video or picture has no motion data to steady it with"), tooltip::Position::Top)
             } else {
                 labelled("Stabilisation", pick_list(&Mode::ALL[..], Some(media.stab.mode()), Message::Stab))
             },
             if media.flat.is_some() {
-                tip(labelled("Projection", text("Flat")), text("An ordinary video is framed by panning and zooming within it"), tooltip::Position::Top)
+                tip(labelled("Projection", text("Flat")), text("An ordinary video or picture is framed by panning and zooming within it"), tooltip::Position::Top)
             } else {
                 labelled("Projection", pick_list(&Projection::ALL[..], Some(shown_view.projection), Message::Projection))
             },
@@ -2710,8 +2773,8 @@ impl App {
                     let (w, h) = playback::fit(flat.size(), playback::FLAT_PLAY);
                     let (fw, fh) = flat.size();
                     tip(
-                        labelled("Playback source", text(format!("Video {w}×{h}"))),
-                        text(if (w, h) == (fw, fh) { "The video at its own size".to_owned() } else { format!("The video scaled down to play smoothly; paused, it shows at its full {fw}×{fh} (Full res when paused)") }),
+                        labelled("Playback source", text(format!("{} {w}×{h}", if flat.picture { "Picture" } else { "Video" }))),
+                        text(if (w, h) == (fw, fh) { "At its own size".to_owned() } else { format!("Scaled down to play smoothly; paused, it shows at its full {fw}×{fh} (Full res when paused)") }),
                         tooltip::Position::Top,
                     )
                 }

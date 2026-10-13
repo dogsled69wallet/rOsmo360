@@ -19,11 +19,24 @@ pub struct Playback {
     /// Playback clock: `anchor_pts` at `anchor_at`.
     anchor_pts: f64,
     anchor_at: Instant,
+    /// When the stream playing was started, until its first frame; and how
+    /// long that took last time, to start a crossfade's partner that far
+    /// ahead (`startup`).
+    started_at: Option<Instant>,
+    startup: f64,
+    /// A crossfade partner made `primed` to catch up: `go` once the edit
+    /// reaches this clip time, and left alone (not ticked) until then.
+    pub go_at: Option<f64>,
     pub shown_pts: f64,
     stream: Option<Stream>,
     pending: Option<Frame>,
     /// While paused, a stream is only kept for its first frame.
     preview_only: bool,
+    /// The paused frame asked for while a preview was still on its way
+    /// (stepping, a crossfade's partner following): started once that one
+    /// shows. Restarted on every step instead, a preview never got its
+    /// first frame out while the keys repeated, and nothing showed.
+    preview_next: Option<f64>,
     /// A sharper frame for while paused, being decoded: its time and size
     /// (`None` for full resolution).
     still: Option<(f64, Option<u32>, Receiver<Result<Frame>>)>,
@@ -82,10 +95,14 @@ impl Playback {
             playing: false,
             anchor_pts: 0.0,
             anchor_at: Instant::now(),
+            started_at: None,
+            startup: 0.0,
+            go_at: None,
             shown_pts: 0.0,
             stream: None,
             pending: None,
             preview_only: false,
+            preview_next: None,
             still: None,
             still_busy: Default::default(),
             still_next: None,
@@ -142,6 +159,9 @@ impl Playback {
     /// the picture runs on at once; else the sound starts with the first
     /// frame, and the picture waits for it to be heard.
     pub fn go(&mut self) {
+        // Its decoder started long before: no start-up to measure.
+        self.started_at = None;
+        self.go_at = None;
         self.playing = true;
         self.ended = false;
         self.anchor_at = Instant::now();
@@ -150,7 +170,8 @@ impl Playback {
 
     fn kind(&self) -> Kind {
         if let Some(flat) = self.media.flat {
-            return Kind::Flat { path: self.media.input.clone(), flat, size: Some(fit(flat.size(), FLAT_PLAY)), rate: None };
+            // A picture repeats at the clip's rate, as the frames are timed.
+            return Kind::Flat { path: self.media.input.clone(), flat, size: Some(fit(flat.size(), FLAT_PLAY)), rate: flat.picture.then_some(self.media.fps) };
         }
         match (&self.media.proxy, self.media.osv_size) {
             (Some(p), None) => Kind::Lrf(p.clone()),
@@ -217,7 +238,9 @@ impl Playback {
     /// Starts decoding at `t`. A paused preview only needs one frame, so it
     /// comes from the proxy when there is one: it starts fastest.
     fn start_stream(&mut self, t: f64) {
+        self.started_at = self.playing.then(Instant::now);
         self.pending = None;
+        self.preview_next = None;
         let kind = match (&self.media.proxy, self.playing) {
             (Some(p), false) => Kind::Lrf(p.clone()),
             _ => self.kind(),
@@ -269,8 +292,12 @@ impl Playback {
             self.start_stream(t);
             self.hold_sound();
         } else {
-            self.preview_only = true;
-            self.start_stream(t);
+            if self.stream.is_some() && self.preview_only {
+                self.preview_next = Some(t);
+            } else {
+                self.preview_only = true;
+                self.start_stream(t);
+            }
             self.request_still(t);
         }
     }
@@ -293,6 +320,21 @@ impl Playback {
                 self.seek(t);
             }
         }
+    }
+
+    /// How long the last stream started playing took to show its first
+    /// frame: about a second for the OSV at 1920 px.
+    pub fn startup(&self) -> f64 {
+        self.startup
+    }
+
+    /// A playback of the same clip, `primed` at `t` to `go` there (see
+    /// `go_at`), knowing how long its decoder takes to start.
+    pub fn primed_again(&self, t: f64) -> Self {
+        let mut p = Playback::primed(self.media.clone(), t, self.volume, self.full_on_pause);
+        p.startup = self.startup;
+        p.go_at = Some(p.anchor_pts);
+        p
     }
 
     /// Whether the clock is running: playing, and not waiting for the first
@@ -455,6 +497,9 @@ impl Playback {
                 }
             }
             if let Some(f) = latest {
+                if let Some(at) = self.started_at.take() {
+                    self.startup = at.elapsed().as_secs_f64();
+                }
                 if self.sound_waits && self.playing {
                     self.sound_waits = false;
                     self.anchor_pts = f.pts;
@@ -469,6 +514,8 @@ impl Playback {
                     if let Some((resume, Some(t))) = self.scrub {
                         self.scrub = Some((resume, None));
                         self.start_stream(t);
+                    } else if let Some(t) = self.preview_next.take() {
+                        self.start_stream(t);
                     }
                 }
             } else if self.playing && self.audio.is_none() && self.shown_pts < self.clock() - 0.25 {
@@ -480,6 +527,12 @@ impl Playback {
             if ended && self.playing {
                 self.pause();
                 self.ended = true;
+            } else if ended && self.preview_only {
+                // No frame there (past the end): the next one asked for.
+                self.stream = None;
+                if let Some(t) = self.preview_next.take() {
+                    self.start_stream(t);
+                }
             }
         }
         if let Some((t, size, rx)) = &self.still {

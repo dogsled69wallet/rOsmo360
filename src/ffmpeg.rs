@@ -18,19 +18,44 @@ fn probe(input: &Path, stream: &str, entries: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().lines().map(|l| l.trim_end_matches(',')).collect::<Vec<_>>().join("\n"))
 }
 
+fn probe_format(input: &Path) -> Result<String> {
+    let out = Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=format_name", "-of", "csv=p=0"]).arg(input).output().context("running ffprobe")?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
 pub fn frame_rate(input: &Path) -> Result<f64> {
     let rate = probe(input, "v:0", "stream=r_frame_rate")?;
     let (n, d) = rate.split_once('/').context("ffprobe gave no frame rate")?;
     Ok(n.parse::<f64>()? / d.parse::<f64>()?)
 }
 
+/// How long the clip runs; a picture is `PICTURE_MOST`, as long as its cut
+/// may be stretched.
 pub fn duration(input: &Path) -> Result<f64> {
     let out = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+        .args(["-v", "error", "-show_entries", "format=format_name,duration", "-of", "csv=p=0"])
         .arg(input)
         .output()
         .context("running ffprobe")?;
-    Ok(String::from_utf8_lossy(&out.stdout).trim().parse()?)
+    let out = String::from_utf8_lossy(&out.stdout);
+    // The format name may hold commas ("mov,mp4,m4a,...").
+    let (format, duration) = out.trim().rsplit_once(',').context("ffprobe gave no duration")?;
+    if is_picture(format) {
+        return Ok(PICTURE_MOST);
+    }
+    Ok(duration.parse()?)
+}
+
+/// A picture's cut when it's added, and its export on its own.
+pub const PICTURE_SECONDS: f64 = 5.0;
+/// The longest a picture's cut can be trimmed out to.
+pub const PICTURE_MOST: f64 = 3600.0;
+
+/// Whether ffprobe's format name is a still picture's: `image2` (JPEG and
+/// files named like a picture) or a `*_pipe` (PNG, WebP, ...). An animated
+/// GIF is `gif`, a video.
+fn is_picture(format: &str) -> bool {
+    format == "image2" || format.ends_with("_pipe")
 }
 
 /// The clip's recording time as the camera tagged it, if it did.
@@ -149,6 +174,8 @@ pub struct Flat {
     pub stored: (u32, u32),
     /// Quarter turns clockwise to stand it upright.
     pub turns: u8,
+    /// A still picture: one frame, shown for as long as its cut lasts.
+    pub picture: bool,
 }
 
 impl Flat {
@@ -159,7 +186,7 @@ impl Flat {
 
     /// Decoded upright, at `size` (upright) if given.
     pub fn out(&self, size: Option<(u32, u32)>, rate: Option<f64>) -> Out {
-        Out { size, turns: Some(self.turns), rate }
+        Out { size, turns: Some(self.turns), rate, picture: self.picture }
     }
 }
 
@@ -189,7 +216,8 @@ pub fn flat(input: &Path) -> Result<Option<Flat>> {
     // own autorotation turns -90 into a clockwise quarter turn.
     let rotation = probe(input, &format!("v:{track}"), "stream_side_data=rotation")?.lines().next().and_then(|r| r.trim().parse::<f64>().ok()).unwrap_or(0.0);
     let turns = ((-rotation / 90.0).round() as i64).rem_euclid(4) as u8;
-    Ok(Some(Flat { track, stored, turns }))
+    let picture = is_picture(&probe_format(input)?);
+    Ok(Some(Flat { track, stored, turns, picture }))
 }
 
 /// How a decode delivers frames, beyond the track as stored.
@@ -204,6 +232,9 @@ pub struct Out {
     /// Frames repeated or dropped to this rate (a 60 fps phone clip in a
     /// 29.97 fps edit).
     pub rate: Option<f64>,
+    /// A still picture: decoded once in software, laid over black where
+    /// it's transparent, and never seeked (it has only its one frame).
+    pub picture: bool,
 }
 
 impl Out {
@@ -213,8 +244,34 @@ impl Out {
         }
     }
 
-    /// Filters for after decoding: the turn, then the scale.
+    /// `-ss t`, except for a picture: at any time it's its one frame.
+    fn seek(&self, cmd: &mut Command, t: f64) {
+        if !self.picture {
+            cmd.args(["-ss", &t.to_string()]);
+        }
+    }
+
+    /// The decoder: a picture in software, as GPU decoders take only video.
+    fn hw(&self, hw: Hwaccel) -> Hwaccel {
+        if self.picture { Hwaccel::Software } else { hw }
+    }
+
+    /// For a stream of frames: a picture's one frame repeated at the rate
+    /// (30 fps without one), decoded and scaled only once.
+    fn repeat(&self, filters: &mut Vec<String>) {
+        if self.picture {
+            filters.push(format!("loop=loop=-1:size=1,setpts=N/{}/TB", self.rate.unwrap_or(30.0)));
+        }
+    }
+
+    /// Filters for after decoding: over black (a picture), the turn, then
+    /// the scale.
     fn filters(&self, filters: &mut Vec<String>) {
+        if self.picture {
+            // Where a PNG is see-through its colours are anything; times
+            // alpha they're over black, as decided for the main track.
+            filters.push("format=rgba,premultiply=inplace=1".to_owned());
+        }
         match self.turns {
             Some(1) => filters.push("transpose=clock".to_owned()),
             Some(2) => filters.push("hflip,vflip".to_owned()),
@@ -306,6 +363,7 @@ impl Hwaccel {
 /// NV12 before the download, which halves the bytes. Both 3840² lenses of
 /// 0037 then decode at 1.9× real time instead of 0.9× on Vulkan.
 pub fn nv12(input: &Path, track: u32, start: f64, out: Out, hw: Hwaccel) -> Result<Command> {
+    let hw = out.hw(hw);
     let mut filters = Vec::new();
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
@@ -319,9 +377,11 @@ pub fn nv12(input: &Path, track: u32, start: f64, out: Out, hw: Hwaccel) -> Resu
         }
     }
     out.filters(&mut filters);
+    out.repeat(&mut filters);
     filters.push("format=nv12".to_owned());
     out.input_args(&mut cmd);
-    cmd.args(["-ss", &start.to_string(), "-i"]).arg(input);
+    out.seek(&mut cmd, start);
+    cmd.arg("-i").arg(input);
     cmd.args(["-map", &format!("0:v:{track}"), "-vf", &filters.join(",")]);
     out.output_args(&mut cmd);
     Ok(cmd)
@@ -338,13 +398,14 @@ pub fn still(input: &Path, track: u32, t: f64, hw: Hwaccel) -> Result<Frame> {
 pub fn still_out(input: &Path, track: u32, t: f64, hw: Hwaccel, (width, height): (usize, usize), out: Out) -> Result<Frame> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
-    if let Some(name) = hw.name() {
+    if let Some(name) = out.hw(hw).name() {
         cmd.args(["-hwaccel", name]);
     }
     out.input_args(&mut cmd);
     let mut filters = Vec::new();
     out.filters(&mut filters);
-    cmd.args(["-ss", &t.to_string(), "-i"]).arg(input).args(["-map", &format!("0:v:{track}")]);
+    out.seek(&mut cmd, t);
+    cmd.arg("-i").arg(input).args(["-map", &format!("0:v:{track}")]);
     if !filters.is_empty() {
         cmd.args(["-vf", &filters.join(",")]);
     }
@@ -378,13 +439,15 @@ impl Decoder {
     pub fn with(input: &Path, track: u32, start: f64, hw: Hwaccel, (width, height): (usize, usize), out: Out) -> Result<Self> {
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error"]);
-        if let Some(name) = hw.name() {
+        if let Some(name) = out.hw(hw).name() {
             cmd.args(["-hwaccel", name]);
         }
         out.input_args(&mut cmd);
         let mut filters = Vec::new();
         out.filters(&mut filters);
-        cmd.args(["-ss", &start.to_string(), "-i"]).arg(input).args(["-map", &format!("0:v:{track}")]);
+        out.repeat(&mut filters);
+        out.seek(&mut cmd, start);
+        cmd.arg("-i").arg(input).args(["-map", &format!("0:v:{track}")]);
         if !filters.is_empty() {
             cmd.args(["-vf", &filters.join(",")]);
         }
@@ -506,6 +569,14 @@ pub struct Mix<'a> {
     pub fades: crate::project::Fades,
 }
 
+impl Sound<'_> {
+    /// Whether its input gives sound: its clip's, or silence in its place
+    /// (`Encoder::new`) where the clip has none and its length is known.
+    fn sounds(&self) -> bool {
+        self.duration.is_some() || has_audio(self.input).unwrap_or(false)
+    }
+}
+
 impl Mix<'_> {
     /// Whether it changes anything.
     fn matters(&self) -> bool {
@@ -525,11 +596,19 @@ impl Encoder {
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24"]).args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"]);
         for s in audio {
-            cmd.args(["-ss", &s.start.to_string()]);
-            if let Some(d) = s.duration {
-                cmd.args(["-t", &d.to_string()]);
+            match s.duration {
+                // A picture or a silent video: silence as long as its frames.
+                Some(d) if !has_audio(s.input).unwrap_or(false) => {
+                    cmd.args(["-f", "lavfi", "-t", &d.to_string(), "-i", "anullsrc=r=48000:cl=stereo"]);
+                }
+                _ => {
+                    cmd.args(["-ss", &s.start.to_string()]);
+                    if let Some(d) = s.duration {
+                        cmd.args(["-t", &d.to_string()]);
+                    }
+                    cmd.arg("-i").arg(s.input);
+                }
             }
-            cmd.arg("-i").arg(s.input);
         }
         // The music's inputs, before any output option.
         let points = audio.iter().any(|s| !s.volume.is_empty() || s.crossfade > 0.0);
@@ -539,7 +618,7 @@ impl Encoder {
             cmd.args(["-filter_complex", &graph, "-map", "[a]"]);
         } else if let [_] = audio {
             cmd.args(["-map", "1:a:0?"]);
-        } else if audio.iter().all(|s| has_audio(s.input).unwrap_or(false)) {
+        } else if audio.iter().all(Sound::sounds) {
             // Same camera, but resample anyway: concat needs matching formats.
             let parts: String = (1..=audio.len()).map(|i| format!("[{i}:a:0]aresample=48000,aformat=channel_layouts=stereo[a{i}];")).collect();
             let inputs: String = (1..=audio.len()).map(|i| format!("[a{i}]")).collect();
@@ -605,7 +684,7 @@ fn level_filter(base: f64, keys: &[crate::project::VolumeKey], t: &str) -> Strin
 fn mixed(cmd: &mut Command, audio: &[Sound<'_>], mix: &Mix<'_>) -> Result<String> {
     let stereo = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
     let mut graph = String::new();
-    if !audio.is_empty() && audio.iter().all(|s| has_audio(s.input).unwrap_or(false)) {
+    if !audio.is_empty() && audio.iter().all(Sound::sounds) {
         for (i, sound) in (1..).zip(audio) {
             // Its volume points, in clip time: the stretch's time starts at 0.
             let level = if sound.volume.is_empty() { String::new() } else { format!(",{}", level_filter(0.0, sound.volume, &format!("(t+{})", sound.start))) };
