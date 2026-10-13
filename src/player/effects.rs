@@ -33,6 +33,8 @@ pub enum EffectMsg {
     Place(usize, f64),
     /// Its place value `i` back to the default here.
     ResetPlace(usize),
+    /// Its place dragged on the view (`handles`).
+    Drag(Place),
     /// The selected text overlay's words edited, and its look.
     TextEdit(iced::widget::text_editor::Action),
     Text(TextChange),
@@ -203,6 +205,10 @@ impl App {
                     values[p] = v;
                     *place = Place::from_values(values);
                 });
+            }
+            EffectMsg::Drag(to) => {
+                self.begin_drag();
+                self.change_place(|place| *place = to);
             }
             EffectMsg::Done => self.dragging = false,
             EffectMsg::TextEdit(action) => {

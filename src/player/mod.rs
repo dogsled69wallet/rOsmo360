@@ -6,6 +6,7 @@ mod audio;
 mod edit;
 mod export;
 mod gpu;
+mod handles;
 mod meter;
 mod playback;
 pub mod render;
@@ -2213,6 +2214,23 @@ impl App {
             .collect()
     }
 
+    /// The overlays showing at the playhead for the view's handles, while
+    /// paused (playing, a drag would fight the motion keyframes).
+    fn overlay_handles(&self) -> handles::Handles {
+        let t = self.position();
+        let playing = self.clip.as_ref().is_some_and(|c| c.playback.playing);
+        let items = [crate::overlay::Track::Overlay, crate::overlay::Track::Text]
+            .into_iter()
+            .filter(|_| !playing)
+            .filter_map(|track| {
+                let (i, item) = self.edit.lane(track)?.at(t)?;
+                let (_, picture) = self.overlay_pictures.get(&item.key())?.clone()?;
+                Some(((track, i), crate::overlay::look(item, t).0, picture))
+            })
+            .collect();
+        handles::Handles { items, selected: self.selected_overlay }
+    }
+
     /// The timeline's blocks for `track`'s lane.
     fn overlay_blocks(&self, track: crate::overlay::Track) -> Vec<timeline::OverlayBlock> {
         self.edit.lane(track).map_or_else(Vec::new, |lane| {
@@ -2830,6 +2848,7 @@ impl App {
         let view: Element<'_, Message> = match self.held.clone().or_else(|| self.sphere()) {
             Some(sphere) => {
                 let (aspect, picking) = (self.aspect, self.picking);
+                let handles = self.overlay_handles();
                 // A locked aspect is the largest box of that shape that fits.
                 responsive(move |room| {
                     let (w, h) = match aspect.ratio() {
@@ -2839,9 +2858,10 @@ impl App {
                     let sphere = shader(sphere.clone()).width(w).height(h);
                     // The box's layer is there from the start of picking: adding it
                     // mid-drag would rebuild the view's state and lose the drag.
+                    // The handles' layer is always there for the same reason.
                     match picking {
                         Some(area) => center(stack![sphere, canvas(PickBox(area)).width(w).height(h)]).into(),
-                        None => center(sphere).into(),
+                        None => center(stack![sphere, canvas(handles.clone()).width(w).height(h)]).into(),
                     }
                 })
                 .into()
