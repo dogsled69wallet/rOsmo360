@@ -1,8 +1,8 @@
 # rOsmo360
 
-A 360° video player and editor for **DJI Osmo 360** footage, written in Rust. It plays the camera's `.OSV` files directly: it stitches the two fisheye lenses, stabilises with the camera's gyro data and lets you look around freely, without going through DJI Studio. Then you can cut clips together on a timeline, keyframe the camera's view, add crossfades, music and colour effects, and export a framed video.
+A 360° video player and editor for **DJI Osmo 360** footage, written in Rust. It plays the camera's `.OSV` files directly: it stitches the two fisheye lenses, stabilises with the camera's gyro data and lets you look around freely, without going through DJI Studio. Then you can cut clips together on a timeline, with ordinary videos and photos beside them, keyframe the camera's view, add crossfades, music, colour effects, titles and logos, and export a framed video.
 
-![rOsmo360 editing a mountain hike: the view over a cairn on a ridge, a lake and glaciers, with cuts from four clips on the timeline below, crossfades between them, their thumbnails and keyframes, and a soundtrack lane with its waveform and volume line](docs/screenshot.png)
+![rOsmo360 editing a mountain hike: a rock tower under the title "Kyrkja, July 2026" with a small logo in the corner, and below it the timeline: a text lane and an overlay lane, cuts from four clips with crossfades, thumbnails and keyframe rows, and a soundtrack lane with its waveform and volume line](docs/screenshot.png)
 
 **New here? Read the [user guide](docs/user-guide.md)**: the whole app, step by step, with screenshots.
 
@@ -30,14 +30,15 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Projections**: little planet (the default, like DJI Studio), perspective and flat equirectangular.
 - **Smooth playback** from the low-resolution proxy (`.LRF`), switching to the full-resolution frame when paused. On a fast GPU it can stream the full-resolution `.OSV` directly.
 - **Hardware decoding** on any GPU vendor: Vulkan Video, VA-API or CUDA, with a software fallback.
-- **Sound**, in sync with the picture, with mute and volume.
+- **Sound**, in sync with the picture, with mute and volume, and an **audio meter** of the mix (peak and RMS per channel, red past 0 dBFS, the loudest peak held), as the export will mix it.
 - **Save photos** of a paused frame: the view as framed, at 3840 px on the long side, or the whole 360° sphere at 7680 × 3840.
 - **Aspect lock** (16:9, 9:16, 4:3, 1:1, 2:1) for framing shots; saved views and exports take the same shape.
 - **Looks native**: follows your desktop's colour theme and accent (KDE, GNOME, Hyprland and others through the desktop portal, Windows, macOS), including live changes, in the Flatpak too. Your settings are remembered between runs.
 
 ### Editing
 
-- **Timeline** of cuts from one or more clips: split, trim, move and delete them, with undo and redo. Each cut shows thumbnails of its footage, and the timeline zooms in for fine work.
+- **Timeline** of cuts from one or more clips: split, trim, move and delete them, with undo and redo. Each cut shows thumbnails of its footage, its keyframes sit in rows under it, and the timeline zooms in for fine work.
+- **Ordinary videos and photos** as cuts beside the Osmo clips: MP4, MOV and the like from a phone, a drone or an action camera (any frame rate, portrait too), and JPG, PNG, WebP and other pictures. They work like any cut, framed by pan and zoom keyframes, so a slow push-in over a photo comes free.
 - **Keyframes** for the view: where it looks (yaw, pitch, roll), the zoom, and the projection, so a shot can pan, zoom or morph into a little planet. Each keyframe eases into the next smoothly, at a steady speed, or holds and then cuts.
 - **Follow the stick**: a keyframe can follow the selfie stick, and so whoever holds it, for a third-person shot that frames you automatically. It works from the camera's motion data, even straight below the camera.
 - **Follow a subject by colour**: `rosmo360 track` finds a coloured subject (a friend's jacket, a tent) through a clip, and keyframes can follow it the same way.
@@ -45,20 +46,22 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Crossfades** between cuts, picture and sound: overlap two cuts and the first dissolves into the second. Select a cut in the overlap to frame it on its own.
 - **Music**: songs on a lane of their own under the edit, to move, trim, split and crossfade; it fades out by itself where the video ends. A project can start from a song.
 - **Sound levels**: one slider for the clips' sound and one for the music, plus volume points over time on the music and on each cut's own sound, to dip the music under talk or tame the wind.
-- **Colour effects**, keyframed per cut: exposure, contrast, highlights and shadows, temperature and tint (with a white-balance eyedropper), saturation, vibrance and a vignette, in a side panel. Plus fades from and to black for the whole edit.
-- **Projects**: save the edit and open it again later. A cut can carry a short note, shown on the timeline.
+- **Colour effects**, keyframed per cut: exposure, contrast, highlights and shadows, temperature and tint (with a white-balance eyedropper), saturation, vibrance, a vignette and opacity, in a side panel. Plus fades from and to black for the whole edit.
+- **Titles and overlays**: a text track and an overlay track above the picture, for titles, captions and logos (PNGs keep their transparency). Text is typed in a panel of its own, with six built-in fonts that look the same on every computer (and your system's), size, colour, alignment, a shadow and an outline. Drag, size and turn items right on the view; their place, effects and opacity are keyframed, so a title can drift and fade.
+- **Projects**: save the edit and open it again later, framed as you left it. A cut can carry a short note, shown on the timeline.
 - **Export** the edit to MP4 with its sound, from 720p to 4K, in the aspect lock's shape. It renders on the GPU, about four times faster than the CPU (21 frames a second at 1080p on an RTX 3090).
 - **Export for another editor**: a file per cut (`My hike - 001.mp4`, `- 002` …) with the music beside them as WAVs, graded or as shot, and a DaVinci Resolve format (DNxHR HQ with PCM sound in `.mov`) that Resolve's free Linux version can read.
 
 ### Command line
 
 - **Export** a clip with a fixed view or keyframed camera moves, or a whole project, in any shape such as 9:16.
-- **Skim clips**: contact sheets of stitched frames (of a clip, or of a project with a row per cut), and a per-second summary of the camera's motion and the sound level.
+- **Skim clips**: contact sheets of stitched frames (of a clip, or of a project: a row per cut headed with its edit time, the titles drawn in, the music's waveform underneath), and a per-second summary of the camera's motion and the sound level, for one clip or a whole folder.
+- **Check an edit** for likely mistakes: cuts out of filming order, repeated footage, crossfades within one scene, pans too fast to follow, music that ends too soon.
 - Stitch single frames or whole clips to equirectangular images and MP4 video.
 
 ## Requirements
 
-- A DJI Osmo 360 clip (`.OSV`). Keep the `.LRF` proxy file next to it for the smoothest playback.
+- A DJI Osmo 360 clip (`.OSV`). Keep the `.LRF` proxy file next to it for the smoothest playback. Ordinary videos and photos can join it in an edit.
 - `ffmpeg` and `ffprobe` on your `PATH`.
 - A GPU with Vulkan support (Linux) and up-to-date drivers. It plays, decodes and exports.
 - On Linux, ALSA for sound (`alsa-lib`, or `libasound2-dev` on Debian/Ubuntu). PipeWire and PulseAudio work through it.
@@ -96,7 +99,7 @@ The program is `target/release/rosmo360`. `packaging/build-release.sh` builds th
 
 ## Usage
 
-The **[user guide](docs/user-guide.md)** walks through the whole app with screenshots: watching, projections, stabilisation, the timeline, keyframes, projects and exporting.
+The **[user guide](docs/user-guide.md)** walks through the whole app with screenshots: watching, projections, stabilisation, the timeline, keyframes, crossfades, music, effects, titles and overlays, projects and exporting.
 
 ```sh
 rosmo360 play                 # opens the player; use Open clips… or Ctrl+O
@@ -119,7 +122,7 @@ In the player:
 | Mute | M |
 | Reset view / fullscreen | 0 / F |
 | Keyframe the current view | K, or the ◆+ button (on a keyframe, it updates it) |
-| Jump to the previous / next keyframe | `[` / `]`, or click a ◆ on the timeline |
+| Jump to the previous / next keyframe | `[` / `]`, or click a ◆ in the cut's View row |
 | Move / delete a keyframe | Drag its ◆ / Delete |
 | How a keyframe moves on to the next | J cycles, or the Ease picker: smooth (◆), linear (●) or hold (■, stays put then cuts) |
 | Make a keyframe follow the selfie stick or a subject | The Follow picker: Fixed, Stick, or Colour track (its mark gets a ring); for a colour track, the eyedropper: drag a box over the subject (a jacket, a tent) and it's tracked to the end of the cut |
@@ -136,12 +139,15 @@ In the player:
 | Move / trim / split / delete a song | Drag it (it snaps edge to edge) / drag its edges / C / Delete, with it selected; Shift-drag onto another song to crossfade them |
 | Mix levels | The **Clip sound** and **Music** sliders |
 | Volume points | Ctrl+click on the music lane or on a cut; drag them up/down and sideways, Delete removes; K adds one at the playhead with a song or point selected |
-| Colour effects and fades | G, or the sliders button: the Effects panel (sliders keyframe the cut's look at the playhead; white-balance eyedropper; to all cuts; fades in/out) |
+| Colour effects and fades | G, or the sliders button: the Effects panel (sliders keyframe the cut's look at the playhead, opacity included; white-balance eyedropper; to all cuts; fades in/out) |
+| Add a title / a logo or picture | The T with a plus (the Text panel opens at the left) / the picture with a plus; both go in at the playhead, 5 s long |
+| Place a title or picture | Paused, select it (on the view or its timeline block), then drag it, a corner to size it, the knob to turn it (Shift: 15° steps); or Across, Down, Size and Rotation in the Effects panel. Each change sets a motion keyframe at the playhead |
+| Move / trim / delete a title or picture | Drag its block / its edges on the Text or Overlay lane / Delete |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
 | Save / open / new project | Ctrl+S (Ctrl+Shift+S: save as) / Ctrl+Shift+O / Ctrl+N |
 | Export the edit | The export button, an arrow out of a tray (pick 720p–2160p next to it); the aspect lock sets the shape, 16:9 when free. **Clips** writes each cut to its own file ("project - 001" and on) and the music as WAVs, for another editor (**Graded** gives them their effects); **Resolve** writes DNxHR and PCM in `.mov`, which DaVinci Resolve's free Linux version can read |
 
-A project saves the cuts with their keyframes, crossfades, effects and volume points, the music, the levels, the fades and the aspect lock, in the same file `rosmo360 export` renders (see below). Clips in the project's folder are stored by relative path, so the folder can be moved as a whole.
+A project saves the cuts with their keyframes, crossfades, effects and volume points, the music, the levels, the titles and overlays, the fades and the aspect lock, in the same file `rosmo360 export` renders (see below). Clips in the project's folder are stored by relative path, so the folder can be moved as a whole.
 
 Command-line tools:
 
@@ -176,7 +182,7 @@ Angles are in degrees: yaw turns right, pitch looks up. With stabilisation on (h
 
 Exports are 1080p by default (1920 × 1080, or 1080 × 1920 for 9:16), a good quality for sharing online. `-r` picks `720p`, `1080p`, `1440p` or `2160p` (`4k`), meaning the short side in pixels. `-a` sets the shape (`16:9`, `9:16`, `1:1`, `4:5`, …) when the reframe file doesn't, and `--size 1234x567` gives an exact size.
 
-To join cuts from one or more clips, write a project file and export it. Each cut has its own keyframes, in clip time, and may set its own `stabilize` (`off`, `horizon`, `level` or `lock`; otherwise `--stabilize`, horizon by default) and a `note`, which the player's timeline shows on the cut. Relative paths are relative to the project file:
+To join cuts from one or more clips, write a project file and export it. A cut's `input` is an Osmo clip, an ordinary video or a picture (a picture has no length of its own: `"in": 0, "out": 5` shows it for 5 s). Each cut has its own keyframes, in clip time, and may set its own `stabilize` (`off`, `horizon`, `level` or `lock`; otherwise `--stabilize`, horizon by default) and a `note`, which the player's timeline shows on the cut. Relative paths are relative to the project file:
 
 ```json
 {
@@ -193,7 +199,9 @@ A cut may also have:
 
 - `crossfade`: seconds it overlaps the cut before, dissolving in from it (the edit is that much shorter);
 - `volume`: its own sound's level over time, `[{"t": 12, "volume": -10}, …]` in clip time and dB, straight lines between points;
-- `effects`: colour keyframes in clip time, each holding the whole look (fields left out are 0): `exposure` (stops, −3…3), `contrast`, `highlights`, `shadows`, `temperature`, `tint`, `saturation`, `vibrance` (−1…1), `vignette` (0…1), and `ease`.
+- `effects`: colour keyframes in clip time, each holding the whole look (fields left out are 0, opacity 1): `exposure` (stops, −3…3), `contrast`, `highlights`, `shadows`, `temperature`, `tint`, `saturation`, `vibrance` (−1…1), `vignette` (0…1), `opacity` (0…1, the rest black), and `ease`.
+
+On an ordinary video or a picture there's no sphere: a keyframe pans and zooms within the picture. `fov` 90 shows its whole height (and is where a cut without keyframes stays), 45 is a 2× zoom, and 90° of `yaw` or `pitch` moves the view one picture height.
 
 And the edit as a whole: `sound` (the clips' level in dB), `fades` (seconds from and to black) and `music`, songs placed in edit time:
 
@@ -216,6 +224,26 @@ And the edit as a whole: `sound` (the clips' level in dB), `fades` (seconds from
 ```
 
 A music clip plays `in` to `out` of its song from `at` in the edit; two may overlap partly, which crossfades them. Its `keyframes` are volume points in edit time, in dB on top of `volume`. The export ends with the last cut, fading out music that runs on.
+
+Titles go in `text` and pictures in `overlays`, each a list of lanes (the first lowest; text over the overlays) holding items one after another, in edit time like music:
+
+```json
+{
+  "overlays": [{"items": [
+    {"input": "logo.png", "at": 0, "in": 0, "out": 40,
+     "motion": [{"t": 0, "x": 0.92, "y": 0.1, "size": 0.12}], "effects": [{"t": 0, "opacity": 0.85}]}
+  ]}],
+  "text": [{"items": [
+    {"text": {"content": "Kyrkja\nJuly 2026", "font": "Bebas Neue", "size": 0.13, "colour": "#ffffff",
+              "align": "centre", "shadow": true, "outline": {"colour": "#000000", "width": 0.05}},
+     "at": 0.5, "in": 0, "out": 6,
+     "motion": [{"t": 0, "x": 0.5, "y": 0.3}, {"t": 6, "x": 0.5, "y": 0.28, "size": 1.08}],
+     "effects": [{"t": 0, "opacity": 0}, {"t": 0.8, "opacity": 1}, {"t": 5.2, "opacity": 1}, {"t": 6, "opacity": 0}]}
+  ]}]
+}
+```
+
+An item shows from `at` in the edit for `out − in` seconds. Its `motion` keyframes, in its own time from `in`, give its centre (`x`, `y`, 0…1 across and down the frame), `size` (1: a picture fits the frame, text is as big as its own `size`, a share of the frame's height) and `rotation` (degrees clockwise), eased like camera keyframes; left-out fields are their defaults (the centre, 1, 0). `effects` are as for cuts. Text takes `content`, `font` (the built-in Inter, Montserrat, Bebas Neue, Playfair Display, Caveat and Permanent Marker, or a system font; a missing one falls back to Inter), `size`, `colour`, `bold`, `align` (`left`, `centre`, `right`), `shadow` and `outline`. Clips export leaves titles and overlays out.
 
 ```sh
 rosmo360 export edit.json -o edit.mp4
@@ -245,21 +273,27 @@ The CSV has, every 0.1 s, the subject's direction in the camera, its yaw and pit
 Skimming a clip:
 
 ```sh
-rosmo360 info clip.OSV                      # length, frame rate, recording time, as JSON
+rosmo360 info clip.OSV                      # length, frame rate, recording time and kind (osv, video, picture), as JSON
 rosmo360 preview clip.OSV -o sheet.png      # 24 moments on one contact sheet, marked with time and yaw
 rosmo360 preview clip.OSV --reframe moves.json -o check.png   # the framing at each keyframe
 rosmo360 preview edit.json -o check.png      # a project: a row per cut, framed as the export (--every N for more)
+rosmo360 preview edit.json --tile 200 --columns 6 -o check.png   # a long edit on one readable sheet
 rosmo360 scan clip.OSV > scan.csv           # per second: heading, tilt, turning, shake, loudness
 rosmo360 scan clip.OSV --image > scan.csv   # and open sky, skyline height, views out to the horizon
+rosmo360 scan ~/Videos/Hike -o scans/        # a CSV per clip in a folder, four at a time
+rosmo360 check edit.json                    # likely mistakes in an edit, a line each
 ```
 
-Clips' telemetry and thumbnails are cached in `~/.cache/rosmo360`, so a clip opens in a fraction of a second after the first time (0047 from a network share: 46 s, then 0.4 s). `rosmo360 cache add FOLDER` caches a folder's clips ahead of time, `rosmo360 cache move FOLDER` keeps the cache elsewhere (or set `ROSMO360_CACHE` for one run), `rosmo360 cache` shows where it is and its size, `rosmo360 cache clear [--older-than DAYS]` empties it, and `--no-cache` on any command bypasses it.
+A project's sheet heads each row with the cut's edit time, number, clip and in–out points (`2:16.4 #23 0036 18.0-25.0`), labels each tile with its edit and clip time, draws the titles and overlays, and runs the music's waveform under each row. `check` lists cuts out of the order they were filmed in, a cut repeating footage the cut before shows, crossfades between cuts of one clip seconds apart, pans over 30°/s (`--fast-pan`; it says whether the keyframes or the camera's own turning make them), cuts under a second, and music ending before the edit or running far past it.
+
+Clips' telemetry and thumbnails, and songs' waveforms, are cached in `~/.cache/rosmo360`, so a clip opens in a fraction of a second after the first time (0047 from a network share: 46 s, then 0.4 s). `rosmo360 cache add FOLDER` caches a folder's clips ahead of time, `rosmo360 cache move FOLDER` keeps the cache elsewhere (or set `ROSMO360_CACHE` for one run), `rosmo360 cache` shows where it is and its size, `rosmo360 cache clear [--older-than DAYS]` empties it, and `--no-cache` on any command bypasses it.
 
 `rosmo360 --help` lists everything, including `rig` (calibration as JSON), `imu` (motion data as CSV) and `seam` (seam quality report).
 
 ## Roadmap
 
-- Version 0.3: ordinary video files (MP4, MOV from a phone or drone) and pictures as cuts beside the Osmo clips, an opacity effect, and an overlay track for pictures, text and picture-in-picture video.
+- Osmo 360 photos as cuts, looked around in like a frozen clip.
+- Picture-in-picture video on the overlay track.
 - 360° metadata on equirectangular exports, so YouTube and VR players show them as 360° video.
 - Smooth full-resolution playback on modest hardware (zero-copy decoding).
 - Windows and macOS builds.
@@ -274,6 +308,8 @@ rOsmo360 is licensed under either of
 
 at your option. Unless you state otherwise, any contribution you submit for inclusion in rOsmo360 is dual-licensed as above, without any additional terms or conditions.
 
+The built-in fonts in [`fonts/`](fonts/) keep their own licences (the SIL Open Font License 1.1, and Apache 2.0 for Permanent Marker), included beside each font and with every release; see [`fonts/README.md`](fonts/README.md).
+
 The Vibing with Ravelund logo ([`vibewithravelund-lowres-corrected.jpg`](vibewithravelund-lowres-corrected.jpg)) and the screenshots ([`docs/screenshot.png`](docs/screenshot.png) and those in [`docs/guide/`](docs/guide/)) are not covered by these licences; all rights reserved.
 
 ## Support
@@ -287,7 +323,8 @@ Made by **Vibing with Ravelund**, 2026. rOsmo360 was built through AI-assisted (
 It stands on the shoulders of:
 
 - [telemetry-parser](https://github.com/AdrianEddy/telemetry-parser) by Adrian Eddy, which reads the camera's calibration and motion data;
-- [iced](https://iced.rs) (GUI), [wgpu](https://wgpu.rs) (GPU rendering), [cpal](https://github.com/RustAudio/cpal) (sound), [native-theme](https://github.com/tiborgats/native-theme) (desktop theming) and [rfd](https://github.com/PolyMeilex/rfd) (file dialogs);
+- [iced](https://iced.rs) (GUI), [wgpu](https://wgpu.rs) (GPU rendering), [cosmic-text](https://github.com/pop-os/cosmic-text) (drawing titles), [cpal](https://github.com/RustAudio/cpal) (sound), [native-theme](https://github.com/tiborgats/native-theme) (desktop theming) and [rfd](https://github.com/PolyMeilex/rfd) (file dialogs);
+- the fonts Inter, Montserrat, Bebas Neue, Playfair Display, Caveat and Permanent Marker, by their designers, as published on [Google Fonts](https://fonts.google.com);
 - [FFmpeg](https://ffmpeg.org), used as an external program for decoding.
 
 rOsmo360 is an independent project. It is not affiliated with or endorsed by DJI. DJI, Osmo and DJI Studio are trademarks of SZ DJI Technology Co., Ltd.
