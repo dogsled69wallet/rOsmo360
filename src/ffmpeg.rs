@@ -216,6 +216,8 @@ pub struct Flat {
     pub picture: bool,
     /// HDR (a phone's HLG): brought down to SDR as it's shown (`hdr.rs`).
     pub hdr: Hdr,
+    /// Full-range samples (0-255, `yuvj420p`, as Nikon cameras write).
+    pub full_range: bool,
 }
 
 impl Flat {
@@ -226,7 +228,7 @@ impl Flat {
 
     /// Decoded upright, at `size` (upright) if given.
     pub fn out(&self, size: Option<(u32, u32)>, rate: Option<f64>) -> Out {
-        Out { size, turns: Some(self.turns), rate, picture: self.picture, hdr: self.hdr }
+        Out { size, turns: Some(self.turns), rate, picture: self.picture, hdr: self.hdr, full_range: self.full_range }
     }
 }
 
@@ -257,8 +259,11 @@ pub fn flat(input: &Path) -> Result<Option<Flat>> {
     let rotation = probe(input, &format!("v:{track}"), "stream_side_data=rotation")?.lines().next().and_then(|r| r.trim().parse::<f64>().ok()).unwrap_or(0.0);
     let turns = ((-rotation / 90.0).round() as i64).rem_euclid(4) as u8;
     let picture = is_picture(&probe_format(input)?);
-    let hdr = Hdr::from_transfer(&probe(input, &format!("v:{track}"), "stream=color_transfer")?);
-    Ok(Some(Flat { track, stored, turns, picture, hdr }))
+    let colour = probe(input, &format!("v:{track}"), "stream=pix_fmt,color_range,color_transfer")?;
+    let colour: Vec<&str> = colour.lines().next().unwrap_or("").split(',').collect();
+    let hdr = Hdr::from_transfer(colour.get(2).unwrap_or(&""));
+    let full_range = colour.first().is_some_and(|f| f.starts_with("yuvj")) || colour.get(1) == Some(&"pc");
+    Ok(Some(Flat { track, stored, turns, picture, hdr, full_range }))
 }
 
 /// How a decode delivers frames, beyond the track as stored.
@@ -280,6 +285,11 @@ pub struct Out {
     /// (`rgb_filters`), which `rgb24` brings down to SDR (`rgb24`). The GPU's NV12
     /// and P010 are left as stored; the shader does the same there.
     pub hdr: Hdr,
+    /// Full-range video: NV12 and P010 are brought to video range
+    /// (`yuv_filters`), the only range the shader reads. Left as is, a
+    /// Nikon's 0-255 came out crushed and dark (the user's DSC_0412,
+    /// 2026-10-14). RGB decodes convert by the stream's own tag already.
+    pub full_range: bool,
 }
 
 impl Out {
@@ -326,6 +336,13 @@ impl Out {
         if let Some((w, h)) = self.size {
             // A picture is scaled once, so it may as well be scaled well.
             filters.push(format!("scale={w}:{h}:flags={}", if self.picture { "lanczos" } else { "bilinear" }));
+        }
+    }
+
+    /// For an NV12 or P010 decode: full range brought to video range.
+    fn yuv_filters(&self, filters: &mut Vec<String>) {
+        if self.full_range {
+            filters.push("scale=in_range=pc:out_range=tv".to_owned());
         }
     }
 
@@ -485,6 +502,7 @@ pub fn yuv(input: &Path, track: u32, start: f64, out: Out, hw: Hwaccel, deep: bo
     }
     out.filters(&mut filters);
     out.repeat(&mut filters);
+    out.yuv_filters(&mut filters);
     filters.push(format!("format={format}"));
     out.input_args(&mut cmd);
     out.seek(&mut cmd, start);

@@ -8,9 +8,11 @@ fn grade_by(g0: vec4f, g1: vec4f, g2: vec4f, rgb: vec3f, at: vec2f, aspect: f32)
     let wb = vec3f(exp2(g0.y), exp2(-g0.z), exp2(-g0.y));
     var c = pow(pow(max(rgb, vec3f(0.0)), vec3f(2.2)) * g0.x * wb, vec3f(1.0 / 2.2));
     var l = dot(c, luma);
-    let lift = 0.25 * (g1.y * (1.0 - smoothstep(0.0, 0.6, l)) + g1.x * smoothstep(0.4, 1.0, l));
+    let x = clamp(l / 0.6, 0.0, 1.0);
+    let lift = 0.25 * (g1.y * 6.75 * x * (1.0 - x) * (1.0 - x) + g1.x * smoothstep(0.4, 1.0, l));
     if l > 1e-4 {
-        c = c * max((l + lift) / l, 0.0);
+        let to = max(l + lift, 0.0);
+        c = vec3f(to) + (c - vec3f(l)) * sqrt(to / l);
     } else {
         c = max(c + vec3f(lift), vec3f(0.0));
     }

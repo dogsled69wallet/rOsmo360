@@ -102,15 +102,23 @@ impl Grade {
             c[i] = (rgb[i].max(0.0).powf(2.2) * gain * wb[i]).powf(1.0 / 2.2);
         }
         // Tone: highlights and shadows move the brightness, keeping the hue.
+        // Shadows works on a bump that is 0 at black (black stays black)
+        // and greatest at 0.2. The colour grows only by the square root of
+        // the brightness gain: multiplied by the whole gain (6× for a pixel
+        // lifted from 5% to 30%), shadows' slight warm cast turned the rock
+        // in them red (user, 2026-10-14; a shadowed rock face at +0.8: its
+        // colour spread 0.075 against 0.043 now, from 0.027).
         let l = luma(c);
         let smooth = |a: f64, b: f64, x: f64| {
             let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
             t * t * (3.0 - 2.0 * t)
         };
-        let lift = 0.25 * (self.shadows * (1.0 - smooth(0.0, 0.6, l)) + self.highlights * smooth(0.4, 1.0, l));
+        let x = (l / 0.6).clamp(0.0, 1.0);
+        let lift = 0.25 * (self.shadows * 6.75 * x * (1.0 - x).powi(2) + self.highlights * smooth(0.4, 1.0, l));
         if l > 1e-4 {
-            let k = ((l + lift) / l).max(0.0);
-            c = c.map(|v| v * k);
+            let to = (l + lift).max(0.0);
+            let g = (to / l).sqrt();
+            c = c.map(|v| to + (v - l) * g);
         } else {
             c = c.map(|v| (v + lift).max(0.0));
         }
