@@ -130,6 +130,15 @@ Not done yet, roughly in priority order:
    - Needs a D-Log M sample clip first: all 35 Kyrkja clips are normal colour, tagged BT.709 10-bit, as DJI may also tag D-Log.
    - DJI records the profile in `StreamMeta.color_mode` (`ColorModeType`: D_LOG = 2, HLG = 9, …). telemetry-parser's Metadata tag only serialises the clip meta, so reading it means decoding StreamMeta ourselves.
 
+10. **Version 0.6.0 (user, 2026-10-14): fixes from the code audit**, worst first. Reproduced files are in the session scratchpad (`odd.png`/`odd.jpg`, `sd.mp4`, `h422.mp4`, `mix.json`); remake them with ffmpeg's `testsrc2` if gone.
+   1. **Wrong colour matrix on the GPU path (reproduced).** `ffmpeg::yuv` lets swscale convert pictures (RGB after `Out::filters`' `format=rgba`) and BT.601-tagged videos (`smpte170m`/`bt470bg`) to NV12 with BT.601, while the shader decodes BT.709: colour bars' green 252 → 213 (red gains 23 of green) in the player and GPU export; CPU export is right. Fix: `out_color_matrix=bt709` for pictures and for videos tagged 601 (untagged HD stays as is, assumed 709); check GPU vs CPU on the bars and a real JPEG.
+   2. **The hardware-decoder probe is shared across files (reproduced).** `Hwaccel::works` caches per decoder only, so after an OSV a video the GPU can't decode (10-bit 4:2:2 H.264, as Sony/Panasonic record) is given that decoder: alone it exports, after 0037 "Error: no frames decoded". Fix: key the probe by codec, profile and pixel format (or probe each ordinary video).
+   3. **Decode errors hidden and padded over.** Player/GPU decodes send ffmpeg's stderr to null, and both exports repeat the last frame when a clip runs out early, so a disk or decoder failure mid-export gives a frozen picture with no word. Fix: warn when more than a frame or two is padded; keep stderr's tail for error messages. Also: a cut that decodes no frames writes none on the CPU path while its sound stretch still counts (later cuts drift); fail as the GPU path does.
+   4. **Project save isn't atomic.** `Project::save` (and `Settings::save`) write over the file; a crash or full disk mid-save loses it. Write a temporary file beside it and rename, as `cache::store` does.
+   5. **Closing during an export or colour track quits at once**, leaving a half-written video and the dissolve's temp files in `/tmp` (GBs at 2160p). Ask first, or cancel and clean up.
+   6. Small ones: ffmpeg children not waited for on `source::still`/`still_flat` error paths (zombies); dissolve temp files predictable by pid and opened following symlinks (create them `create_new` with a random name); text `size` unbounded from JSON (cap it, a huge size × long text allocates GBs); `install.sh` doesn't check the release's `SHA256SUMS`; AppRun/`launch.sh` open only `.OSV`/`.json` by bare name (add video and picture types), and the desktop file has no `MimeType`; pin telemetry-parser to a `rev` (the cache's `FORMAT` depends on it).
+   Not covered by the audit: `player/mod.rs` only skimmed; the shader maths not re-derived; no `cargo audit` (not installed).
+
 ## Commands
 
 ```sh
