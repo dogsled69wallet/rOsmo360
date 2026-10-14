@@ -172,7 +172,9 @@ pub fn run(inputs: Vec<PathBuf>, launch: Launch) -> Result<()> {
     .subscription(App::subscription)
     .theme(|app: &App| app.theme.clone())
     .window(window::Settings {
-        size: iced::Size::new(1280.0, 820.0),
+        // Wide enough for the top bar and the transport row (at 1280 the
+        // ends of both were cut off).
+        size: iced::Size::new(1640.0, 900.0),
         // Closing asks first when the edit has unsaved changes.
         exit_on_close_request: false,
         // Wayland matches the window to its menu entry and icon by this id: in a
