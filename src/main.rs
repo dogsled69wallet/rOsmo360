@@ -5,6 +5,7 @@ mod dissolve;
 mod exposure;
 mod grade;
 mod ffmpeg;
+mod hdr;
 mod imu;
 mod overlay;
 mod player;

@@ -127,7 +127,10 @@ impl Media {
             proxy,
             osv_size: opts.osv_size,
             hw,
-            rig: Arc::new(if p.flat.is_some() { Rig::flat(p.tracks[0]) } else { Rig::new(p.lenses, p.tracks, false) }),
+            rig: Arc::new(match p.flat {
+                Some(flat) => Rig::flat(p.tracks[0], flat.hdr),
+                None => Rig::new(p.lenses, p.tracks, false),
+            }),
             stab: p.stab,
             readout_ms: p.readout_ms,
             fps: p.fps,
@@ -300,6 +303,7 @@ enum Message {
     SettingsPanel,
     AutoKey(bool),
     Theme(ThemeChoice),
+    TenBit(bool),
     /// A drag on the view let go.
     LookDone,
     /// Open the Info panel on a file on the timeline (right-click).
@@ -556,6 +560,8 @@ struct App {
     settings_open: bool,
     /// The theme chosen in the Settings panel (`theme` is it resolved).
     theme_choice: ThemeChoice,
+    /// 10-bit tracks decode at 10 bits (`source::deep`).
+    ten_bit: bool,
     fullscreen: bool,
     volume: f32,
     muted: bool,
@@ -582,11 +588,13 @@ struct App {
 impl App {
     fn new(opts: Options, saved: settings::Settings) -> Self {
         audio::set_listening(if saved.muted { 0.0 } else { saved.volume });
+        source::set_deep(saved.ten_bit);
         App {
             opts,
             followed: Default::default(),
             theme: ThemeChoice::from_key(&saved.theme).resolve(),
             theme_choice: ThemeChoice::from_key(&saved.theme),
+            ten_bit: saved.ten_bit,
             logo: image::Handle::from_bytes(LOGO),
             library: Vec::new(),
             thumbs: Default::default(),
@@ -671,6 +679,7 @@ impl App {
             export_format: self.export_format,
             auto_key: self.auto_key,
             theme: self.theme_choice.key(),
+            ten_bit: self.ten_bit,
         }
     }
 
@@ -1468,6 +1477,10 @@ impl App {
                 }
             }
             Message::AutoKey(on) => self.auto_key = on,
+            Message::TenBit(on) => {
+                self.ten_bit = on;
+                source::set_deep(on);
+            }
             Message::LookDone => {}
             Message::Export => {
                 if self.edit.cuts.is_empty() || self.exporting.is_some() {

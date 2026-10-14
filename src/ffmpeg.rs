@@ -5,6 +5,7 @@ use crate::stitch::Frame;
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use crate::hdr::Hdr;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 /// A command running ffmpeg's `tool` (`ffmpeg` or `ffprobe`): one bundled
@@ -131,6 +132,7 @@ pub fn split_proxy(frame: &Frame, tracks: &[u32]) -> Vec<Frame> {
 pub fn key_frames(input: &Path, track: u32, (w, h): (usize, usize), out: Out, mut each: impl FnMut(f64, Frame) -> bool) -> Result<()> {
     let mut filters = Vec::new();
     Out { size: Some((w as u32, h as u32)), ..out }.filters(&mut filters);
+    out.rgb_filters(&mut filters);
     filters.push("showinfo".to_owned());
     let mut cmd = tool("ffmpeg");
     cmd.args(["-hide_banner", "-nostdin", "-nostats", "-loglevel", "info", "-skip_frame", "nokey"]);
@@ -139,7 +141,7 @@ pub fn key_frames(input: &Path, track: u32, (w, h): (usize, usize), out: Out, mu
         .arg("-i")
         .arg(input)
         .args(["-map", &format!("0:v:{track}"), "-vf", &filters.join(","), "-fps_mode", "passthrough"])
-        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .args(["-f", "rawvideo", "-pix_fmt", out.rgb_format(), "-"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -161,14 +163,14 @@ pub fn key_frames(input: &Path, track: u32, (w, h): (usize, usize), out: Out, mu
     let mut stdout = child.stdout.take().unwrap();
     let result = (|| -> Result<()> {
         loop {
-            let mut rgb = vec![0; w * h * 3];
-            match stdout.read_exact(&mut rgb) {
+            let mut data = vec![0; w * h * out.rgb_bytes()];
+            match stdout.read_exact(&mut data) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e.into()),
             }
             let t = times.recv().context("ffmpeg gave a frame without its time")?;
-            if !each(t, Frame { width: w, height: h, rgb }) {
+            if !each(t, Frame { width: w, height: h, rgb: out.rgb24(data) }) {
                 return Ok(());
             }
         }
@@ -212,6 +214,8 @@ pub struct Flat {
     pub turns: u8,
     /// A still picture: one frame, shown for as long as its cut lasts.
     pub picture: bool,
+    /// HDR (a phone's HLG): brought down to SDR as it's shown (`hdr.rs`).
+    pub hdr: Hdr,
 }
 
 impl Flat {
@@ -222,7 +226,7 @@ impl Flat {
 
     /// Decoded upright, at `size` (upright) if given.
     pub fn out(&self, size: Option<(u32, u32)>, rate: Option<f64>) -> Out {
-        Out { size, turns: Some(self.turns), rate, picture: self.picture }
+        Out { size, turns: Some(self.turns), rate, picture: self.picture, hdr: self.hdr }
     }
 }
 
@@ -253,7 +257,8 @@ pub fn flat(input: &Path) -> Result<Option<Flat>> {
     let rotation = probe(input, &format!("v:{track}"), "stream_side_data=rotation")?.lines().next().and_then(|r| r.trim().parse::<f64>().ok()).unwrap_or(0.0);
     let turns = ((-rotation / 90.0).round() as i64).rem_euclid(4) as u8;
     let picture = is_picture(&probe_format(input)?);
-    Ok(Some(Flat { track, stored, turns, picture }))
+    let hdr = Hdr::from_transfer(&probe(input, &format!("v:{track}"), "stream=color_transfer")?);
+    Ok(Some(Flat { track, stored, turns, picture, hdr }))
 }
 
 /// How a decode delivers frames, beyond the track as stored.
@@ -271,6 +276,10 @@ pub struct Out {
     /// A still picture: decoded once in software, laid over black where
     /// it's transparent, and never seeked (it has only its one frame).
     pub picture: bool,
+    /// HDR video: an RGB decode delivers the BT.2020 signal at 16 bits
+    /// (`rgb_filters`), which `rgb24` brings down to SDR (`rgb24`). The GPU's NV12
+    /// and P010 are left as stored; the shader does the same there.
+    pub hdr: Hdr,
 }
 
 impl Out {
@@ -318,6 +327,40 @@ impl Out {
             // A picture is scaled once, so it may as well be scaled well.
             filters.push(format!("scale={w}:{h}:flags={}", if self.picture { "lanczos" } else { "bilinear" }));
         }
+    }
+
+    /// For an RGB decode: an HDR video's BT.2020 matrix, read in limited
+    /// range and given in full, for `rgb24`.
+    fn rgb_filters(&self, filters: &mut Vec<String>) {
+        if self.hdr != Hdr::None {
+            filters.push("scale=in_color_matrix=bt2020:in_range=tv:out_range=pc".to_owned());
+        }
+    }
+
+    fn rgb_format(&self) -> &'static str {
+        if self.hdr == Hdr::None { "rgb24" } else { "rgb48le" }
+    }
+
+    /// Bytes an RGB decode gives a pixel.
+    fn rgb_bytes(&self) -> usize {
+        if self.hdr == Hdr::None { 3 } else { 6 }
+    }
+
+    /// An RGB decode's pixels as 8-bit SDR RGB.
+    fn rgb24(&self, data: Vec<u8>) -> Vec<u8> {
+        use rayon::prelude::*;
+        if self.hdr == Hdr::None {
+            return data;
+        }
+        let mut rgb = vec![0u8; data.len() / 2];
+        rgb.par_chunks_mut(3).zip(data.par_chunks(6)).for_each(|(px, d)| {
+            let v = |i: usize| u16::from_le_bytes([d[2 * i], d[2 * i + 1]]) as f32 / 65535.0;
+            let sdr = crate::hdr::to_sdr([v(0), v(1), v(2)], self.hdr);
+            for c in 0..3 {
+                px[c] = (sdr[c] * 255.0).round() as u8;
+            }
+        });
+        rgb
     }
 
     fn output_args(&self, cmd: &mut Command) {
@@ -414,28 +457,53 @@ impl Hwaccel {
 /// NV12 before the download, which halves the bytes. Both 3840² lenses of
 /// 0037 then decode at 1.9× real time instead of 0.9× on Vulkan.
 pub fn nv12(input: &Path, track: u32, start: f64, out: Out, hw: Hwaccel) -> Result<Command> {
+    Ok(yuv(input, track, start, out, hw, false)?.0)
+}
+
+/// `nv12`, or with `deep` and a 10-bit track, P010: the same layout with
+/// 16-bit samples, the 10 bits in the high ones. Says which it is. A 10-bit
+/// track's frames come off Vulkan as P010 anyway (keeping them was a little
+/// faster than converting: 0037's lenses at 1.19× real time against 1.10×);
+/// on CUDA they cost twice the download (1.33× against 2.3×).
+pub fn yuv(input: &Path, track: u32, start: f64, out: Out, hw: Hwaccel, deep: bool) -> Result<(Command, bool)> {
     let hw = out.hw(hw);
+    // Asked only where it matters: a software decode to NV12 converts
+    // whatever it gets (the proxy never paid for a probe).
+    let ten_bit = !out.picture && (deep || hw.name().is_some()) && ten_bit(input, track)?;
+    let deep = deep && ten_bit;
+    let format = if deep { "p010le" } else { "nv12" };
     let mut filters = Vec::new();
     let mut cmd = tool("ffmpeg");
     cmd.args(["-v", "error", "-nostdin"]);
     if let Some(name) = hw.name() {
-        let ten_bit = probe(input, &format!("v:{track}"), "stream=pix_fmt")?.contains("10");
         cmd.args(["-hwaccel", name, "-hwaccel_output_format", hw.output_format().unwrap_or(name)]);
         if hw == Hwaccel::Cuda && out.size.is_none() {
-            filters.push("scale_cuda=format=nv12,hwdownload".to_owned());
+            filters.push(format!("scale_cuda=format={format},hwdownload"));
         } else {
             filters.push(format!("hwdownload,format={}", if ten_bit { "p010le" } else { "nv12" }));
         }
     }
     out.filters(&mut filters);
     out.repeat(&mut filters);
-    filters.push("format=nv12".to_owned());
+    filters.push(format!("format={format}"));
     out.input_args(&mut cmd);
     out.seek(&mut cmd, start);
     cmd.arg("-i").arg(input);
     cmd.args(["-map", &format!("0:v:{track}"), "-vf", &filters.join(",")]);
     out.output_args(&mut cmd);
-    Ok(cmd)
+    Ok((cmd, deep))
+}
+
+/// Whether `track` holds more than 8 bits a sample, asked of ffprobe once
+/// per track a run.
+fn ten_bit(input: &Path, track: u32) -> Result<bool> {
+    static KNOWN: std::sync::Mutex<Vec<(PathBuf, u32, bool)>> = std::sync::Mutex::new(Vec::new());
+    if let Some(&(_, _, deep)) = KNOWN.lock().unwrap().iter().find(|(p, t, _)| p == input && *t == track) {
+        return Ok(deep);
+    }
+    let deep = probe(input, &format!("v:{track}"), "stream=pix_fmt")?.contains("10");
+    KNOWN.lock().unwrap().push((input.to_owned(), track, deep));
+    Ok(deep)
 }
 
 /// One RGB24 frame of a video track at `t`, decoded on `hw` when it can be.
@@ -475,20 +543,21 @@ pub fn still_out(input: &Path, track: u32, t: f64, hw: Hwaccel, (width, height):
     out.input_args(&mut cmd);
     let mut filters = Vec::new();
     out.filters(&mut filters);
+    out.rgb_filters(&mut filters);
     out.seek(&mut cmd, t);
     cmd.arg("-i").arg(input).args(["-map", &format!("0:v:{track}")]);
     if !filters.is_empty() {
         cmd.args(["-vf", &filters.join(",")]);
     }
-    let out = cmd
-        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+    let decoded = cmd
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", out.rgb_format(), "-"])
         .stderr(Stdio::inherit())
         .output()
         .context("running ffmpeg")?;
-    if out.stdout.len() != width * height * 3 {
+    if decoded.stdout.len() != width * height * out.rgb_bytes() {
         bail!("no frame at {t:.2} s");
     }
-    Ok(Frame { width, height, rgb: out.stdout })
+    Ok(Frame { width, height, rgb: out.rgb24(decoded.stdout) })
 }
 
 /// Streams RGB24 frames of one video track, starting at the first frame at or
@@ -499,6 +568,8 @@ pub struct Decoder {
     stdout: ChildStdout,
     width: usize,
     height: usize,
+    /// How it was asked to deliver, for `Out::rgb24`.
+    out: Out,
 }
 
 impl Decoder {
@@ -516,6 +587,7 @@ impl Decoder {
         out.input_args(&mut cmd);
         let mut filters = Vec::new();
         out.filters(&mut filters);
+        out.rgb_filters(&mut filters);
         out.repeat(&mut filters);
         out.seek(&mut cmd, start);
         cmd.arg("-i").arg(input).args(["-map", &format!("0:v:{track}")]);
@@ -524,19 +596,19 @@ impl Decoder {
         }
         out.output_args(&mut cmd);
         let mut child = cmd
-            .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .args(["-f", "rawvideo", "-pix_fmt", out.rgb_format(), "-"])
             .stdout(Stdio::piped())
             .spawn()
             .context("running ffmpeg")?;
         let stdout = child.stdout.take().unwrap();
-        Ok(Decoder { child, stdout, width, height })
+        Ok(Decoder { child, stdout, width, height, out })
     }
 
     /// The next frame, or `None` at the end of the stream.
     pub fn next(&mut self) -> Result<Option<Frame>> {
-        let mut rgb = vec![0; self.width * self.height * 3];
-        match self.stdout.read_exact(&mut rgb) {
-            Ok(()) => Ok(Some(Frame { width: self.width, height: self.height, rgb })),
+        let mut data = vec![0; self.width * self.height * self.out.rgb_bytes()];
+        match self.stdout.read_exact(&mut data) {
+            Ok(()) => Ok(Some(Frame { width: self.width, height: self.height, rgb: self.out.rgb24(data) })),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
             Err(e) => Err(e.into()),
         }

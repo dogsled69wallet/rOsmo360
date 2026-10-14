@@ -84,6 +84,13 @@ impl App {
             ]
             .spacing(6),
             rule::horizontal(1),
+            text("Decoding").size(15),
+            column![
+                toggler(self.ten_bit).label("10-bit").on_toggle(Message::TenBit),
+                note("Decodes the OSV and 10-bit videos (a phone's HDR) at all their 10 bits instead of 8: smoother skies and gradients, twice the data to move. Applies from the next seek or clip. Being tried out for 0.5."),
+            ]
+            .spacing(6),
+            rule::horizontal(1),
             text("Keyframes").size(15),
             column![
                 toggler(self.auto_key).label("Auto keyframe").on_toggle(Message::AutoKey),

@@ -165,7 +165,7 @@ pub struct Clip {
 impl Clip {
     pub fn new(p: &crate::Pipeline) -> Result<Clip> {
         if p.flat.is_some() {
-            return Ok(Clip { rig: Arc::new(Rig::flat(p.tracks[0])), hw: p.hw });
+            return Ok(Clip { rig: Arc::new(Rig::flat(p.tracks[0], p.flat.map_or(crate::hdr::Hdr::None, |f| f.hdr))), hw: p.hw });
         }
         let mut rig = Rig::new(p.lenses.clone(), p.tracks.clone(), p.seam.is_some());
         if p.aligner.is_none() {
@@ -274,6 +274,57 @@ mod tests {
     use super::*;
     use crate::overlay::{self, Place, Quad};
 
+    /// The shader brings a 10-bit HLG picture to SDR as `hdr::to_sdr` does.
+    #[test]
+    fn gpu_hdr_matches_the_cpu() {
+        use crate::hdr::{self, Hdr};
+        let Ok(mut gpu) = Gpu::new() else { return };
+        let (w, h) = (64, 32);
+        // Y′CbCr as 10-bit limited-range codes: grey, sky blue, green, near
+        // peak white.
+        for [y, cb, cr] in [[502.0, 512.0, 512.0], [600.0, 640.0, 440.0], [420.0, 420.0, 470.0], [900.0, 512.0, 512.0]] {
+            let le = |c: f64| ((c as u16) << 6).to_le_bytes();
+            let mut data = Vec::new();
+            for _ in 0..w * h {
+                data.extend(le(y));
+            }
+            for _ in 0..w * h / 4 {
+                data.extend(le(cb));
+                data.extend(le(cr));
+            }
+            let frame = Frame { pts: 0.0, layout: source::Layout::PerTrack, pictures: vec![source::Picture { width: w as u32, height: h as u32, deep: true, data }] };
+            let shown = Shown::new(frame, SeamFix::default());
+            let rig = Rig::flat(0, Hdr::Hlg);
+            let camera = crate::view::View::home(crate::view::Projection::Perspective).camera();
+            gpu.size = (0, 0);
+            gpu.targets = vec![gpu.make_target(w, h)];
+            gpu.stitcher.prepare_frame(&gpu.device, &gpu.queue, &rig, &shown, &camera, &[stitch::IDENTITY], [w as f32, h as f32], [0.0, 0.0]);
+            gpu.stitcher.prepare_overlays(&gpu.device, &gpu.queue, &[], [w as f32, h as f32], [0.0, 0.0], [w as f32, h as f32]);
+            let target = &gpu.targets[0];
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            gpu.stitcher.draw(&mut encoder, &target.view, &Rectangle { x: 0, y: 0, width: w as u32, height: h as u32 });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &target.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &target.readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(target.row as u32), rows_per_image: Some(h as u32) } },
+                wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+            );
+            gpu.queue.submit([encoder.finish()]);
+            let (tx, rx) = channel();
+            target.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            gpu.pending.push_back((0, rx));
+            gpu.size = (w, h);
+            let got = gpu.finish().unwrap().unwrap();
+            let ycc = [((y - 64.0) / 876.0) as f32, ((cb - 512.0) / 896.0) as f32, ((cr - 512.0) / 896.0) as f32];
+            let want = hdr::to_sdr(hdr::bt2020_rgb(ycc), Hdr::Hlg).map(|v| (v * 255.0).round() as i32);
+            let mid = ((h / 2) * w + w / 2) * 3;
+            let px = [0, 1, 2].map(|c| got.rgb[mid + c] as i32);
+            eprintln!("{ycc:?}: GPU {px:?}, CPU {want:?}");
+            assert!(px.iter().zip(want).all(|(a, b)| (a - b).abs() <= 2), "GPU {px:?} against CPU {want:?}");
+        }
+    }
+
     /// The player's overlay pass draws what `overlay::composite` does.
     #[test]
     fn gpu_overlays_match_the_cpu() {
@@ -282,9 +333,9 @@ mod tests {
         // A mid-grey ordinary video frame (limited-range NV12).
         let mut data = vec![126u8; w * h];
         data.extend(vec![128u8; w * h / 2]);
-        let frame = Frame { pts: 0.0, layout: source::Layout::PerTrack, pictures: vec![source::Picture { width: w as u32, height: h as u32, data }] };
+        let frame = Frame { pts: 0.0, layout: source::Layout::PerTrack, pictures: vec![source::Picture { width: w as u32, height: h as u32, deep: false, data }] };
         let shown = Shown::new(frame, SeamFix::default());
-        let rig = Rig::flat(0);
+        let rig = Rig::flat(0, crate::hdr::Hdr::None);
         let camera = crate::view::View::home(crate::view::Projection::Perspective).camera();
         // A 4×2 picture: opaque red left, half-transparent green right.
         let mut rgba = Vec::new();

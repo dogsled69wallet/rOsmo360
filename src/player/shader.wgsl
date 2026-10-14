@@ -48,7 +48,7 @@ struct Uniforms {
     // Colour effects (grade.rs, `Grade::uniforms`).
     grade: array<vec4f, 3>,
     // An ordinary video: .x 1 if it is one, .y its picture's width over
-    // height; then its crop (view.rs `Crop`): centre x, y, half height, roll.
+    // height, .z 1 if it came as 10-bit, .w HDR (1 HLG, 2 PQ); then its crop (view.rs `Crop`): centre x, y, half height, roll.
     flat: vec4f,
     crop: vec4f,
 }
@@ -71,6 +71,12 @@ const TAPER_WIDTH: f32 = 12.0;
 @group(0) @binding(5) var uv1: texture_2d<f32>;
 @group(0) @binding(6) var mask0: texture_2d<f32>;
 @group(0) @binding(7) var mask1: texture_2d<f32>;
+// A 10-bit (P010) picture's planes, per slot: 16-bit integers, the 10 bits
+// in the high ones (see deep_y).
+@group(0) @binding(8) var y0d: texture_2d<u32>;
+@group(0) @binding(9) var uv0d: texture_2d<u32>;
+@group(0) @binding(10) var y1d: texture_2d<u32>;
+@group(0) @binding(11) var uv1d: texture_2d<u32>;
 
 const PI: f32 = 3.14159265358979;
 
@@ -147,21 +153,82 @@ fn project(i: u32, d: vec3f) -> Hit {
     return h;
 }
 
-fn nv12(slot: f32, uv: vec2f) -> vec3f {
+// A 16-bit integer plane at `uv`, filtered by hand as the sampler would
+// (texel centres at +0.5, clamped at the edges): integer textures can't be
+// filtered. On the 8-bit planes' scale, so the same limited-range constants
+// hold: 10-bit 64 and 940 land where 8-bit 16 and 235 do (/ 65280).
+fn deep_at(t: texture_2d<u32>, uv: vec2f) -> vec2f {
+    let size = vec2i(textureDimensions(t));
+    let p = uv * vec2f(size) - 0.5;
+    let i = vec2i(floor(p));
+    let f = p - floor(p);
+    let a = mix(deep_load(t, i, size), deep_load(t, i + vec2i(1, 0), size), f.x);
+    let b = mix(deep_load(t, i + vec2i(0, 1), size), deep_load(t, i + vec2i(1, 1), size), f.x);
+    return mix(a, b, f.y) / 65280.0;
+}
+
+fn deep_load(t: texture_2d<u32>, p: vec2i, size: vec2i) -> vec2f {
+    return vec2f(textureLoad(t, clamp(p, vec2i(0), size - 1), 0).rg);
+}
+
+// The picture in `slot` at `uv` as Y′ (0..1) and Cb, Cr (−0.5..0.5), from
+// limited range: slots 0 and 1 are 8-bit NV12, 2 and 3 the same slots'
+// 10-bit planes.
+fn ycc(slot: f32, uv: vec2f) -> vec3f {
     var yy: f32;
     var c: vec2f;
-    if slot < 0.5 {
+    if slot > 2.5 {
+        yy = deep_at(y1d, uv).x;
+        c = deep_at(uv1d, uv);
+    } else if slot > 1.5 {
+        yy = deep_at(y0d, uv).x;
+        c = deep_at(uv0d, uv);
+    } else if slot < 0.5 {
         yy = textureSampleLevel(y0, samp, uv, 0.0).r;
         c = textureSampleLevel(uv0, samp, uv, 0.0).rg;
     } else {
         yy = textureSampleLevel(y1, samp, uv, 0.0).r;
         c = textureSampleLevel(uv1, samp, uv, 0.0).rg;
     }
-    // BT.709, limited range.
-    let Y = (yy - 16.0 / 255.0) * (255.0 / 219.0);
-    let U = (c.x - 128.0 / 255.0) * (255.0 / 224.0);
-    let V = (c.y - 128.0 / 255.0) * (255.0 / 224.0);
-    return clamp(vec3f(Y + 1.5748 * V, Y - 0.1873 * U - 0.4681 * V, Y + 1.8556 * U), vec3f(0.0), vec3f(1.0));
+    return vec3f((yy - 16.0 / 255.0) * (255.0 / 219.0), (c.x - 128.0 / 255.0) * (255.0 / 224.0), (c.y - 128.0 / 255.0) * (255.0 / 224.0));
+}
+
+// BT.709 Y′CbCr as display RGB.
+fn nv12(slot: f32, uv: vec2f) -> vec3f {
+    let c = ycc(slot, uv);
+    return clamp(vec3f(c.x + 1.5748 * c.z, c.x - 0.1873 * c.y - 0.4681 * c.z, c.x + 1.8556 * c.y), vec3f(0.0), vec3f(1.0));
+}
+
+// Mirrors hdr.rs (`bt2020_rgb`, `to_sdr`): a BT.2020 HDR signal (`hdr` 1
+// HLG, 2 PQ) as display-encoded sRGB BT.709, as a 1000-nit display shows
+// it, Hable's curve on the brightest channel, 100 nits as white.
+fn hdr_to_sdr(c: vec3f, hdr: f32) -> vec3f {
+    let e = clamp(vec3f(c.x + 1.4746 * c.z, c.x - 0.16455 * c.y - 0.57135 * c.z, c.x + 1.8814 * c.y), vec3f(0.0), vec3f(1.0));
+    var nits: vec3f;
+    if hdr < 1.5 {
+        let a = 0.17883277;
+        let b = 0.28466892;
+        let cc = 0.5599107;
+        let scene = select((exp((e - cc) / a) + b) / 12.0, e * e / 3.0, e <= vec3f(0.5));
+        let ys = dot(scene, vec3f(0.2627, 0.6780, 0.0593));
+        nits = 1000.0 * pow(max(ys, 1e-6), 0.2) * scene;
+    } else {
+        let p = pow(e, vec3f(1.0 / 78.84375));
+        nits = 10000.0 * pow(max(p - 0.8359375, vec3f(0.0)) / (18.851563 - 18.6875 * p), vec3f(1.0 / 0.15930176));
+    }
+    let l = nits / 100.0;
+    let lin = max(vec3f(
+        1.6605 * l.x - 0.5876 * l.y - 0.0728 * l.z,
+        -0.1246 * l.x + 1.1329 * l.y - 0.0083 * l.z,
+        -0.0182 * l.x - 0.1006 * l.y + 1.1187 * l.z,
+    ), vec3f(0.0));
+    let sig = max(max(lin.x, lin.y), max(lin.z, 1e-6));
+    let v = clamp(lin * (hable(sig) / hable(10.0) / sig), vec3f(0.0), vec3f(1.0));
+    return select(1.055 * pow(v, vec3f(1.0 / 2.4)) - 0.055, 12.92 * v, v <= vec3f(0.0031308));
+}
+
+fn hable(x: f32) -> f32 {
+    return (x * (0.15 * x + 0.05) + 0.004) / (x * (0.15 * x + 0.5) + 0.06) - 0.02 / 0.3;
 }
 
 // Matches Camera::ray in view.rs. The azimuthal mappings put the ray at θ
@@ -279,7 +346,11 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         if any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) {
             return vec4f(0.0, 0.0, 0.0, 1.0);
         }
-        return finish(nv12(0.0, uv), pos);
+        let slot = 2.0 * u.flat.z;
+        if u.flat.w > 0.5 {
+            return finish(hdr_to_sdr(ycc(slot, uv), u.flat.w), pos);
+        }
+        return finish(nv12(slot, uv), pos);
     }
     let v = rows(u.user0, u.user1, u.user2, screen_ray(pos.xy - u.misc.zw));
     let steps = u32(u.misc.x);

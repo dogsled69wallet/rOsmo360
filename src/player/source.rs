@@ -9,22 +9,52 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// One NV12 picture: Y plane then interleaved UV at half resolution.
+/// Whether 10-bit tracks (the OSV's, a phone's HDR video) are decoded at
+/// 10 bits (P010) rather than cut to 8 (NV12). One switch for the run: the
+/// player's setting, or `ROSMO360_10BIT=1` for the command line, to compare
+/// the two while the 10-bit pipeline is new.
+static DEEP: AtomicBool = AtomicBool::new(false);
+
+pub fn set_deep(on: bool) {
+    DEEP.store(on, Ordering::Relaxed);
+}
+
+pub fn deep() -> bool {
+    DEEP.load(Ordering::Relaxed) || std::env::var_os("ROSMO360_10BIT").is_some_and(|v| v == "1")
+}
+
+/// One NV12 picture: Y plane then interleaved UV at half resolution; or,
+/// `deep`, P010: the same with 16-bit little-endian samples, the 10 bits
+/// in the high ones.
 pub struct Picture {
     pub width: u32,
     pub height: u32,
+    pub deep: bool,
     pub data: Vec<u8>,
 }
 
 impl Picture {
+    /// Bytes for a picture of `w` × `h`.
+    pub fn bytes(w: u32, h: u32, deep: bool) -> usize {
+        (w * h * 3 / 2) as usize * if deep { 2 } else { 1 }
+    }
+    fn split(&self) -> usize {
+        (self.width * self.height) as usize * if self.deep { 2 } else { 1 }
+    }
     pub fn y(&self) -> &[u8] {
-        &self.data[..(self.width * self.height) as usize]
+        &self.data[..self.split()]
     }
     pub fn uv(&self) -> &[u8] {
-        &self.data[(self.width * self.height) as usize..]
+        &self.data[self.split()..]
+    }
+    /// Sample `i` of `plane` on an 8-bit scale (0..255 as 0..1), whatever
+    /// the depth: 10-bit 64 and 940 land where 8-bit 16 and 235 do.
+    fn sample(&self, plane: &[u8], i: usize) -> f64 {
+        if self.deep { u16::from_le_bytes([plane[2 * i], plane[2 * i + 1]]) as f64 / 65280.0 } else { plane[i] as f64 / 255.0 }
     }
 }
 
@@ -59,10 +89,9 @@ impl Frame {
         }
         let (x, y, w) = (x as usize, y as usize, pic.width as usize);
         let c = (y / 2) * w + (x / 2) * 2;
-        let px = |b: u8| b as f64 / 255.0;
-        let yy = (px(pic.y()[y * w + x]) - 16.0 / 255.0) * (255.0 / 219.0);
-        let cu = (px(pic.uv()[c]) - 128.0 / 255.0) * (255.0 / 224.0);
-        let cv = (px(pic.uv()[c + 1]) - 128.0 / 255.0) * (255.0 / 224.0);
+        let yy = (pic.sample(pic.y(), y * w + x) - 16.0 / 255.0) * (255.0 / 219.0);
+        let cu = (pic.sample(pic.uv(), c) - 128.0 / 255.0) * (255.0 / 224.0);
+        let cv = (pic.sample(pic.uv(), c + 1) - 128.0 / 255.0) * (255.0 / 224.0);
         // BT.709, limited range, as in the shader.
         Some([yy + 1.5748 * cv, yy - 0.1873 * cu - 0.4681 * cv, yy + 1.8556 * cu].map(|v| v.clamp(0.0, 1.0)))
     }
@@ -95,35 +124,37 @@ impl Drop for Stream {
 
 pub fn spawn(kind: Kind, hw: Hwaccel, start: f64, fps: f64) -> Result<Stream> {
     let (tx, rx) = sync_channel(3);
-    let procs: Vec<(Child, u32, u32)> = match &kind {
+    let procs: Vec<(Child, u32, u32, bool)> = match &kind {
         Kind::Lrf(path) => {
             // The proxy is small H.264: software decodes it at 4-8x real time
             // on one to four threads, and starts in 0.15 s where setting up
             // Vulkan or CUDA takes 0.5-1 s, which made every scrub lag.
             let (w, h) = dims(path, 0)?;
-            vec![(decode(path, 0, start, None, Hwaccel::Software)?, w, h)]
+            let (child, deep) = decode(path, 0, start, None, Hwaccel::Software)?;
+            vec![(child, w, h, deep)]
         }
         Kind::Osv { path, tracks, size } => {
             tracks
                 .iter()
                 .map(|&t| {
                     let (w, h) = size.map_or_else(|| dims(path, t), |s| Ok((s, s)))?;
-                    Ok((decode(path, t, start, *size, hw)?, w, h))
+                    let (child, deep) = decode(path, t, start, *size, hw)?;
+                    Ok((child, w, h, deep))
                 })
                 .collect::<Result<_>>()?
         }
         Kind::Flat { path, flat, size, rate } => {
             let (w, h) = size.unwrap_or_else(|| flat.size());
-            let mut cmd = ffmpeg::nv12(path, flat.track, start, flat.out(*size, *rate), hw)?;
+            let (mut cmd, deep) = ffmpeg::yuv(path, flat.track, start, flat.out(*size, *rate), hw, deep())?;
             cmd.args(["-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null());
-            vec![(cmd.spawn().context("running ffmpeg")?, w, h)]
+            vec![(cmd.spawn().context("running ffmpeg")?, w, h, deep)]
         }
     };
     let layout = match &kind {
         Kind::Lrf(_) => Layout::SideBySide,
         Kind::Osv { .. } | Kind::Flat { .. } => Layout::PerTrack,
     };
-    let (mut children, sizes): (Vec<Child>, Vec<(u32, u32)>) = procs.into_iter().map(|(c, w, h)| (c, (w, h))).unzip();
+    let (mut children, sizes): (Vec<Child>, Vec<(u32, u32, bool)>) = procs.into_iter().map(|(c, w, h, deep)| (c, (w, h, deep))).unzip();
     let outs: Vec<_> = children.iter_mut().map(|c| c.stdout.take().unwrap()).collect();
     let procs = Arc::new(Mutex::new(children));
     let decoders = procs.clone();
@@ -136,15 +167,15 @@ pub fn spawn(kind: Kind, hw: Hwaccel, start: f64, fps: f64) -> Result<Stream> {
 
 /// Reads whole frames from the decoders until they end or nobody wants
 /// more.
-fn pump(mut outs: Vec<std::process::ChildStdout>, sizes: Vec<(u32, u32)>, layout: Layout, start: f64, fps: f64, tx: SyncSender<Frame>) {
+fn pump(mut outs: Vec<std::process::ChildStdout>, sizes: Vec<(u32, u32, bool)>, layout: Layout, start: f64, fps: f64, tx: SyncSender<Frame>) {
     for n in 0.. {
         let mut pictures = Vec::with_capacity(sizes.len());
-        for (&(w, h), out) in sizes.iter().zip(outs.iter_mut()) {
-            let mut data = vec![0; (w * h * 3 / 2) as usize];
+        for (&(w, h, deep), out) in sizes.iter().zip(outs.iter_mut()) {
+            let mut data = vec![0; Picture::bytes(w, h, deep)];
             if out.read_exact(&mut data).is_err() {
                 return;
             }
-            pictures.push(Picture { width: w, height: h, data });
+            pictures.push(Picture { width: w, height: h, deep, data });
         }
         if tx.send(Frame { pts: start + n as f64 / fps, layout, pictures }).is_err() {
             return;
@@ -167,16 +198,16 @@ pub fn still(path: &Path, tracks: &[u32], t: f64, size: Option<u32>, hw: Hwaccel
         .iter()
         .map(|&track| {
             let (w, h) = size.map_or_else(|| dims(path, track), |s| Ok((s, s)))?;
-            let read = |hw| -> Result<Vec<u8>> {
-                let mut child = decode(path, track, t, size, hw)?;
-                let mut data = vec![0; (w * h * 3 / 2) as usize];
+            let read = |hw| -> Result<(Vec<u8>, bool)> {
+                let (mut child, deep) = decode(path, track, t, size, hw)?;
+                let mut data = vec![0; Picture::bytes(w, h, deep)];
                 child.stdout.take().unwrap().read_exact(&mut data)?;
                 let _ = child.kill();
                 let _ = child.wait();
-                Ok(data)
+                Ok((data, deep))
             };
-            let data = read(hw).or_else(|_| read(Hwaccel::Software))?;
-            Ok(Picture { width: w, height: h, data })
+            let (data, deep) = read(hw).or_else(|_| read(Hwaccel::Software))?;
+            Ok(Picture { width: w, height: h, deep, data })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Frame { pts: t, layout: Layout::PerTrack, pictures })
@@ -186,22 +217,23 @@ pub fn still(path: &Path, tracks: &[u32], t: f64, size: Option<u32>, hw: Hwaccel
 /// software if the hardware decoder fails.
 pub fn still_flat(path: &Path, flat: ffmpeg::Flat, t: f64, hw: Hwaccel) -> Result<Frame> {
     let (w, h) = flat.size();
-    let read = |hw| -> Result<Vec<u8>> {
-        let mut cmd = ffmpeg::nv12(path, flat.track, t, flat.out(None, None), hw)?;
+    let read = |hw| -> Result<(Vec<u8>, bool)> {
+        let (mut cmd, deep) = ffmpeg::yuv(path, flat.track, t, flat.out(None, None), hw, deep())?;
         let mut child = cmd.args(["-frames:v", "1", "-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().context("running ffmpeg")?;
-        let mut data = vec![0; (w * h * 3 / 2) as usize];
+        let mut data = vec![0; Picture::bytes(w, h, deep)];
         child.stdout.take().unwrap().read_exact(&mut data)?;
         let _ = child.wait();
-        Ok(data)
+        Ok((data, deep))
     };
-    let data = read(hw).or_else(|_| read(Hwaccel::Software))?;
-    Ok(Frame { pts: t, layout: Layout::PerTrack, pictures: vec![Picture { width: w, height: h, data }] })
+    let (data, deep) = read(hw).or_else(|_| read(Hwaccel::Software))?;
+    Ok(Frame { pts: t, layout: Layout::PerTrack, pictures: vec![Picture { width: w, height: h, deep, data }] })
 }
 
-fn decode(path: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel) -> Result<Child> {
-    let mut cmd = ffmpeg::nv12(path, track, start, ffmpeg::Out { size: size.map(|s| (s, s)), ..Default::default() }, hw)?;
+/// A lens track's decoder, and whether it delivers P010.
+fn decode(path: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel) -> Result<(Child, bool)> {
+    let (mut cmd, deep) = ffmpeg::yuv(path, track, start, ffmpeg::Out { size: size.map(|s| (s, s)), ..Default::default() }, hw, deep())?;
     cmd.args(["-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null());
-    cmd.spawn().context("running ffmpeg")
+    Ok((cmd.spawn().context("running ffmpeg")?, deep))
 }
 
 /// A track's picture size, asked of ffprobe once a run: each stream start

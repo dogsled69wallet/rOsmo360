@@ -29,6 +29,8 @@ pub struct Settings {
     pub auto_key: bool,
     /// The colour theme, as `ThemeChoice::key` names it.
     pub theme: String,
+    /// Decode 10-bit tracks at 10 bits (`source::set_deep`).
+    pub ten_bit: bool,
 }
 
 impl Default for Settings {
@@ -47,6 +49,7 @@ impl Default for Settings {
             export_format: Format::Mp4,
             auto_key: false,
             theme: "system".to_owned(),
+            ten_bit: false,
         }
     }
 }

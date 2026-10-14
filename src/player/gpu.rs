@@ -10,6 +10,7 @@
 //! (`overlay.wgsl`), blended premultiplied.
 
 use super::source::{Frame, Layout};
+use crate::hdr::Hdr;
 use crate::align::{Aligner, CELLS_ALPHA, CELLS_PHI, Field, Strips};
 use crate::exposure::{self, BINS, FADE_FROM, FADE_TO, Gains, Seam};
 use crate::grade::Grade;
@@ -86,7 +87,8 @@ struct Uniforms {
     cut: [[f32; 4]; CELLS_PHI / 4],
     /// Colour effects (`Grade::uniforms`).
     grade: [[f32; 4]; 3],
-    /// An ordinary video: 1 if it is one, its picture's width over height.
+    /// An ordinary video: 1 if it is one, its picture's width over height, 1 if
+    /// it came as 10-bit, its HDR (`Hdr::code`).
     flat: [f32; 4],
     /// Its crop (`view::Crop`): centre x, y, half height, roll.
     crop: [f32; 4],
@@ -108,6 +110,8 @@ pub struct Rig {
     /// An ordinary video: no lenses, its one picture cropped as the camera
     /// says.
     pub flat: bool,
+    /// An ordinary video in HDR, brought down to SDR in the shader.
+    pub hdr: Hdr,
 }
 
 impl Rig {
@@ -118,12 +122,12 @@ impl Rig {
     pub fn new(lenses: Vec<Lens>, tracks: Vec<u32>, exposure: bool) -> Self {
         let seam = if exposure { Seam::new(&lenses) } else { None };
         let (aligner, ring) = (Aligner::new(&lenses), crate::ring::Ring::new(&lenses));
-        Rig { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), lenses, tracks, seam, aligner, ring, flat: false }
+        Rig { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), lenses, tracks, seam, aligner, ring, flat: false, hdr: Hdr::None }
     }
 
     /// An ordinary video's: its picture track and nothing to stitch.
-    pub fn flat(track: u32) -> Self {
-        Rig { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), lenses: Vec::new(), tracks: vec![track], seam: None, aligner: None, ring: None, flat: true }
+    pub fn flat(track: u32, hdr: Hdr) -> Self {
+        Rig { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), lenses: Vec::new(), tracks: vec![track], seam: None, aligner: None, ring: None, flat: true, hdr }
     }
 }
 
@@ -253,6 +257,10 @@ struct Layer {
     uniforms: wgpu::Buffer,
     /// Per texture slot: Y plane, UV plane.
     slots: [(Plane, Plane); 2],
+    /// The same for a 10-bit (P010) picture: 16-bit integer planes, read by
+    /// hand in the shader (`deep_y`), as the filterable 16-bit formats need a
+    /// device feature iced doesn't ask for.
+    deep: [(Plane, Plane); 2],
     masks: [Plane; 2],
     bind_group: wgpu::BindGroup,
     lens_u: [LensU; 2],
@@ -282,6 +290,12 @@ impl Pipeline {
             },
             count: None,
         };
+        let deep_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+            count: None,
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -307,6 +321,10 @@ impl Pipeline {
                 tex_entry(5),
                 tex_entry(6),
                 tex_entry(7),
+                deep_entry(8),
+                deep_entry(9),
+                deep_entry(10),
+                deep_entry(11),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -356,9 +374,10 @@ impl Pipeline {
                 mapped_at_creation: false,
             });
             let slots = [0, 1].map(|_| (plane(device, 2, 2, wgpu::TextureFormat::R8Unorm), plane(device, 1, 1, wgpu::TextureFormat::Rg8Unorm)));
+            let deep = [0, 1].map(|_| deep_planes(device, 2, 2));
             let masks = [0, 1].map(|_| plane(device, 1, 1, wgpu::TextureFormat::R8Unorm));
-            let bind_group = bind(device, &layout, &uniforms, &sampler, &slots, &masks);
-            Layer { uniforms, slots, masks, bind_group, lens_u: [LensU::zeroed(); 2], rig_id: 0, shown_id: 0 }
+            let bind_group = bind(device, &layout, &uniforms, &sampler, &slots, &deep, &masks);
+            Layer { uniforms, slots, deep, masks, bind_group, lens_u: [LensU::zeroed(); 2], rig_id: 0, shown_id: 0 }
         });
         let (overlay, overlay_layout) = overlay_pipeline(device, format);
         Pipeline { pipeline, blend, layout, sampler, srgb: format.is_srgb(), layers, mix: None, overlay, overlay_layout, overlay_slots: Vec::new(), overlays: 0 }
@@ -438,7 +457,7 @@ impl Pipeline {
         if rig.flat
             && let Some(p) = shown.frame.pictures.first()
         {
-            u.flat = [1.0, p.width as f32 / p.height as f32, 0.0, 0.0];
+            u.flat = [1.0, p.width as f32 / p.height as f32, p.deep as u8 as f32, rig.hdr.code()];
             let c = &camera.crop;
             u.crop = [c.centre[0], c.centre[1], c.half, c.roll];
         }
@@ -507,7 +526,7 @@ impl Layer {
         if rig.flat {
             self.masks = [0, 1].map(|_| plane(device, 1, 1, wgpu::TextureFormat::R8Unorm));
             self.lens_u = [LensU::zeroed(); 2];
-            self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.masks);
+            self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.deep, &self.masks);
             self.rig_id = rig.id;
             self.shown_id = 0;
             return;
@@ -520,7 +539,7 @@ impl Layer {
             p
         });
         self.lens_u = [0, 1].map(|i| lens_uniform(&rig.lenses[i]));
-        self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.masks);
+        self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.deep, &self.masks);
         self.rig_id = rig.id;
         self.shown_id = 0;
     }
@@ -529,17 +548,21 @@ impl Layer {
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame, rig: &Rig, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler) {
         let mut rebind = false;
         for (slot, pic) in frame.pictures.iter().enumerate().take(2) {
-            let (y, uv) = &mut self.slots[slot];
+            let bytes = if pic.deep { 2 } else { 1 };
+            let (y, uv) = if pic.deep { &mut self.deep[slot] } else { &mut self.slots[slot] };
             if y.texture.width() != pic.width || y.texture.height() != pic.height {
-                *y = plane(device, pic.width, pic.height, wgpu::TextureFormat::R8Unorm);
-                *uv = plane(device, pic.width / 2, pic.height / 2, wgpu::TextureFormat::Rg8Unorm);
+                (*y, *uv) = if pic.deep {
+                    deep_planes(device, pic.width, pic.height)
+                } else {
+                    (plane(device, pic.width, pic.height, wgpu::TextureFormat::R8Unorm), plane(device, pic.width / 2, pic.height / 2, wgpu::TextureFormat::Rg8Unorm))
+                };
                 rebind = true;
             }
-            write(queue, &y.texture, pic.y(), pic.width, pic.height, 1);
-            write(queue, &uv.texture, pic.uv(), pic.width / 2, pic.height / 2, 2);
+            write(queue, &y.texture, pic.y(), pic.width, pic.height, bytes);
+            write(queue, &uv.texture, pic.uv(), pic.width / 2, pic.height / 2, 2 * bytes);
         }
         if rebind {
-            self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.masks);
+            self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.deep, &self.masks);
         }
         for (i, lens) in rig.lenses.iter().enumerate().take(2) {
             let track = rig.tracks[lens.input];
@@ -554,7 +577,8 @@ impl Layer {
             let a = &lens.calib_to_picture;
             let u = &mut self.lens_u[i];
             u.a0 = [(s * a.a[0][0] / w) as f32, (s * a.a[0][1] / w) as f32, ((s * a.t[0] + off_x) / w) as f32, lens.mirror as u8 as f32];
-            u.a1 = [(s * a.a[1][0] / h) as f32, (s * a.a[1][1] / h) as f32, (s * a.t[1] / h) as f32, slot as f32];
+            // The slot, plus 2 for its 10-bit planes.
+            u.a1 = [(s * a.a[1][0] / h) as f32, (s * a.a[1][1] / h) as f32, (s * a.t[1] / h) as f32, (slot + 2 * pic.deep as usize) as f32];
         }
     }
 }
@@ -610,6 +634,11 @@ fn plane(device: &wgpu::Device, w: u32, h: u32, format: wgpu::TextureFormat) -> 
     });
     let view = texture.create_view(&Default::default());
     Plane { texture, view }
+}
+
+/// A 10-bit picture's Y and UV planes, `w` × `h`.
+fn deep_planes(device: &wgpu::Device, w: u32, h: u32) -> (Plane, Plane) {
+    (plane(device, w, h, wgpu::TextureFormat::R16Uint), plane(device, (w / 2).max(1), (h / 2).max(1), wgpu::TextureFormat::Rg16Uint))
 }
 
 fn write(queue: &wgpu::Queue, texture: &wgpu::Texture, data: &[u8], w: u32, h: u32, bpp: u32) {
@@ -685,6 +714,7 @@ fn bind(
     uniforms: &wgpu::Buffer,
     sampler: &wgpu::Sampler,
     slots: &[(Plane, Plane); 2],
+    deep: &[(Plane, Plane); 2],
     masks: &[Plane; 2],
 ) -> wgpu::BindGroup {
     fn tex(binding: u32, p: &Plane) -> wgpu::BindGroupEntry<'_> {
@@ -702,6 +732,10 @@ fn bind(
             tex(5, &slots[1].1),
             tex(6, &masks[0]),
             tex(7, &masks[1]),
+            tex(8, &deep[0].0),
+            tex(9, &deep[0].1),
+            tex(10, &deep[1].0),
+            tex(11, &deep[1].1),
         ],
     })
 }
