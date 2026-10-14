@@ -37,6 +37,35 @@ pub struct Picture {
     pub data: Vec<u8>,
 }
 
+/// Picture buffers given back by pictures done with, for the decode threads
+/// to read the next frames into, rather than a fresh one each frame (two
+/// 3840² lenses are 44 MB at 8 bits, 88 at 10), whose pages the kernel
+/// zeroes first. A full-res GPU export of 10 s of 0037 took 12.9 s instead
+/// of 13.25 at 8 bits, 18.6 instead of 18.9 at 10.
+static SPARE: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// At most this many bytes kept spare: they stay held once playback or an
+/// export stops (five 3840² lenses at 10 bits).
+const SPARE_BYTES: usize = 256 << 20;
+
+/// A buffer of `len` bytes, a spare if one fits. Its contents are whatever
+/// was there: it's read into whole.
+fn buffer(len: usize) -> Vec<u8> {
+    let mut spare = SPARE.lock().unwrap();
+    match spare.iter().position(|b| b.len() == len) {
+        Some(i) => spare.swap_remove(i),
+        None => vec![0; len],
+    }
+}
+
+impl Drop for Picture {
+    fn drop(&mut self) {
+        let mut spare = SPARE.lock().unwrap();
+        if spare.iter().map(Vec::len).sum::<usize>() + self.data.len() <= SPARE_BYTES {
+            spare.push(std::mem::take(&mut self.data));
+        }
+    }
+}
+
 impl Picture {
     /// Bytes for a picture of `w` × `h`.
     pub fn bytes(w: u32, h: u32, deep: bool) -> usize {
@@ -171,7 +200,7 @@ fn pump(mut outs: Vec<std::process::ChildStdout>, sizes: Vec<(u32, u32, bool)>, 
     for n in 0.. {
         let mut pictures = Vec::with_capacity(sizes.len());
         for (&(w, h, deep), out) in sizes.iter().zip(outs.iter_mut()) {
-            let mut data = vec![0; Picture::bytes(w, h, deep)];
+            let mut data = buffer(Picture::bytes(w, h, deep));
             if out.read_exact(&mut data).is_err() {
                 return;
             }
