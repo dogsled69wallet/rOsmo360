@@ -188,6 +188,8 @@ pub enum Drag {
     Volume { key: usize },
     /// Dragging cut `cut`'s sound point `key`.
     Sound { cut: usize, key: usize },
+    /// Dragging cut `cut`'s effect keyframe `key` to another time.
+    Effect { cut: usize, key: usize },
 }
 
 #[derive(Default)]
@@ -260,14 +262,14 @@ impl Timeline {
         }
     }
 
-    /// The effect keyframe mark under `p` (they sit along a cut's bottom):
-    /// (cut, clip time).
-    fn effect_at(&self, p: Point, b: Rectangle) -> Option<(usize, f64)> {
+    /// The effect keyframe mark under `p` (they sit in a row under the
+    /// cuts): (cut, keyframe, clip time).
+    fn effect_at(&self, p: Point, b: Rectangle) -> Option<(usize, usize, f64)> {
         if !(EFFECTS_TOP..KEYS_TOP).contains(&p.y) {
             return None;
         }
         self.blocks.iter().enumerate().rev().find_map(|(i, c)| {
-            c.effects.iter().find(|&&t| t >= c.start && t <= c.start + c.len && (self.x(c.from + t - c.start, b) - p.x).abs() <= PICK).map(|&t| (i, t))
+            c.effects.iter().enumerate().find(|&(_, &t)| t >= c.start && t <= c.start + c.len && (self.x(c.from + t - c.start, b) - p.x).abs() <= PICK).map(|(k, &t)| (i, k, t))
         })
     }
 
@@ -501,6 +503,9 @@ enum OverlayDrag {
     Move { item: usize, x0: f32, at: f64, per_px: f64 },
     /// An edge, at own time `from` when pressed.
     Trim { item: usize, start: bool, x0: f32, from: f64, per_px: f64 },
+    /// A keyframe mark: item `item`'s effect keyframe `key` (`effects`) or
+    /// motion keyframe, to another time.
+    Key { item: usize, effects: bool, key: usize },
 }
 
 impl OverlayLane {
@@ -534,15 +539,22 @@ impl OverlayLane {
         if self.blocks().is_empty() { OVERLAY } else { OVERLAY + EFFECTS + KEYS }
     }
 
-    /// The keyframe mark under `p` in its row: its edit time.
-    fn key_at(&self, p: Point, b: Rectangle) -> Option<f64> {
+    /// The keyframe mark under `p` in its row: the item, whether it's in
+    /// the effects row, the keyframe and its edit time.
+    fn key_at(&self, p: Point, b: Rectangle) -> Option<(usize, bool, usize, f64)> {
         let effects = (OVERLAY..OVERLAY + EFFECTS).contains(&p.y);
         if !effects && !(OVERLAY + EFFECTS..OVERLAY + EFFECTS + KEYS).contains(&p.y) {
             return None;
         }
-        self.blocks().iter().find_map(|o| {
+        self.blocks().iter().enumerate().find_map(|(item, o)| {
             let times: Vec<f64> = if effects { o.effects.clone() } else { o.motion.iter().map(|k| k.0).collect() };
-            times.into_iter().filter(|&t| t >= o.start && t <= o.start + o.len).map(|t| o.from + t - o.start).find(|&t| (self.0.x(t, b) - p.x).abs() <= PICK)
+            times
+                .into_iter()
+                .enumerate()
+                .filter(|&(_, t)| t >= o.start && t <= o.start + o.len)
+                .map(|(key, t)| (key, o.from + t - o.start))
+                .find(|&(_, t)| (self.0.x(t, b) - p.x).abs() <= PICK)
+                .map(|(key, t)| (item, effects, key, t))
         })
     }
 }
@@ -577,7 +589,9 @@ impl canvas::Program<Message> for OverlayLane {
             }
             Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let p = cursor.position_in(bounds)?;
-                if let Some(at) = self.key_at(p, bounds) {
+                if let Some((item, effects, key, at)) = self.key_at(p, bounds) {
+                    // A jump there, and a drag retimes it.
+                    *drag = OverlayDrag::Key { item, effects, key };
                     return Some(canvas::Action::publish(Message::OverlayJump(at)).and_capture());
                 }
                 // Elsewhere in the keyframe rows: seek there.
@@ -601,6 +615,11 @@ impl canvas::Program<Message> for OverlayLane {
                     OverlayDrag::None => return None,
                     OverlayDrag::Move { item, x0, at, per_px } => Message::OverlayMove((self.1, *item), *at + (x - *x0) as f64 * *per_px),
                     OverlayDrag::Trim { item, start, x0, from, per_px } => Message::OverlayTrim((self.1, *item), *start, *from + (x - *x0) as f64 * *per_px),
+                    OverlayDrag::Key { item, effects, key } => {
+                        let o = &self.blocks()[*item];
+                        let at = self.0.t(x, bounds).clamp(o.from, o.from + o.len);
+                        Message::OverlayKeyMove((self.1, *item), *effects, *key, o.start + at - o.from)
+                    }
                 };
                 Some(canvas::Action::publish(message).and_capture())
             }
@@ -665,7 +684,7 @@ impl canvas::Program<Message> for OverlayLane {
             }
         }
         if !self.blocks().is_empty() {
-            draw_rows(&mut frame, theme, bounds, OVERLAY, "Motion");
+            draw_rows(&mut frame, theme, t, bounds, OVERLAY, "Motion");
             let inside = |o: &OverlayBlock, k: f64| k >= o.start && k <= o.start + o.len;
             for o in self.blocks() {
                 for &k in o.effects.iter().filter(|&&k| inside(o, k)) {
@@ -689,11 +708,12 @@ impl canvas::Program<Message> for OverlayLane {
     fn mouse_interaction(&self, drag: &OverlayDrag, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
         match drag {
             OverlayDrag::Trim { .. } => mouse::Interaction::ResizingHorizontally,
-            OverlayDrag::Move { .. } => mouse::Interaction::Grabbing,
+            OverlayDrag::Move { .. } | OverlayDrag::Key { .. } => mouse::Interaction::Grabbing,
             OverlayDrag::None => {
                 let Some(p) = cursor.position_in(bounds) else { return mouse::Interaction::default() };
                 if p.y >= OVERLAY {
-                    return mouse::Interaction::Pointer;
+                    // A mark can be dragged; elsewhere in the rows a click seeks.
+                    return if self.key_at(p, bounds).is_some() { mouse::Interaction::Grab } else { mouse::Interaction::Pointer };
                 }
                 match self.item_at(p.x, bounds) {
                     Some(i) if self.edge_at(i, p.x, bounds).is_some() => mouse::Interaction::ResizingHorizontally,
@@ -791,13 +811,16 @@ fn draw_line(frame: &mut Frame, b: Rectangle, lane: Lane, colour: iced::Color, e
 
 /// The two keyframe rows under a track from `top`: faint bands with their
 /// names at the left, effects above, `keys` (view or motion) below.
-fn draw_rows(frame: &mut Frame, theme: &Theme, b: Rectangle, top: f32, keys: &str) {
+/// The keyframe rows' bands under a track, over the edit's length (`t`)
+/// like the lanes and the seek bar, not the widget's whole width.
+fn draw_rows(frame: &mut Frame, theme: &Theme, t: &Timeline, b: Rectangle, top: f32, keys: &str) {
     let palette = theme.extended_palette();
+    let (l, r) = (t.x(0.0, b).max(0.0), t.x(t.duration, b).min(b.width));
     for (y, h, name) in [(top, EFFECTS, "Effects"), (top + EFFECTS, KEYS, keys)] {
-        frame.fill(&Path::rectangle(Point::new(0.0, y + 1.0), Size::new(b.width, h - 2.0)), palette.background.weak.color.scale_alpha(0.25));
+        frame.fill(&Path::rectangle(Point::new(l, y + 1.0), Size::new((r - l).max(0.0), h - 2.0)), palette.background.weak.color.scale_alpha(0.25));
         frame.fill_text(Text {
             content: name.to_owned(),
-            position: Point::new(PICK + 12.0, y + h / 2.0),
+            position: Point::new(l.max(PICK) + 12.0, y + h / 2.0),
             color: palette.background.base.text.scale_alpha(0.35),
             size: 10.0.into(),
             align_y: Vertical::Center,
@@ -884,7 +907,9 @@ impl canvas::Program<Message> for Marks {
                     let start = if p.x >= l && p.x <= r { self.start } else { self.start + (p.x - (l + r) / 2.0) as f64 * per_px };
                     *drag = Drag::Scroll { x0: p.x, start };
                     Message::TimelinePan(start)
-                } else if let Some((cut, t)) = self.effect_at(p, bounds) {
+                } else if let Some((cut, key, t)) = self.effect_at(p, bounds) {
+                    // A jump there, and a drag retimes it.
+                    *drag = Drag::Effect { cut, key };
                     Message::Effect(super::effects::EffectMsg::Jump(cut, t))
                 } else if p.y < CUTS && let Some((cut, key)) = self.sound_at(p, bounds) {
                     *drag = Drag::Sound { cut, key };
@@ -953,6 +978,11 @@ impl canvas::Program<Message> for Marks {
                         let edit_t = self.t(x, bounds).clamp(c.from, c.from + c.len);
                         Message::KeyMove(*cut, *key, c.start + edit_t - c.from)
                     }
+                    Drag::Effect { cut, key } => {
+                        let c = &self.blocks[*cut];
+                        let edit_t = self.t(x, bounds).clamp(c.from, c.from + c.len);
+                        Message::Effect(super::effects::EffectMsg::KeyMove(*cut, *key, c.start + edit_t - c.from))
+                    }
                     Drag::Trim { cut, start, x0, from, per_px } => Message::Trim(*cut, *start, *from + (x - *x0) as f64 * *per_px),
                     Drag::Move { x0, moved, to, .. } => {
                         *moved |= (x - *x0).abs() > DRAG_FROM;
@@ -986,7 +1016,7 @@ impl canvas::Program<Message> for Marks {
                 Drag::None => None,
                 Drag::Move { cut, moved: true, to, .. } => Some(canvas::Action::publish(Message::MoveCut(cut, to)).and_capture()),
                 Drag::Move { .. } | Drag::Scroll { .. } => Some(canvas::Action::request_redraw().and_capture()),
-                Drag::Playhead | Drag::Key { .. } | Drag::Trim { .. } | Drag::MusicMove { .. } | Drag::MusicTrim { .. } | Drag::Volume { .. } | Drag::Sound { .. } | Drag::Crossfade { .. } => {
+                Drag::Playhead | Drag::Key { .. } | Drag::Effect { .. } | Drag::Trim { .. } | Drag::MusicMove { .. } | Drag::MusicTrim { .. } | Drag::Volume { .. } | Drag::Sound { .. } | Drag::Crossfade { .. } => {
                     Some(canvas::Action::publish(Message::ScrubDone).and_capture())
                 }
             },
@@ -998,7 +1028,7 @@ impl canvas::Program<Message> for Marks {
         let drag = &state.drag;
         let palette = theme.extended_palette();
         let mut frame = Frame::new(renderer, bounds.size());
-        draw_rows(&mut frame, theme, bounds, EFFECTS_TOP, "View");
+        draw_rows(&mut frame, theme, self, bounds, EFFECTS_TOP, "View");
         for (i, c) in self.blocks.iter().enumerate() {
             let (l, r) = self.block_x(c, bounds);
             let block = Path::rounded_rectangle(Point::new(l, 0.0), Size::new((r - l).max(1.0), CUTS), 4.0.into());
@@ -1117,8 +1147,9 @@ impl canvas::Program<Message> for Marks {
                     };
                 }
                 if p.y >= CUTS {
+                    // Marks in either row drag to another time.
                     let on = if p.y < KEYS_TOP { self.effect_at(p, bounds).is_some() } else { p.y < SEEK_TOP && self.key_at(p.x, bounds).is_some() };
-                    return if on && p.y >= KEYS_TOP { mouse::Interaction::Grab } else { mouse::Interaction::Pointer };
+                    return if on { mouse::Interaction::Grab } else { mouse::Interaction::Pointer };
                 }
                 if self.sound_at(p, bounds).is_some() {
                     return mouse::Interaction::Grab;

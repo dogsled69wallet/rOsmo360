@@ -51,6 +51,8 @@ struct Uniforms {
     // height, .z 1 if it came as 10-bit, .w HDR (1 HLG, 2 PQ); then its crop (view.rs `Crop`): centre x, y, half height, roll.
     flat: vec4f,
     crop: vec4f,
+    // .x 1 to dither the last rounding to 8 bits, .y the frame's number.
+    dither: vec4f,
 }
 
 const BINS: u32 = 32u;
@@ -389,11 +391,32 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 }
 
 // The colour effects, then light as the surface wants it.
+// Two uniform numbers in 0..1 from a pixel and a frame (Jarzynski and
+// Olano's pcg3d hash).
+fn noise(p: vec3u) -> vec2f {
+    var v = p * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> vec3u(16u);
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return vec2f(v.xy) / 4294967296.0;
+}
+
 fn finish(picture: vec3f, pos: vec4f) -> vec4f {
     var rgb = picture;
     if u.grade[2].z > 0.5 {
         let p = pos.xy - u.misc.zw;
         rgb = grade(rgb, vec2f(p.x / u.screen.x * 2.0 - 1.0, p.y / u.screen.y * 2.0 - 1.0), u.screen.x / u.screen.y);
+    }
+    if u.dither.x > 0.5 {
+        // Triangular noise of ±1 level, the same on each channel (grain in
+        // brightness, not colour speckle), new each frame: the 8-bit target
+        // rounds a smooth sky into steps without it.
+        let n = noise(vec3u(vec2u(pos.xy), u32(u.dither.y)));
+        rgb += vec3f((n.x + n.y - 1.0) / 255.0);
     }
     if u.misc.y > 0.5 {
         // The surface will sRGB-encode; hand it linear light.

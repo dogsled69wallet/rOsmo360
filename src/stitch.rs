@@ -13,7 +13,11 @@ use telemetry_parser::rig::geometry::{self, LensModel, MaskPolarity, Quat};
 pub struct Frame {
     pub width: usize,
     pub height: usize,
+    /// RGB, 8 bits a sample; or, `deep`, 16 (little-endian): a 10-bit
+    /// export's frames from the GPU, through crossfades and overlays to the
+    /// encoder.
     pub rgb: Vec<u8>,
+    pub deep: bool,
 }
 
 #[derive(Clone)]
@@ -217,7 +221,7 @@ pub fn render(
             }
         }
     });
-    Frame { width: out_w, height: out_h, rgb }
+    Frame { width: out_w, height: out_h, rgb, deep: false }
 }
 
 /// Image circle and include polygons are unioned, exclude polygons subtracted;
@@ -336,7 +340,7 @@ pub fn flat(frame: &Frame, (w, h): (usize, usize), camera: &crate::view::Camera)
             }
         }
     });
-    Frame { width: w, height: h, rgb }
+    Frame { width: w, height: h, rgb, deep: false }
 }
 
 fn sample(f: &Frame, u: f64, v: f64) -> [f64; 3] {

@@ -177,9 +177,9 @@ enum Cmd {
         /// project's or clip's name for --clips]
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// mp4: H.264 and AAC, plays anywhere. resolve: DNxHR HQ and PCM
-        /// in MOV, which DaVinci Resolve's free Linux version can read
-        /// (about 27 MB a second at 1080p).
+        /// mp4: H.264 and AAC, plays anywhere. resolve: 10-bit DNxHR HQX and
+        /// PCM in MOV, which DaVinci Resolve's free Linux version can read
+        /// (about 28 MB a second at 1080p).
         #[arg(long, value_enum, default_value_t = ffmpeg::Format::Mp4)]
         format: ffmpeg::Format,
         /// Write each cut to its own file for another editor, named after
@@ -862,7 +862,8 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
     let mut gpu = if out.cpu || opts.only.is_some() {
         None
     } else {
-        match player::render::Gpu::new() {
+        // The Resolve format is 10-bit, so 16-bit frames from the GPU.
+        match player::render::Gpu::new(out.format == ffmpeg::Format::Resolve) {
             Ok(gpu) => {
                 eprintln!("stitching on {}", gpu.name);
                 Some(gpu)
@@ -930,7 +931,7 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
         let length: f64 = cuts.clone().map(|n| (plan[n].2 - if n > cuts.start { overlap[n] } else { 0 }) as f64 / fps).sum();
         let mix = ffmpeg::Mix { sound_db: project.sound.volume, music: &project.music, length, fades: project.fades };
         let mix = matches!(out.target, Target::One(_)).then_some(&mix);
-        let mut encoder = ffmpeg::Encoder::new(&path, out.size, fps, &sound, mix, out.format)?;
+        let mut encoder = ffmpeg::Encoder::new(&path, out.size, fps, &sound, mix, out.format, out.format == ffmpeg::Format::Resolve && gpu.is_some())?;
         // Overlays over the whole edit only; a file per cut has none.
         let lanes = if matches!(out.target, Target::One(_)) { project.overlays.iter().chain(&project.text).collect() } else { Vec::new() };
         let mut burn = overlay::Burn::new(&mut encoder, lanes, out.size, fps, project.fades, project.duration())?;
@@ -1087,7 +1088,7 @@ fn run() -> Result<()> {
             let p = Pipeline::new(&input, &opts, stab::Mode::Off)?;
             let start = p.snap(start);
             let total = duration.map(|d| (d * p.fps).round() as usize);
-            let mut encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &[ffmpeg::Sound { input: &input, start, duration, volume: &[], crossfade: 0.0 }], None, ffmpeg::Format::Mp4)?;
+            let mut encoder = ffmpeg::Encoder::new(&output, (width, width / 2), p.fps, &[ffmpeg::Sound { input: &input, start, duration, volume: &[], crossfade: 0.0 }], None, ffmpeg::Format::Mp4, false)?;
             let began = Instant::now();
             let mut tick = |n: usize| {
                 if n.is_multiple_of(10) {
@@ -1258,7 +1259,7 @@ fn preview_project(project: &project::Project, opts: &StitchOpts, every: Option<
     let tiles = shots
         .par_iter()
         .map(|shot| {
-            let Some((n, i, t)) = *shot else { return Ok(stitch::Frame { width: size.0, height: size.1, rgb: vec![0; size.0 * size.1 * 3] }) };
+            let Some((n, i, t)) = *shot else { return Ok(stitch::Frame { width: size.0, height: size.1, rgb: vec![0; size.0 * size.1 * 3], deep: false }) };
             let p = &pipelines[i];
             let mut f = p.render(&p.stills(t)?, t, &mut Carry::default(), &Shot::View { camera: Box::new(project::camera_at(&project.cuts, n, t, &|f, t| p.aim(f, t))), size });
             let cut = &project.cuts[n];

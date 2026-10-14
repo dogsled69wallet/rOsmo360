@@ -4,67 +4,15 @@
 use super::{App, Message, tip};
 use iced::widget::{button, column, container, pick_list, row, rule, scrollable, text, toggler, tooltip};
 use iced::{Alignment, Element, Length, Theme};
-use std::fmt;
 
 const WIDTH: f32 = 300.0;
 
-/// The colour theme chosen: the desktop's (following its light or dark
-/// mode, or held to one), or one of iced's own by name.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ThemeChoice {
-    System,
-    SystemLight,
-    SystemDark,
-    Named(String),
-}
-
-impl ThemeChoice {
-    /// Every choice, the desktop's first.
-    pub fn all() -> Vec<ThemeChoice> {
-        [ThemeChoice::System, ThemeChoice::SystemLight, ThemeChoice::SystemDark].into_iter().chain(Theme::ALL.iter().map(|t| ThemeChoice::Named(t.to_string()))).collect()
-    }
-
-    /// Its name in the settings file.
-    pub fn key(&self) -> String {
-        match self {
-            ThemeChoice::System => "system".to_owned(),
-            ThemeChoice::SystemLight => "system-light".to_owned(),
-            ThemeChoice::SystemDark => "system-dark".to_owned(),
-            ThemeChoice::Named(name) => name.clone(),
-        }
-    }
-
-    /// The choice the settings file names; an unknown name (a theme a
-    /// later iced dropped) is the desktop's.
-    pub fn from_key(key: &str) -> ThemeChoice {
-        match key {
-            "system-light" => ThemeChoice::SystemLight,
-            "system-dark" => ThemeChoice::SystemDark,
-            name if Theme::ALL.iter().any(|t| t.to_string() == name) => ThemeChoice::Named(name.to_owned()),
-            _ => ThemeChoice::System,
-        }
-    }
-
-    /// The theme to draw with.
-    pub fn resolve(&self) -> Theme {
-        match self {
-            ThemeChoice::System => super::system_theme(None),
-            ThemeChoice::SystemLight => super::system_theme(Some(false)),
-            ThemeChoice::SystemDark => super::system_theme(Some(true)),
-            ThemeChoice::Named(name) => Theme::ALL.iter().find(|t| t.to_string() == *name).cloned().unwrap_or_else(|| super::system_theme(None)),
-        }
-    }
-}
-
-impl fmt::Display for ThemeChoice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ThemeChoice::System => f.write_str("System"),
-            ThemeChoice::SystemLight => f.write_str("System light"),
-            ThemeChoice::SystemDark => f.write_str("System dark"),
-            ThemeChoice::Named(name) => f.write_str(name),
-        }
-    }
+/// The theme the settings file names, as iced names it; Kanagawa Dragon
+/// (the user's choice, 2026-10-14) for none or one iced no longer has.
+/// The desktop's own theme was followed until then; dropped as the user
+/// liked a fixed one better, and its reading crashed the Mac at times.
+pub fn theme_named(name: &str) -> Theme {
+    Theme::ALL.iter().find(|t| t.to_string() == name).cloned().unwrap_or(Theme::KanagawaDragon)
 }
 
 impl App {
@@ -79,8 +27,8 @@ impl App {
             row![text("Settings").size(18).width(Length::Fill), close].align_y(Alignment::Center),
             text("Look").size(15),
             column![
-                pick_list(ThemeChoice::all(), Some(self.theme_choice.clone()), Message::Theme).width(Length::Fill),
-                note("System follows the desktop's light or dark mode and accent colour; System light and System dark keep its colours but hold to one."),
+                pick_list(Theme::ALL, Some(self.theme.clone()), Message::Theme).width(Length::Fill),
+                note("Kanagawa Dragon unless you choose another."),
             ]
             .spacing(6),
             rule::horizontal(1),
@@ -107,13 +55,15 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::ThemeChoice;
+    use super::theme_named;
+    use iced::Theme;
 
     #[test]
     fn every_theme_is_read_back_as_saved() {
-        for choice in ThemeChoice::all() {
-            assert_eq!(ThemeChoice::from_key(&choice.key()), choice);
+        for theme in Theme::ALL {
+            assert_eq!(&theme_named(&theme.to_string()), theme);
         }
-        assert_eq!(ThemeChoice::from_key("no such theme"), ThemeChoice::System);
+        // What the desktop-following choice was saved as.
+        assert_eq!(theme_named("system"), Theme::KanagawaDragon);
     }
 }

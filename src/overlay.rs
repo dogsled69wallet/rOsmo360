@@ -156,6 +156,15 @@ pub struct MotionKey {
     pub ease: Ease,
 }
 
+impl crate::view::Timed for MotionKey {
+    fn time(&self) -> f64 {
+        self.t
+    }
+    fn set_time(&mut self, t: f64) {
+        self.t = t;
+    }
+}
+
 fn is_smooth(e: &Ease) -> bool {
     *e == Ease::Smooth
 }
@@ -316,7 +325,10 @@ pub fn composite(frame: &mut Frame, picture: &Picture, quad: &Quad, grade: &Grad
     let neutral = shade.is_neutral();
     let aspect = quad.half[0] / quad.half[1].max(1e-9);
     let (pw, ph) = (picture.width as f64, picture.height as f64);
-    frame.rgb.par_chunks_mut(w * 3).enumerate().skip(y0).take(y1 - y0).for_each(|(y, row)| {
+    // A 16-bit frame (a 10-bit export) is drawn on at its depth.
+    let deep = frame.deep;
+    let bytes = if deep { 2 } else { 1 };
+    frame.rgb.par_chunks_mut(w * 3 * bytes).enumerate().skip(y0).take(y1 - y0).for_each(|(y, row)| {
         for x in x0..x1 {
             let [u, v] = quad.to_item(x as f64 + 0.5, y as f64 + 0.5);
             if u.abs() > 1.0 || v.abs() > 1.0 {
@@ -330,10 +342,16 @@ pub fn composite(frame: &mut Frame, picture: &Picture, quad: &Quad, grade: &Grad
             // Graded as a picture of its own: straight colour.
             let straight = [p[0], p[1], p[2]].map(|c| c / p[3].max(1e-9));
             let c = if neutral { straight } else { shade.apply(straight, [u, v], aspect) };
-            let px = &mut row[x * 3..x * 3 + 3];
+            let over = |k: usize, under: f64| c[k] * (1.0 - black) * a + under * (1.0 - a);
             for k in 0..3 {
-                let under = px[k] as f64 / 255.0;
-                px[k] = ((c[k] * (1.0 - black) * a + under * (1.0 - a)) * 255.0).round().clamp(0.0, 255.0) as u8;
+                if deep {
+                    let i = (x * 3 + k) * 2;
+                    let under = u16::from_le_bytes([row[i], row[i + 1]]) as f64 / 65535.0;
+                    row[i..i + 2].copy_from_slice(&((over(k, under) * 65535.0).round().clamp(0.0, 65535.0) as u16).to_le_bytes());
+                } else {
+                    let i = x * 3 + k;
+                    row[i] = (over(k, row[i] as f64 / 255.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+                }
             }
         }
     });
@@ -416,7 +434,7 @@ impl FrameSink for Burn<'_> {
         if !self.overlays.any_at(t) {
             return self.out.write(frame);
         }
-        let mut frame = Frame { width: frame.width, height: frame.height, rgb: frame.rgb.clone() };
+        let mut frame = Frame { width: frame.width, height: frame.height, rgb: frame.rgb.clone(), deep: frame.deep };
         self.overlays.draw(&mut frame, t);
         self.out.write(&frame)
     }
@@ -464,12 +482,17 @@ mod tests {
     fn composite_blends_by_alpha_and_opacity() {
         // A 2×2 half-transparent white picture over grey, filling the frame.
         let picture = Picture { width: 2, height: 2, rgba: [128u8, 128, 128, 128].repeat(4), natural: None };
-        let mut frame = Frame { width: 4, height: 4, rgb: vec![100; 48] };
+        let mut frame = Frame { width: 4, height: 4, rgb: vec![100; 48], deep: false };
         let quad = Quad::new(&Place::default(), &picture, (4, 4));
         composite(&mut frame, &picture, &quad, &Grade::default(), 0.0);
         assert!((frame.rgb[5 * 3] as i32 - 178).abs() <= 1, "{}", frame.rgb[5 * 3]);
-        let mut frame = Frame { width: 4, height: 4, rgb: vec![100; 48] };
+        let mut frame = Frame { width: 4, height: 4, rgb: vec![100; 48], deep: false };
         composite(&mut frame, &picture, &quad, &Grade { opacity: 0.0, ..Default::default() }, 0.0);
         assert_eq!(frame.rgb[5 * 3], 100);
+        // The same over a 16-bit frame (a 10-bit export).
+        let mut frame = Frame { width: 4, height: 4, rgb: (100u16 * 257).to_le_bytes().repeat(48), deep: true };
+        composite(&mut frame, &picture, &quad, &Grade::default(), 0.0);
+        let v = u16::from_le_bytes([frame.rgb[30], frame.rgb[31]]) as f64 / 257.0;
+        assert!((v - 178.0).abs() <= 1.0, "{v}");
     }
 }

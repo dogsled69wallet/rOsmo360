@@ -11,7 +11,6 @@ mod export_panel;
 mod handles;
 mod info;
 mod settings_panel;
-use settings_panel::ThemeChoice;
 mod meter;
 mod playback;
 pub mod render;
@@ -302,7 +301,7 @@ enum Message {
     /// Open or close the Settings panel.
     SettingsPanel,
     AutoKey(bool),
-    Theme(ThemeChoice),
+    Theme(Theme),
     TenBit(bool),
     /// A drag on the view let go.
     LookDone,
@@ -345,6 +344,9 @@ enum Message {
     OverlayTrim(crate::overlay::ItemRef, bool, f64),
     /// To an overlay keyframe's edit time.
     OverlayJump(f64),
+    /// An overlay's effect keyframe (`true`) or motion keyframe dragged to
+    /// another time in the item's own.
+    OverlayKeyMove(crate::overlay::ItemRef, bool, usize, f64),
     SelectMusic(usize),
     /// Music clip `i` dragged to start at this edit time; with Shift held
     /// (`true`) it may overlap a neighbour, crossfading.
@@ -435,8 +437,6 @@ enum Message {
     Mute,
     Volume(f32),
     Aspect(Aspect),
-    /// The OS theme changed; read it again.
-    ThemeChanged,
     /// The 360 view's size on screen, so a saved view keeps its shape.
     ViewSize(Size),
     Save(Saving),
@@ -450,6 +450,7 @@ struct App {
     opts: Options,
     /// Tracks that keyframes follow, read once each (`None`: unreadable).
     followed: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<Arc<crate::track::Track>>>>,
+    /// The colour theme (the Settings panel's; Kanagawa Dragon unless chosen).
     theme: Theme,
     logo: image::Handle,
     /// Every clip opened so far, ready for the cuts that use it.
@@ -558,8 +559,6 @@ struct App {
     auto_key_at: Option<(usize, f64)>,
     /// The Settings panel is open (at the left).
     settings_open: bool,
-    /// The theme chosen in the Settings panel (`theme` is it resolved).
-    theme_choice: ThemeChoice,
     /// 10-bit tracks decode at 10 bits (`source::deep`).
     ten_bit: bool,
     fullscreen: bool,
@@ -592,8 +591,7 @@ impl App {
         App {
             opts,
             followed: Default::default(),
-            theme: ThemeChoice::from_key(&saved.theme).resolve(),
-            theme_choice: ThemeChoice::from_key(&saved.theme),
+            theme: settings_panel::theme_named(&saved.theme),
             ten_bit: saved.ten_bit,
             logo: image::Handle::from_bytes(LOGO),
             library: Vec::new(),
@@ -678,7 +676,7 @@ impl App {
             export_graded: self.export_graded,
             export_format: self.export_format,
             auto_key: self.auto_key,
-            theme: self.theme_choice.key(),
+            theme: self.theme.to_string(),
             ten_bit: self.ten_bit,
         }
     }
@@ -1221,18 +1219,17 @@ impl App {
             keyboard::Event::KeyPressed { key, modifiers, .. } => Some(Message::Key(key, modifiers)),
             _ => None,
         });
-        let theme = Subscription::run(theme_changes);
         // The crossfade's partner too: paused, its frame came in only with
         // the next event.
         let busy = self.clip.iter().chain(self.partner.as_ref().map(|(_, c)| c)).any(|c| c.playback.busy());
         let close = window::close_requests().map(|_| Message::CloseRequested);
         if busy {
-            Subscription::batch([keys, theme, close, window::frames().map(|_| Message::Tick)])
+            Subscription::batch([keys, close, window::frames().map(|_| Message::Tick)])
         } else if self.loading.is_some() {
             // Only to redraw the loading bar as it fills.
-            Subscription::batch([keys, theme, close, window::frames().map(|_| Message::LoadingTick)])
+            Subscription::batch([keys, close, window::frames().map(|_| Message::LoadingTick)])
         } else {
-            Subscription::batch([keys, theme, close])
+            Subscription::batch([keys, close])
         }
     }
 
@@ -1730,6 +1727,25 @@ impl App {
                     self.goto(i, t, false);
                 }
             }
+            Message::OverlayKeyMove(r, effects, key, t) => {
+                self.follow = true;
+                self.begin_drag();
+                let gap = 1.0 / self.fps();
+                let Some(item) = self.edit.item_mut(r) else { return Task::none() };
+                let local = if effects {
+                    crate::view::retime(&mut item.effects, key, t, gap);
+                    item.effects.get(key).map(|k| k.t)
+                } else {
+                    crate::view::retime(&mut item.motion, key, t, gap);
+                    item.motion.get(key).map(|k| k.t)
+                };
+                // Follow the mark, so what it holds shows as it moves.
+                if let Some(at) = local.map(|t| item.at + t - item.start)
+                    && let Some((i, t)) = self.edit.locate(at)
+                {
+                    self.scrub_to(i, t);
+                }
+            }
             Message::AddMusic => {
                 let dir = self.project.as_ref().and_then(|p| p.parent().map(Path::to_owned));
                 return Task::perform(
@@ -2093,11 +2109,7 @@ impl App {
             }
             Message::ViewSize(size) => self.view_size = size,
             Message::Aspect(a) => self.aspect = a,
-            Message::ThemeChanged => self.theme = self.theme_choice.resolve(),
-            Message::Theme(choice) => {
-                self.theme = choice.resolve();
-                self.theme_choice = choice;
-            }
+            Message::Theme(theme) => self.theme = theme,
             Message::Save(what) => {
                 let Some(c) = &self.clip else { return Task::none() };
                 let media = &c.playback.media;
@@ -3384,144 +3396,6 @@ fn labelled_button<'a>(icon: &'static [u8], label: &'a str, on_press: Option<Mes
 const SPEAKER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z" fill="white"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/></svg>"#;
 const SPEAKER_MUTED: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z" fill="white"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></svg>"#;
 
-/// The OS's own colours (KDE colour scheme, GTK/portal, Windows, macOS), so
-/// the player looks like the rest of the desktop; iced's dark theme where
-/// they can't be read.
-///
-/// The desktop portal's light/dark choice and accent win over native-theme's
-/// own reading: in a Flatpak it can't see gsettings, kdeglobals or GTK's
-/// settings, and on desktops it has no reader for (Hyprland) it guesses from
-/// them, so it landed on light there. With no answer from the portal, a
-/// Flatpak goes dark, as the native build does. `dark` holds it to dark or
-/// light whatever the desktop says (the Settings panel's System dark/light).
-fn system_theme(dark: Option<bool>) -> Theme {
-    let sys = match native_theme::SystemTheme::from_system() {
-        Ok(sys) => sys,
-        Err(e) => {
-            eprintln!("using the default theme: {e}");
-            return Theme::Dark;
-        }
-    };
-    let (scheme, accent) = portal_appearance();
-    // On macOS native-theme reads both variants and always reports light as
-    // the mode, so ask for the appearance itself (read fresh each time, for
-    // live changes).
-    let os_dark = if cfg!(target_os = "macos") { native_theme::detect::detect_is_dark() } else { sys.mode.is_dark() };
-    let dark = dark.or(scheme).unwrap_or_else(|| std::env::var_os("FLATPAK_ID").is_some() || os_dark);
-    let mut resolved = if dark { sys.dark } else { sys.light };
-    if let Some([r, g, b]) = accent {
-        resolved.defaults.accent_color = native_theme_iced::Rgba::from_f32(r as f32, g as f32, b as f32, 1.0);
-    }
-    native_theme_iced::to_theme(&resolved, &sys.name)
-}
-
-/// The XDG desktop portal's `color-scheme` (dark or light; `None` for no
-/// preference) and `accent-color`, read over D-Bus, giving up after a second
-/// so a missing or slow portal doesn't hold up the window.
-#[cfg(target_os = "linux")]
-fn portal_appearance() -> (Option<bool>, Option<[f64; 3]>) {
-    use zbus::zvariant::{OwnedValue, Value};
-    fn read(key: &str) -> Option<OwnedValue> {
-        let connection = zbus::blocking::Connection::session().ok()?;
-        let reply = connection
-            .call_method(
-                Some("org.freedesktop.portal.Desktop"),
-                "/org/freedesktop/portal/desktop",
-                Some("org.freedesktop.portal.Settings"),
-                "ReadOne",
-                &("org.freedesktop.appearance", key),
-            )
-            .ok()?;
-        let value: OwnedValue = reply.body().deserialize().ok()?;
-        // Some portals wrap the value in a second variant.
-        match &*value {
-            Value::Value(inner) => inner.try_to_owned().ok(),
-            _ => Some(value),
-        }
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let scheme = read("color-scheme").and_then(|v| u32::try_from(v).ok()).and_then(|v| match v {
-            1 => Some(true),
-            2 => Some(false),
-            _ => None,
-        });
-        let accent = read("accent-color")
-            .and_then(|v| <(f64, f64, f64)>::try_from(v).ok())
-            .map(|(r, g, b)| [r, g, b])
-            .filter(|c| c.iter().all(|v| (0.0..=1.0).contains(v)));
-        let _ = tx.send((scheme, accent));
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or((None, None))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn portal_appearance() -> (Option<bool>, Option<[f64; 3]>) {
-    (None, None)
-}
-
-/// A message whenever the OS theme changes, from native-theme's watcher or
-/// the desktop portal's (native-theme watches nothing on some desktops, such
-/// as Hyprland, nor in a Flatpak). The watchers call back on threads of their
-/// own; a channel hands that to iced.
-fn theme_changes() -> impl iced::futures::Stream<Item = Message> {
-    use iced::futures::{SinkExt, StreamExt};
-    iced::stream::channel(1, async |mut output: iced::futures::channel::mpsc::Sender<Message>| {
-        let (tx, mut rx) = iced::futures::channel::mpsc::unbounded();
-        let portal = tx.clone();
-        watch_portal(move || {
-            let _ = portal.unbounded_send(());
-        });
-        // Not on macOS: native-theme's watcher there keeps a raw pointer to
-        // its thread's run loop, which can be gone by the time it's used, and
-        // the player sometimes died at start ("trace trap", a freed
-        // CoreFoundation object on a background thread). There the theme is
-        // read at start and when chosen; the Settings panel's System
-        // light/dark cover a change.
-        let _watch = (!cfg!(target_os = "macos")).then(|| {
-            native_theme::watch::on_theme_change(move |_| {
-                let _ = tx.unbounded_send(());
-            })
-            .inspect_err(|e| eprintln!("following theme changes through the desktop portal only: {e}"))
-        });
-        while rx.next().await.is_some() {
-            if output.send(Message::ThemeChanged).await.is_err() {
-                break;
-            }
-        }
-    })
-}
-
-/// Calls `changed` whenever the desktop portal's appearance settings change,
-/// on a thread of its own, for as long as the portal is there.
-#[cfg(target_os = "linux")]
-fn watch_portal(changed: impl Fn() + Send + 'static) {
-    std::thread::spawn(move || {
-        let watch = || -> zbus::Result<()> {
-            let connection = zbus::blocking::Connection::session()?;
-            let proxy = zbus::blocking::Proxy::new(
-                &connection,
-                "org.freedesktop.portal.Desktop",
-                "/org/freedesktop/portal/desktop",
-                "org.freedesktop.portal.Settings",
-            )?;
-            for signal in proxy.receive_signal("SettingChanged")? {
-                if let Ok((namespace, ..)) = signal.body().deserialize::<(String, String, zbus::zvariant::OwnedValue)>()
-                    && namespace == "org.freedesktop.appearance"
-                {
-                    changed();
-                }
-            }
-            Ok(())
-        };
-        if let Err(e) = watch() {
-            eprintln!("not watching the desktop portal: {e}");
-        }
-    });
-}
-
-#[cfg(not(target_os = "linux"))]
-fn watch_portal(_changed: impl Fn() + Send + 'static) {}
 
 fn labelled<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     row![text(label), widget.into()].spacing(6).align_y(Alignment::Center).into()

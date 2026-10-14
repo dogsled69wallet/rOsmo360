@@ -108,7 +108,7 @@ pub fn compose_rows(tiles: &[Frame], columns: usize, bands: &[Band]) -> Frame {
     let wave = bands.iter().any(|b| b.wave.is_some());
     let row = HEAD + th + if wave { WAVE } else { 0 };
     let (width, height) = (sheet.width, bands.len() * row + bands.len().saturating_sub(1) * GAP);
-    let mut out = Frame { width, height, rgb: vec![32; width * height * 3] };
+    let mut out = Frame { width, height, rgb: vec![32; width * height * 3], deep: false };
     for (r, band) in bands.iter().enumerate() {
         let y0 = r * (row + GAP);
         // The heading on its own dark strip, the tiles under it.
@@ -152,5 +152,5 @@ pub fn compose(tiles: &[Frame], columns: usize) -> Frame {
             rgb[to..to + tw * 3].copy_from_slice(&tile.rgb[y * tw * 3..(y + 1) * tw * 3]);
         }
     }
-    Frame { width, height, rgb }
+    Frame { width, height, rgb, deep: false }
 }

@@ -27,7 +27,7 @@ pub struct Settings {
     pub export_format: Format,
     /// Looking around while paused keys the view at the playhead.
     pub auto_key: bool,
-    /// The colour theme, as `ThemeChoice::key` names it.
+    /// The colour theme, by iced's name for it (`settings_panel::theme_named`).
     pub theme: String,
     /// Decode 10-bit tracks at 10 bits (`source::set_deep`).
     pub ten_bit: bool,
@@ -48,7 +48,7 @@ impl Default for Settings {
             export_graded: false,
             export_format: Format::Mp4,
             auto_key: false,
-            theme: "system".to_owned(),
+            theme: iced::Theme::KanagawaDragon.to_string(),
             ten_bit: false,
         }
     }

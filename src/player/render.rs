@@ -24,8 +24,12 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel, sync_channel};
 
-/// Display-encoded RGBA, as the shader writes it for a non-sRGB target.
-const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Display-encoded RGBA, as the shader writes it for a non-sRGB target; for
+/// a 10-bit export 16-bit floats (a core format, blending included; its 11
+/// bits of precision near white are half a 10-bit step).
+fn format(deep: bool) -> wgpu::TextureFormat {
+    if deep { wgpu::TextureFormat::Rgba16Float } else { wgpu::TextureFormat::Rgba8Unorm }
+}
 /// Frames in flight on the GPU: one renders while the other is read back.
 const IN_FLIGHT: usize = 2;
 
@@ -39,6 +43,10 @@ pub struct Gpu {
     /// word of its readback being mapped.
     pending: VecDeque<(usize, Receiver<Result<(), wgpu::BufferAsyncError>>)>,
     next: usize,
+    /// Frames submitted, numbering the dither noise so it changes each frame.
+    frames: u32,
+    /// Renders and hands back 16-bit frames (`stitch::Frame::deep`).
+    deep: bool,
     /// The adapter's name, for the log.
     pub name: String,
 }
@@ -55,7 +63,8 @@ struct Target {
 impl Gpu {
     /// A device of our own on the fastest GPU. A software rasteriser
     /// doesn't count: the CPU stitcher is quicker than that.
-    pub fn new() -> Result<Gpu> {
+    /// `deep`: 16-bit frames, for a 10-bit export.
+    pub fn new(deep: bool) -> Result<Gpu> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let options = wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() };
         let adapter = block_on(instance.request_adapter(&options)).context("no GPU adapter")?;
@@ -64,8 +73,8 @@ impl Gpu {
             bail!("only a software renderer ({})", info.name);
         }
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("export"), ..Default::default() }))?;
-        let stitcher = gpu::Pipeline::create(&device, FORMAT);
-        Ok(Gpu { device, queue, stitcher, size: (0, 0), targets: Vec::new(), pending: VecDeque::new(), next: 0, name: info.name })
+        let stitcher = gpu::Pipeline::create(&device, format(deep));
+        Ok(Gpu { device, queue, stitcher, size: (0, 0), targets: Vec::new(), pending: VecDeque::new(), next: 0, frames: 0, deep, name: info.name })
     }
 
     /// Starts rendering `shown` through `camera` at `size`; `finish` hands
@@ -80,6 +89,9 @@ impl Gpu {
         }
         let slot = self.next;
         self.next = (self.next + 1) % IN_FLIGHT;
+        // A 16-bit target keeps the precision itself.
+        self.stitcher.dither = (!self.deep).then_some(self.frames);
+        self.frames = self.frames.wrapping_add(1);
         let target = &self.targets[slot];
         self.stitcher.prepare_frame(&self.device, &self.queue, rig, shown, camera, views, [w as f32, h as f32], [0.0, 0.0]);
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -117,15 +129,29 @@ impl Gpu {
         };
         result.context("reading the frame back from the GPU")?;
         let data = target.readback.slice(..).get_mapped_range();
-        let mut rgb = vec![0; w * h * 3];
-        rgb.par_chunks_mut(w * 3).zip(data.par_chunks(target.row)).for_each(|(out, row)| {
-            for (o, px) in out.chunks_exact_mut(3).zip(row.chunks_exact(4)) {
-                o.copy_from_slice(&px[..3]);
-            }
-        });
+        let rgb = if self.deep {
+            let mut rgb = vec![0; w * h * 6];
+            rgb.par_chunks_mut(w * 6).zip(data.par_chunks(target.row)).for_each(|(out, row)| {
+                for (o, px) in out.chunks_exact_mut(6).zip(row.chunks_exact(8)) {
+                    for c in 0..3 {
+                        let v = half(u16::from_le_bytes([px[2 * c], px[2 * c + 1]]));
+                        o[2 * c..2 * c + 2].copy_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes());
+                    }
+                }
+            });
+            rgb
+        } else {
+            let mut rgb = vec![0; w * h * 3];
+            rgb.par_chunks_mut(w * 3).zip(data.par_chunks(target.row)).for_each(|(out, row)| {
+                for (o, px) in out.chunks_exact_mut(3).zip(row.chunks_exact(4)) {
+                    o.copy_from_slice(&px[..3]);
+                }
+            });
+            rgb
+        };
         drop(data);
         target.readback.unmap();
-        Ok(Some(stitch::Frame { width: w, height: h, rgb }))
+        Ok(Some(stitch::Frame { width: w, height: h, rgb, deep: self.deep }))
     }
 
     fn make_target(&self, w: usize, h: usize) -> Target {
@@ -135,13 +161,13 @@ impl Gpu {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
+            format: format(self.deep),
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
-        let row = (w * 4).div_ceil(align) * align;
+        let row = (w * if self.deep { 8 } else { 4 }).div_ceil(align) * align;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: (row * h) as u64,
@@ -265,6 +291,17 @@ pub fn encode(
     Ok(())
 }
 
+/// An IEEE half-precision float's value.
+fn half(bits: u16) -> f32 {
+    let (sign, exp, man) = ((bits >> 15) as u32, ((bits >> 10) & 0x1f) as u32, (bits & 0x3ff) as u32);
+    let magnitude = match exp {
+        0 => man as f32 / 1024.0 / 16384.0,
+        31 => f32::INFINITY,
+        _ => f32::from_bits(((exp + 112) << 23) | (man << 13)),
+    };
+    if sign == 1 { -magnitude } else { magnitude }
+}
+
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     iced::futures::executor::block_on(f)
 }
@@ -274,49 +311,61 @@ mod tests {
     use super::*;
     use crate::overlay::{self, Place, Quad};
 
+    /// `w` × `h` 10-bit pictures of one Y′ code a column (`y(x)`) and
+    /// these Cb, Cr codes, as P010.
+    fn p010(w: usize, h: usize, y: impl Fn(usize) -> u16, cb: u16, cr: u16) -> Frame {
+        let mut data = Vec::new();
+        for _ in 0..h {
+            for x in 0..w {
+                data.extend((y(x) << 6).to_le_bytes());
+            }
+        }
+        for _ in 0..w * h / 4 {
+            data.extend((cb << 6).to_le_bytes());
+            data.extend((cr << 6).to_le_bytes());
+        }
+        Frame { pts: 0.0, layout: source::Layout::PerTrack, pictures: vec![source::Picture { width: w as u32, height: h as u32, deep: true, data }] }
+    }
+
+    /// An ordinary video's `frame` drawn whole into a `w` × `h` target, as
+    /// an export draws it.
+    fn draw_flat(gpu: &mut Gpu, frame: Frame, hdr: crate::hdr::Hdr, (w, h): (usize, usize)) -> stitch::Frame {
+        let shown = Shown::new(frame, SeamFix::default());
+        let rig = Rig::flat(0, hdr);
+        let camera = crate::view::View::home(crate::view::Projection::Perspective).camera();
+        gpu.size = (0, 0);
+        gpu.targets = vec![gpu.make_target(w, h)];
+        gpu.stitcher.prepare_frame(&gpu.device, &gpu.queue, &rig, &shown, &camera, &[stitch::IDENTITY], [w as f32, h as f32], [0.0, 0.0]);
+        gpu.stitcher.prepare_overlays(&gpu.device, &gpu.queue, &[], [w as f32, h as f32], [0.0, 0.0], [w as f32, h as f32]);
+        let target = &gpu.targets[0];
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        gpu.stitcher.draw(&mut encoder, &target.view, &Rectangle { x: 0, y: 0, width: w as u32, height: h as u32 });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &target.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &target.readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(target.row as u32), rows_per_image: Some(h as u32) } },
+            wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let (tx, rx) = channel();
+        target.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        gpu.pending.push_back((0, rx));
+        gpu.size = (w, h);
+        gpu.finish().unwrap().unwrap()
+    }
+
     /// The shader brings a 10-bit HLG picture to SDR as `hdr::to_sdr` does.
     #[test]
     fn gpu_hdr_matches_the_cpu() {
         use crate::hdr::{self, Hdr};
-        let Ok(mut gpu) = Gpu::new() else { return };
+        let Ok(mut gpu) = Gpu::new(false) else { return };
         let (w, h) = (64, 32);
         // Y′CbCr as 10-bit limited-range codes: grey, sky blue, green, near
         // peak white.
-        for [y, cb, cr] in [[502.0, 512.0, 512.0], [600.0, 640.0, 440.0], [420.0, 420.0, 470.0], [900.0, 512.0, 512.0]] {
-            let le = |c: f64| ((c as u16) << 6).to_le_bytes();
-            let mut data = Vec::new();
-            for _ in 0..w * h {
-                data.extend(le(y));
-            }
-            for _ in 0..w * h / 4 {
-                data.extend(le(cb));
-                data.extend(le(cr));
-            }
-            let frame = Frame { pts: 0.0, layout: source::Layout::PerTrack, pictures: vec![source::Picture { width: w as u32, height: h as u32, deep: true, data }] };
-            let shown = Shown::new(frame, SeamFix::default());
-            let rig = Rig::flat(0, Hdr::Hlg);
-            let camera = crate::view::View::home(crate::view::Projection::Perspective).camera();
-            gpu.size = (0, 0);
-            gpu.targets = vec![gpu.make_target(w, h)];
-            gpu.stitcher.prepare_frame(&gpu.device, &gpu.queue, &rig, &shown, &camera, &[stitch::IDENTITY], [w as f32, h as f32], [0.0, 0.0]);
-            gpu.stitcher.prepare_overlays(&gpu.device, &gpu.queue, &[], [w as f32, h as f32], [0.0, 0.0], [w as f32, h as f32]);
-            let target = &gpu.targets[0];
-            let mut encoder = gpu.device.create_command_encoder(&Default::default());
-            gpu.stitcher.draw(&mut encoder, &target.view, &Rectangle { x: 0, y: 0, width: w as u32, height: h as u32 });
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo { texture: &target.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::TexelCopyBufferInfo { buffer: &target.readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(target.row as u32), rows_per_image: Some(h as u32) } },
-                wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
-            );
-            gpu.queue.submit([encoder.finish()]);
-            let (tx, rx) = channel();
-            target.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-            gpu.pending.push_back((0, rx));
-            gpu.size = (w, h);
-            let got = gpu.finish().unwrap().unwrap();
-            let ycc = [((y - 64.0) / 876.0) as f32, ((cb - 512.0) / 896.0) as f32, ((cr - 512.0) / 896.0) as f32];
+        for [y, cb, cr] in [[502, 512, 512], [600, 640, 440], [420, 420, 470], [900, 512, 512]] {
+            let got = draw_flat(&mut gpu, p010(w, h, |_| y, cb, cr), Hdr::Hlg, (w, h));
+            let ycc = [(y as f32 - 64.0) / 876.0, (cb as f32 - 512.0) / 896.0, (cr as f32 - 512.0) / 896.0];
             let want = hdr::to_sdr(hdr::bt2020_rgb(ycc), Hdr::Hlg).map(|v| (v * 255.0).round() as i32);
             let mid = ((h / 2) * w + w / 2) * 3;
             let px = [0, 1, 2].map(|c| got.rgb[mid + c] as i32);
@@ -325,10 +374,55 @@ mod tests {
         }
     }
 
+    /// Dithered, a 10-bit grey ramp finer than 8 bits holds its shape in the
+    /// 8-bit export: each column's average follows it rather than stepping.
+    #[test]
+    fn dither_keeps_a_smooth_ramp() {
+        let Ok(mut gpu) = Gpu::new(false) else { return };
+        let (w, h) = (256, 64);
+        // 20 codes across: steps of a quarter of an 8-bit level.
+        let code = |x: usize| 400 + (x * 20 / w) as u16;
+        let mut errors = Vec::new();
+        for dither in [None, Some(7)] {
+            gpu.stitcher.dither = dither;
+            let got = draw_flat(&mut gpu, p010(w, h, code, 512, 512), crate::hdr::Hdr::None, (w, h));
+            let mut squares = 0.0;
+            for x in 0..w {
+                let mean = (0..h).map(|y| got.rgb[(y * w + x) * 3 + 1] as f64).sum::<f64>() / h as f64;
+                let want = (code(x) as f64 - 64.0) / 876.0 * 255.0;
+                squares += (mean - want).powi(2);
+            }
+            errors.push((squares / w as f64).sqrt());
+        }
+        gpu.stitcher.dither = None;
+        eprintln!("RMS error of the column averages: {:.3} levels plain, {:.3} dithered", errors[0], errors[1]);
+        assert!(errors[0] > 0.2 && errors[1] < 0.12, "{errors:?}");
+    }
+
+    /// A 16-bit render (a 10-bit export) keeps a 10-bit ramp's quarter-level
+    /// steps, pixel by pixel, where 8 bits round them away.
+    #[test]
+    fn deep_render_keeps_ten_bits() {
+        let Ok(mut gpu) = Gpu::new(true) else { return };
+        let (w, h) = (256, 4);
+        let code = |x: usize| 400 + (x * 20 / w) as u16;
+        let got = draw_flat(&mut gpu, p010(w, h, code, 512, 512), crate::hdr::Hdr::None, (w, h));
+        assert!(got.deep);
+        let worst = (0..w)
+            .map(|x| {
+                let i = (2 * w + x) * 6 + 2;
+                let g = u16::from_le_bytes([got.rgb[i], got.rgb[i + 1]]) as f64 / 65535.0 * 255.0;
+                (g - (code(x) as f64 - 64.0) / 876.0 * 255.0).abs()
+            })
+            .fold(0.0, f64::max);
+        eprintln!("worst error {worst:.3} of an 8-bit level");
+        assert!(worst < 0.1, "{worst}");
+    }
+
     /// The player's overlay pass draws what `overlay::composite` does.
     #[test]
     fn gpu_overlays_match_the_cpu() {
-        let Ok(mut gpu) = Gpu::new() else { return };
+        let Ok(mut gpu) = Gpu::new(false) else { return };
         let (w, h) = (320, 180);
         // A mid-grey ordinary video frame (limited-range NV12).
         let mut data = vec![126u8; w * h];

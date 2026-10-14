@@ -64,7 +64,7 @@ impl App {
             column![
                 text("Format"),
                 format(Format::Mp4, "MP4", "H.264 and AAC: plays anywhere, small."),
-                format(Format::Resolve, "DaVinci Resolve", "DNxHR HQ with PCM sound in .mov, which Resolve's free Linux version reads. Large: about 27 MB a second at 1080p."),
+                format(Format::Resolve, "DaVinci Resolve", "10-bit DNxHR HQX with PCM sound in .mov, which Resolve's free Linux version reads, with room to grade. Large: about 28 MB a second at 1080p."),
             ]
             .spacing(6),
             column![text("Clips"), clips].spacing(6),

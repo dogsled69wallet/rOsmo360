@@ -92,6 +92,9 @@ struct Uniforms {
     flat: [f32; 4],
     /// Its crop (`view::Crop`): centre x, y, half height, roll.
     crop: [f32; 4],
+    /// 1 to dither the picture's last rounding to 8 bits, then the frame's
+    /// number for the noise (`Pipeline::dither`).
+    dither: [f32; 4],
 }
 
 /// Numbers rigs and frames so each is uploaded once however often it is drawn.
@@ -250,6 +253,12 @@ pub struct Pipeline {
     /// Kept between frames; the first `overlays` are drawn.
     overlay_slots: Vec<OverlaySlot>,
     overlays: usize,
+    /// Dither the picture into its 8-bit target, with noise for this frame
+    /// number: an export's. A smooth sky came out in steps of one level
+    /// once rounded to 8 bits, however finely it was decoded and graded.
+    /// The player's target is the screen's, sRGB-encoded by the GPU after
+    /// the shader, so it isn't dithered there.
+    pub dither: Option<u32>,
 }
 
 /// One picture's resources: uniforms, textures and what they hold.
@@ -380,7 +389,7 @@ impl Pipeline {
             Layer { uniforms, slots, deep, masks, bind_group, lens_u: [LensU::zeroed(); 2], rig_id: 0, shown_id: 0 }
         });
         let (overlay, overlay_layout) = overlay_pipeline(device, format);
-        Pipeline { pipeline, blend, layout, sampler, srgb: format.is_srgb(), layers, mix: None, overlay, overlay_layout, overlay_slots: Vec::new(), overlays: 0 }
+        Pipeline { pipeline, blend, layout, sampler, srgb: format.is_srgb(), layers, mix: None, overlay, overlay_layout, overlay_slots: Vec::new(), overlays: 0, dither: None }
     }
 
     /// Gets `overlays` ready to draw over the view (`size` pixels at
@@ -436,7 +445,7 @@ impl Pipeline {
     /// Gets layer `layer` ready (see `prepare_frame`).
     #[allow(clippy::too_many_arguments)]
     fn prepare_layer(&mut self, layer: usize, device: &wgpu::Device, queue: &wgpu::Queue, rig: &Rig, shown: &Shown, camera: &Camera, rig_from_view: &[M3], size: [f32; 2], origin: [f32; 2]) {
-        let srgb = self.srgb;
+        let (srgb, dither) = (self.srgb, self.dither);
         let (layout, sampler) = (&self.layout, &self.sampler);
         let l = &mut self.layers[layer];
         if l.rig_id != rig.id {
@@ -447,6 +456,7 @@ impl Pipeline {
             l.shown_id = shown.id;
         }
         let mut u = Uniforms::zeroed();
+        u.dither = dither.map_or([0.0; 4], |n| [1.0, (n % 65536) as f32, 0.0, 0.0]);
         u.user = rows(camera.user);
         // A negative mapping means equirect; see the shader's `screen_ray`.
         u.screen = [size[0], size[1], camera.zoom as f32, camera.planet.map_or(-1.0, |d| d as f32)];

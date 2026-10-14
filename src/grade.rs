@@ -164,6 +164,15 @@ pub struct EffectKey {
     pub ease: Ease,
 }
 
+impl crate::view::Timed for EffectKey {
+    fn time(&self) -> f64 {
+        self.t
+    }
+    fn set_time(&mut self, t: f64) {
+        self.t = t;
+    }
+}
+
 fn is_smooth(e: &Ease) -> bool {
     *e == Ease::Smooth
 }
@@ -183,6 +192,21 @@ pub fn grade_at(keys: &[EffectKey], t: f64) -> Grade {
 
 #[cfg(test)]
 mod tests {
+
+    /// A dragged effect keyframe stops a frame short of its neighbours, so
+    /// each keeps what it holds.
+    #[test]
+    fn effect_keys_retime_between_neighbours() {
+        let key = |t, exposure| EffectKey { t, grade: Grade { exposure, ..Default::default() }, ease: Ease::Smooth };
+        let mut keys = vec![key(1.0, 0.1), key(2.0, 0.2), key(3.0, 0.3)];
+        crate::view::retime(&mut keys, 1, 2.5, 0.1);
+        assert_eq!(keys[1].t, 2.5);
+        crate::view::retime(&mut keys, 1, 9.0, 0.1);
+        assert!((keys[1].t - 2.9).abs() < 1e-9 && keys[1].grade.exposure == 0.2);
+        crate::view::retime(&mut keys, 0, -5.0, 0.1);
+        assert_eq!(keys[0].t, -5.0);
+    }
+
     use super::*;
 
     #[test]

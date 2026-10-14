@@ -70,8 +70,14 @@ impl FrameSink for Dissolve<'_> {
             r.read_exact(&mut before).context("reading the crossfade's held frames")?;
             // Linear, by frame centres: the first frame already a little in.
             let a = (n as f32 + 0.5) / self.head as f32;
-            let rgb = before.iter().zip(&frame.rgb).map(|(&b, &c)| (b as f32 + (c as f32 - b as f32) * a).round() as u8).collect();
-            return self.out.write(&Frame { width: frame.width, height: frame.height, rgb });
+            let mix = |b: f32, c: f32| b + (c - b) * a;
+            let rgb = if frame.deep {
+                let sample = |s: &[u8]| u16::from_le_bytes([s[0], s[1]]) as f32;
+                before.chunks_exact(2).zip(frame.rgb.chunks_exact(2)).flat_map(|(b, c)| (mix(sample(b), sample(c)).round() as u16).to_le_bytes()).collect()
+            } else {
+                before.iter().zip(&frame.rgb).map(|(&b, &c)| mix(b as f32, c as f32).round() as u8).collect()
+            };
+            return self.out.write(&Frame { width: frame.width, height: frame.height, rgb, deep: frame.deep });
         }
         self.out.write(frame)
     }

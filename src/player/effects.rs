@@ -46,6 +46,8 @@ pub enum EffectMsg {
     FadeOut(f64),
     /// Jump to cut `cut`'s effect keyframe at clip time `t`.
     Jump(usize, f64),
+    /// Cut `cut`'s effect keyframe `key` dragged to clip time `t`.
+    KeyMove(usize, usize, f64),
 }
 
 /// Each effect: its name, range, and what it does. Untouched, each is
@@ -350,6 +352,16 @@ impl App {
                 self.selected = Some(cut);
                 self.selected_overlay = None;
                 self.goto(cut, t, false);
+            }
+            EffectMsg::KeyMove(cut, key, t) => {
+                self.follow = true;
+                self.begin_drag();
+                let gap = 1.0 / self.fps();
+                let Some(c) = self.edit.cuts.get_mut(cut) else { return };
+                crate::view::retime(&mut c.effects, key, t, gap);
+                if let Some(t) = c.effects.get(key).map(|k| k.t) {
+                    self.scrub_to(cut, t);
+                }
             }
         }
     }

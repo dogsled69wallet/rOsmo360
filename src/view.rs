@@ -510,14 +510,37 @@ impl Keyframes {
         self.0[i].ease = ease;
     }
 
-    /// Moves keyframe `i` to time `t`, kept between its neighbours (`gap`
-    /// seconds clear of them) so the order and indices stay as they are.
+    /// Moves keyframe `i` to time `t` (see `retime`).
     pub fn retime(&mut self, i: usize, t: f64, gap: f64) {
-        let lo = i.checked_sub(1).map_or(f64::NEG_INFINITY, |p| self.0[p].t + gap);
-        let hi = self.0.get(i + 1).map_or(f64::INFINITY, |n| n.t - gap);
-        if lo <= hi {
-            self.0[i].t = t.clamp(lo, hi);
-        }
+        retime(&mut self.0, i, t, gap);
+    }
+}
+
+/// A keyframe of any kind: the view's, effects', an overlay's motion.
+pub trait Timed {
+    fn time(&self) -> f64;
+    fn set_time(&mut self, t: f64);
+}
+
+impl Timed for Keyframe {
+    fn time(&self) -> f64 {
+        self.t
+    }
+    fn set_time(&mut self, t: f64) {
+        self.t = t;
+    }
+}
+
+/// Moves `keys[i]` (in time order) to time `t`, kept between its
+/// neighbours (`gap` seconds clear of them) so the order and indices stay
+/// as they are: dragging one past another would swap what each holds.
+pub fn retime<T: Timed>(keys: &mut [T], i: usize, t: f64, gap: f64) {
+    let lo = i.checked_sub(1).map_or(f64::NEG_INFINITY, |p| keys[p].time() + gap);
+    let hi = keys.get(i + 1).map_or(f64::INFINITY, |n| n.time() - gap);
+    if lo <= hi
+        && let Some(k) = keys.get_mut(i)
+    {
+        k.set_time(t.clamp(lo, hi));
     }
 }
 

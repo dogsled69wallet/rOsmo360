@@ -120,7 +120,7 @@ pub fn split_proxy(frame: &Frame, tracks: &[u32]) -> Vec<Frame> {
         .map(|&t| {
             let x0 = t as usize * side;
             let rgb = (0..side).flat_map(|y| &frame.rgb[(y * frame.width + x0) * 3..(y * frame.width + x0 + side) * 3]).copied().collect();
-            Frame { width: side, height: side, rgb }
+            Frame { width: side, height: side, rgb, deep: false }
         })
         .collect()
 }
@@ -170,7 +170,7 @@ pub fn key_frames(input: &Path, track: u32, (w, h): (usize, usize), out: Out, mu
                 Err(e) => return Err(e.into()),
             }
             let t = times.recv().context("ffmpeg gave a frame without its time")?;
-            if !each(t, Frame { width: w, height: h, rgb: out.rgb24(data) }) {
+            if !each(t, Frame { width: w, height: h, rgb: out.rgb24(data), deep: false }) {
                 return Ok(());
             }
         }
@@ -557,7 +557,7 @@ pub fn still_out(input: &Path, track: u32, t: f64, hw: Hwaccel, (width, height):
     if decoded.stdout.len() != width * height * out.rgb_bytes() {
         bail!("no frame at {t:.2} s");
     }
-    Ok(Frame { width, height, rgb: out.rgb24(decoded.stdout) })
+    Ok(Frame { width, height, rgb: out.rgb24(decoded.stdout), deep: false })
 }
 
 /// Streams RGB24 frames of one video track, starting at the first frame at or
@@ -608,7 +608,7 @@ impl Decoder {
     pub fn next(&mut self) -> Result<Option<Frame>> {
         let mut data = vec![0; self.width * self.height * self.out.rgb_bytes()];
         match self.stdout.read_exact(&mut data) {
-            Ok(()) => Ok(Some(Frame { width: self.width, height: self.height, rgb: self.out.rgb24(data) })),
+            Ok(()) => Ok(Some(Frame { width: self.width, height: self.height, rgb: self.out.rgb24(data), deep: false })),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -629,9 +629,11 @@ pub enum Format {
     /// H.264 and AAC in MP4: plays anywhere, small.
     #[default]
     Mp4,
-    /// DNxHR HQ and 16-bit PCM in MOV, for DaVinci Resolve: its free Linux
-    /// version decodes neither H.264/H.265 nor AAC. About 27 MB a second
-    /// at 1080p (110 at 2160p), an editing intermediate.
+    /// 10-bit DNxHR HQX (4:2:2) and 16-bit PCM in MOV, for DaVinci
+    /// Resolve: its free Linux version decodes neither H.264/H.265 nor AAC.
+    /// About 28 MB a second at 1080p, as 8-bit HQ was; an editing
+    /// intermediate, with the bits for grading. A GPU export feeds it 16-bit
+    /// frames (`Frame::deep`).
     Resolve,
 }
 
@@ -646,15 +648,18 @@ impl Format {
     fn codecs(self) -> &'static [&'static str] {
         match self {
             Format::Mp4 => &["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac"],
-            Format::Resolve => &["-c:v", "dnxhd", "-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p", "-c:a", "pcm_s16le", "-ar", "48000"],
+            Format::Resolve => &["-c:v", "dnxhd", "-profile:v", "dnxhr_hqx", "-pix_fmt", "yuv422p10le", "-c:a", "pcm_s16le", "-ar", "48000"],
         }
     }
 }
 
-/// Encodes RGB24 frames, muxing the source's audio over the same span.
+/// Encodes RGB frames (8 or 16 bits a sample), muxing the source's audio
+/// over the same span.
 pub struct Encoder {
     child: Child,
     stdin: Option<ChildStdin>,
+    /// It takes 16-bit frames.
+    deep: bool,
 }
 
 /// A stretch of a clip's sound: from `start` seconds, for `duration` (to
@@ -735,9 +740,11 @@ impl Encoder {
     /// frames arriving slower than the sound it cut the last frame off.
     /// With `mix`, the joined sound is set to its level and the music mixed
     /// in.
-    pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio: &[Sound<'_>], mix: Option<&Mix<'_>>, format: Format) -> Result<Self> {
+    /// `deep`: frames come with 16-bit samples (`Frame::deep`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(output: &Path, (w, h): (usize, usize), fps: f64, audio: &[Sound<'_>], mix: Option<&Mix<'_>>, format: Format, deep: bool) -> Result<Self> {
         let mut cmd = tool("ffmpeg");
-        cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24"]).args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"]);
+        cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", if deep { "rgb48le" } else { "rgb24" }]).args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"]);
         for s in audio {
             match s.duration {
                 // A picture or a silent video: silence as long as its frames.
@@ -776,10 +783,13 @@ impl Encoder {
             .spawn()
             .context("running ffmpeg")?;
         let stdin = child.stdin.take();
-        Ok(Encoder { child, stdin })
+        Ok(Encoder { child, stdin, deep })
     }
 
     pub fn write(&mut self, frame: &Frame) -> Result<()> {
+        if frame.deep != self.deep {
+            bail!("a {}-bit frame for a {}-bit encoder", if frame.deep { 16 } else { 8 }, if self.deep { 16 } else { 8 });
+        }
         self.stdin.as_mut().unwrap().write_all(&frame.rgb)?;
         Ok(())
     }
