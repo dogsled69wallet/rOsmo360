@@ -34,6 +34,15 @@ pub fn tool(tool: &str) -> Command {
     }
 }
 
+/// Everything ffprobe says about `input`'s container and streams, as JSON.
+pub fn probe_all(input: &Path) -> Result<serde_json::Value> {
+    let out = tool("ffprobe").args(["-v", "error", "-show_format", "-show_streams", "-of", "json"]).arg(input).output().context("running ffprobe")?;
+    if !out.status.success() {
+        bail!("ffprobe couldn't read {}", input.display());
+    }
+    Ok(serde_json::from_slice(&out.stdout)?)
+}
+
 fn probe(input: &Path, stream: &str, entries: &str) -> Result<String> {
     let out = tool("ffprobe")
         .args(["-v", "error", "-select_streams", stream, "-show_entries", entries, "-of", "csv=p=0"])
@@ -542,7 +551,7 @@ impl Drop for Decoder {
 }
 
 /// What `Encoder` writes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
     /// H.264 and AAC in MP4: plays anywhere, small.

@@ -12,7 +12,7 @@ use crate::grade::{EffectKey, Grade, grade_at};
 use crate::overlay::{MotionKey, Place, place_at};
 use crate::text::{Colour, Outline, TextAlign};
 use crate::view::Ease;
-use iced::widget::{button, column, container, pick_list, row, rule, scrollable, slider, text, tooltip};
+use iced::widget::{button, column, container, pick_list, row, rule, scrollable, slider, text, toggler, tooltip};
 use iced::{Alignment, Element, Length};
 
 #[derive(Debug, Clone)]
@@ -189,7 +189,7 @@ impl App {
     pub(super) fn effect_message(&mut self, m: EffectMsg) {
         let target = self.effect_target();
         match m {
-            EffectMsg::Toggle => self.effects_open = !self.effects_open,
+            EffectMsg::Toggle => self.toggle_side(super::Side::Effects),
             EffectMsg::Set(p, v) => {
                 self.begin_drag();
                 self.change_effects(|g| {
@@ -536,6 +536,13 @@ impl App {
             text("Edit").size(16),
             fade("Fade in", fades.fade_in, EffectMsg::FadeIn, "From black at the start of the edit, the sound with it"),
             fade("Fade out", fades.fade_out, EffectMsg::FadeOut, "To black at the end of the edit, the sound with it"),
+            rule::horizontal(1),
+            text("Correction").size(16),
+            tip(
+                toggler(self.rolling_shutter).label("Rolling shutter").on_toggle(Message::RollingShutter),
+                text("Straightens what the sensor's row-by-row readout bends while the camera turns, in playback and the export"),
+                tooltip::Position::Left,
+            ),
         ]
         .spacing(10)
         .into()]);

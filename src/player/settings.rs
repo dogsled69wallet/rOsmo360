@@ -25,6 +25,10 @@ pub struct Settings {
     /// Apply the cuts' colour effects to those files.
     pub export_graded: bool,
     pub export_format: Format,
+    /// Looking around while paused keys the view at the playhead.
+    pub auto_key: bool,
+    /// The colour theme, as `ThemeChoice::key` names it.
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -41,6 +45,8 @@ impl Default for Settings {
             export_clips: false,
             export_graded: false,
             export_format: Format::Mp4,
+            auto_key: false,
+            theme: "system".to_owned(),
         }
     }
 }

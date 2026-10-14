@@ -6,7 +6,12 @@ mod audio;
 mod edit;
 mod export;
 mod gpu;
+mod audio_panel;
+mod export_panel;
 mod handles;
+mod info;
+mod settings_panel;
+use settings_panel::ThemeChoice;
 mod meter;
 mod playback;
 pub mod render;
@@ -26,7 +31,7 @@ use anyhow::{Context, Result};
 use gpu::{Rig, Shown};
 use iced::keyboard::{self, Key, key::Named};
 use iced::mouse;
-use iced::widget::{button, canvas, center, checkbox, column, progress_bar, container, image, pick_list, responsive, row, shader, slider, space, stack, svg, text, toggler, tooltip};
+use iced::widget::{button, canvas, center, column, progress_bar, container, image, pick_list, responsive, row, shader, slider, space, stack, svg, text, toggler, tooltip};
 use iced::window;
 use iced::{Alignment, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme};
 use playback::Playback;
@@ -193,6 +198,14 @@ enum Saving {
 const SAVE_VIEW_PX: f32 = 3840.0;
 const SAVE_SPHERE_PX: usize = 7680;
 
+/// The panels that dock at the right of the view, one at a time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Side {
+    Effects,
+    Export,
+    Audio,
+}
+
 /// The shape of the view, and so of a saved view: free fills the window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Aspect {
@@ -278,8 +291,25 @@ enum Message {
     ExportClips(bool),
     /// Grade those files with the cuts' effects.
     ExportGraded(bool),
-    /// Export for DaVinci Resolve (true) or as MP4.
-    ExportResolve(bool),
+    ExportFormat(ffmpeg::Format),
+    /// Open or close the Export panel.
+    ExportPanel,
+    /// Open or close the Audio panel.
+    AudioPanel,
+    /// Open or close the Settings panel.
+    SettingsPanel,
+    AutoKey(bool),
+    Theme(ThemeChoice),
+    /// A drag on the view let go.
+    LookDone,
+    /// Open the Info panel on a file on the timeline (right-click).
+    Info(info::Of),
+    /// What was read about a file for the Info panel.
+    InfoRead(PathBuf, Result<Arc<info::File>, String>),
+    InfoClose,
+    /// Show a file in the file manager.
+    Reveal(PathBuf),
+    CopyPath(PathBuf),
     /// Export the edit: ask where (a file, or a folder for the clips), then
     /// render in the background.
     Export,
@@ -515,6 +545,17 @@ struct App {
     rolling_shutter: bool,
     /// Show a full-resolution frame when paused.
     full_on_pause: bool,
+    /// Looking around while paused keys the view at the playhead (the
+    /// Settings panel).
+    auto_key: bool,
+    /// The cut and clip time automatic keyframing is writing to, so one
+    /// look-around there is one undo step; `None` once it's over (the mouse
+    /// let go, or anything else done).
+    auto_key_at: Option<(usize, f64)>,
+    /// The Settings panel is open (at the left).
+    settings_open: bool,
+    /// The theme chosen in the Settings panel (`theme` is it resolved).
+    theme_choice: ThemeChoice,
     fullscreen: bool,
     volume: f32,
     muted: bool,
@@ -528,7 +569,10 @@ struct App {
     /// The box picks a white balance, not a colour to track.
     picking_white: bool,
     /// The Effects panel shows beside the view.
-    effects_open: bool,
+    /// The panel docked at the right of the view, if one is open.
+    side: Option<Side>,
+    /// The Info panel (at the left, in the Text panel's place).
+    info: Option<info::Info>,
     /// A running colour track: its cancel flag and progress, 0..1.
     tracking: Option<(Arc<std::sync::atomic::AtomicBool>, f32)>,
     /// The settings as last written, to save only when they change.
@@ -541,7 +585,8 @@ impl App {
         App {
             opts,
             followed: Default::default(),
-            theme: system_theme(),
+            theme: ThemeChoice::from_key(&saved.theme).resolve(),
+            theme_choice: ThemeChoice::from_key(&saved.theme),
             logo: image::Handle::from_bytes(LOGO),
             library: Vec::new(),
             thumbs: Default::default(),
@@ -589,6 +634,9 @@ impl App {
             follow: true,
             rolling_shutter: saved.rolling_shutter,
             full_on_pause: saved.full_on_pause,
+            auto_key: saved.auto_key,
+            auto_key_at: None,
+            settings_open: false,
             fullscreen: false,
             volume: saved.volume,
             muted: saved.muted,
@@ -597,7 +645,8 @@ impl App {
             save_status: None,
             picking: None,
             picking_white: false,
-            effects_open: false,
+            side: None,
+            info: None,
             tracking: None,
             saved_settings: saved,
         }
@@ -620,13 +669,25 @@ impl App {
             export_clips: self.export_clips,
             export_graded: self.export_graded,
             export_format: self.export_format,
+            auto_key: self.auto_key,
+            theme: self.theme_choice.key(),
         }
     }
 
     /// Handles `message`, then saves the settings if it changed any.
     fn update(&mut self, message: Message) -> Task<Message> {
         let before = if self.look_flat { (self.other_look, self.look) } else { (self.look, self.other_look) };
+        // What may look around (a key may turn the view); a let-go drag or
+        // anything else done ends a look-around's undo step. Frames and
+        // the view's size go by without ending it.
+        let looking = matches!(message, Message::Look { .. } | Message::Zoom(_) | Message::Fov(_) | Message::ResetView | Message::Key(..));
+        if !looking && !matches!(message, Message::Tick | Message::LoadingTick | Message::ViewSize(_)) {
+            self.auto_key_at = None;
+        }
         let task = self.handle(message);
+        if looking {
+            self.auto_key(before);
+        }
         self.keep_hand_view(before);
         let task = Task::batch([task, self.load_overlay_pictures()]);
         self.settle_look();
@@ -1065,31 +1126,11 @@ impl App {
                     tooltip::Position::Bottom,
                 ),
                 tip(
-                    icon_button(EXPORT, (!self.edit.cuts.is_empty()).then_some(Message::Export)),
-                    text("Export… the edit with sound, at this resolution, in the aspect's shape"),
-                    tooltip::Position::Bottom,
-                ),
-                pick_list(&crate::Resolution::ALL[..], Some(self.resolution), Message::Resolution),
-                tip(
-                    checkbox(self.export_clips).label("Clips").on_toggle(Message::ExportClips),
-                    text("Export each cut to its own file, for another editor: \"<project> - 001\" and on, into a folder you pick; each music clip as a WAV beside them, unfaded"),
+                    icon_button(EXPORT, (!self.edit.cuts.is_empty()).then_some(Message::ExportPanel)),
+                    text(if self.side == Some(Side::Export) { "Close the Export panel (Ctrl+E)" } else { "Export: resolution, format and clips, then the edit with sound (Ctrl+E)" }),
                     tooltip::Position::Bottom,
                 ),
             ]
-            .push(self.export_clips.then(|| {
-                tip(
-                    checkbox(self.export_graded).label("Graded").on_toggle(Message::ExportGraded),
-                    text("Apply the cuts' colour effects to the clips too; left off, they're as shot, to grade in the other editor"),
-                    tooltip::Position::Bottom,
-                )
-            }))
-            .push(
-                tip(
-                    checkbox(self.export_format == ffmpeg::Format::Resolve).label("Resolve").on_toggle(Message::ExportResolve),
-                    text("For DaVinci Resolve, whose free Linux version can't read MP4's H.264 and AAC: DNxHR HQ with PCM sound in .mov. Large: about 27 MB a second at 1080p"),
-                    tooltip::Position::Bottom,
-                ),
-            )
             .spacing(6)
             .align_y(Alignment::Center)
             .into(),
@@ -1124,6 +1165,11 @@ impl App {
             Then::OpenProject => self.update(Message::OpenProject),
             Then::NewProject => self.update(Message::NewProject),
         }
+    }
+
+    /// Opens `side` at the right (closing whichever was there), or closes it.
+    fn toggle_side(&mut self, side: Side) {
+        self.side = if self.side == Some(side) { None } else { Some(side) };
     }
 
     fn unsaved(&self) -> bool {
@@ -1240,6 +1286,7 @@ impl App {
                 // still loading finishes there without becoming a cut.
                 self.edit.replace(Vec::new(), Default::default(), Default::default(), Default::default(), Vec::new(), Vec::new());
                 self.hand_cut = None;
+                self.info = None;
                 self.selected_music = None;
                 self.selected_volume = None;
                 self.selected_sound = None;
@@ -1335,6 +1382,7 @@ impl App {
                 let complete = missing.is_empty() && gone.is_empty() && lost.is_empty();
                 self.edit.replace(cuts, music, project.sound, project.fades, overlays, texts);
                 self.hand_cut = None;
+                self.info = None;
                 self.mark_flat();
                 self.saved_version = if complete { self.edit.version } else { 0 };
                 self.saved_aspect = self.aspect;
@@ -1373,7 +1421,54 @@ impl App {
             Message::Resolution(r) => self.resolution = r,
             Message::ExportClips(on) => self.export_clips = on,
             Message::ExportGraded(on) => self.export_graded = on,
-            Message::ExportResolve(on) => self.export_format = if on { ffmpeg::Format::Resolve } else { ffmpeg::Format::Mp4 },
+            Message::ExportFormat(f) => self.export_format = f,
+            Message::Info(of) => {
+                let path = match of {
+                    info::Of::Cut(i) => self.edit.cuts.get(i).map(|c| c.input.clone()),
+                    info::Of::Music(i) => self.edit.music.clips.get(i).map(|m| m.input.clone()),
+                    info::Of::Overlay(r) => self.edit.item(r).filter(|it| it.text.is_none()).map(|it| it.input.clone()),
+                };
+                let Some(path) = path else { return Task::none() };
+                self.settings_open = false;
+                // Read once per file: another cut of it shows at once.
+                let file = self.info.take().filter(|i| i.path == path).and_then(|i| i.file).filter(|f| f.is_ok());
+                let read = file.is_none();
+                self.info = Some(info::Info { of, path: path.clone(), file });
+                if read {
+                    let song = matches!(of, info::Of::Music(_));
+                    let p = path.clone();
+                    return Task::perform(blocking(move || info::read(&p, song).map(Arc::new).map_err(|e| format!("{e:#}"))), move |r| Message::InfoRead(path.clone(), r));
+                }
+            }
+            Message::InfoRead(path, file) => {
+                if let Some(info) = &mut self.info
+                    && info.path == path
+                {
+                    info.file = Some(file);
+                }
+            }
+            Message::InfoClose => self.info = None,
+            Message::Reveal(path) => {
+                std::thread::spawn(move || {
+                    if let Err(e) = info::reveal(&path) {
+                        eprintln!("couldn't show {}: {e:#}", path.display());
+                    }
+                });
+            }
+            Message::CopyPath(path) => {
+                self.save_status = Some("Copied the file's path".to_owned());
+                return iced::clipboard::write(path.display().to_string());
+            }
+            Message::ExportPanel => self.toggle_side(Side::Export),
+            Message::AudioPanel => self.toggle_side(Side::Audio),
+            Message::SettingsPanel => {
+                self.settings_open = !self.settings_open;
+                if self.settings_open {
+                    self.info = None;
+                }
+            }
+            Message::AutoKey(on) => self.auto_key = on,
+            Message::LookDone => {}
             Message::Export => {
                 if self.edit.cuts.is_empty() || self.exporting.is_some() {
                     return Task::none();
@@ -1888,13 +1983,9 @@ impl App {
                 }
             }
             Message::KeyAdd => {
-                let (view, tolerance) = (self.shown_view(), self.tolerance());
-                let Some((_, t)) = self.playing_cut() else { return Task::none() };
-                let aims = self.aims(t);
-                self.edit.checkpoint();
-                if let Some(cut) = self.edit.cuts.get_mut(self.current) {
-                    cut.keyframes.set(t, view, tolerance, &|f, _| aims.iter().find(|a| &a.0 == f).and_then(|a| a.1));
-                    self.follow = true;
+                if self.playing_cut().is_some() {
+                    self.edit.checkpoint();
+                    self.key_view();
                 }
             }
             Message::KeyDelete => {
@@ -1989,7 +2080,11 @@ impl App {
             }
             Message::ViewSize(size) => self.view_size = size,
             Message::Aspect(a) => self.aspect = a,
-            Message::ThemeChanged => self.theme = system_theme(),
+            Message::ThemeChanged => self.theme = self.theme_choice.resolve(),
+            Message::Theme(choice) => {
+                self.theme = choice.resolve();
+                self.theme_choice = choice;
+            }
             Message::Save(what) => {
                 let Some(c) = &self.clip else { return Task::none() };
                 let media = &c.playback.media;
@@ -2491,6 +2586,35 @@ impl App {
         cut.keyframes.set(start, look, 0.0, &|_, _| None);
     }
 
+    /// Keys the view shown at the playhead on the playing cut, or updates
+    /// the keyframe there; the view then follows the keyframes again.
+    fn key_view(&mut self) {
+        let (view, tolerance) = (self.shown_view(), self.tolerance());
+        let Some((_, t)) = self.playing_cut() else { return };
+        let aims = self.aims(t);
+        if let Some(cut) = self.edit.cuts.get_mut(self.current) {
+            cut.keyframes.set(t, view, tolerance, &|f, _| aims.iter().find(|a| &a.0 == f).and_then(|a| a.1));
+            self.follow = true;
+        }
+    }
+
+    /// With Auto keyframe on: a look around while paused (`before` is each
+    /// kind's free look as it was) keys the view at the playhead, as K does.
+    /// While playing a drag would leave a keyframe each frame, so looking
+    /// around stays free there.
+    fn auto_key(&mut self, before: (View, View)) {
+        let now = if self.look_flat { (self.other_look, self.look) } else { (self.look, self.other_look) };
+        if !self.auto_key || self.follow || now == before || self.clip.as_ref().is_none_or(|c| c.playback.playing) {
+            return;
+        }
+        let Some((_, t)) = self.playing_cut() else { return };
+        if self.auto_key_at != Some((self.current, t)) {
+            self.edit.checkpoint();
+            self.auto_key_at = Some((self.current, t));
+        }
+        self.key_view();
+    }
+
     /// Jumps to the nearest keyframe before (`-1`) or after (`1`) the playhead.
     fn key_step(&mut self, dir: f64) -> Task<Message> {
         let tolerance = self.tolerance();
@@ -2688,6 +2812,8 @@ impl App {
                 "z" | "Z" if mods.command() && mods.shift() => return self.update(Message::Redo),
                 "z" if mods.command() => return self.update(Message::Undo),
                 "y" if mods.command() => return self.update(Message::Redo),
+                "e" | "E" if mods.command() => return self.update(Message::ExportPanel),
+                "," if mods.command() => return self.update(Message::SettingsPanel),
                 "c" | "C" => return self.update(Message::Split),
                 "q" | "Q" => self.free_look().roll -= step,
                 "e" | "E" => self.free_look().roll += step,
@@ -2843,7 +2969,25 @@ impl App {
             Some(_) => self.loading_bar(140.0),
             None => row![].push(message).push(showing).push(decode).spacing(10).align_y(Alignment::Center).into(),
         };
+        let shown_view = self.shown_view();
+        let (lo, hi) = shown_view.fov_range();
+        let mut sources = Vec::new();
+        if media.proxy.is_some() {
+            sources.push(Source::Proxy);
+        }
+        sources.push(Source::Osv(1920.min(media.osv_full)));
+        sources.push(Source::Osv(media.osv_full));
+        sources.dedup();
+        let source = match (media.osv_size, &media.proxy) {
+            (None, Some(_)) => Source::Proxy,
+            (size, _) => Source::Osv(size.unwrap_or(1920)),
+        };
         let top = row![
+            tip(
+                icon_button(SETTINGS, Some(Message::SettingsPanel)),
+                text(if self.settings_open { "Close the Settings panel (Ctrl+,)" } else { "Settings (Ctrl+,)" }),
+                tooltip::Position::Bottom,
+            ),
             tip(icon_button(NEW_PROJECT, Some(Message::NewProject)), text("Start a new, empty project (Ctrl+N)"), tooltip::Position::Bottom),
             tip(icon_button(ADD_CLIP, Some(Message::Open)), text(open_hint), tooltip::Position::Bottom),
             tip(
@@ -2865,12 +3009,24 @@ impl App {
                 tooltip::Position::Bottom,
             ),
             self.export_controls(),
-            // The file name: the full path is in the tooltip.
-            tip(
-                text(media.input.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())),
-                text(media.input.display().to_string()),
-                tooltip::Position::Bottom,
-            ),
+        ]
+        // How a 360 clip is steadied and drawn; an ordinary video or a
+        // picture has neither, so nothing shows.
+        .push(media.flat.is_none().then(|| labelled("Stabilisation", pick_list(&Mode::ALL[..], Some(media.stab.mode()), Message::Stab))))
+        .push(media.flat.is_none().then(|| labelled("Projection", pick_list(&Projection::ALL[..], Some(shown_view.projection), Message::Projection))))
+        .push(media.flat.is_none().then(|| {
+            row![
+                tip(labelled("Source", pick_list(sources, Some(source), Message::Source)), text("Playback source: the proxy is quick, the OSV sharper"), tooltip::Position::Bottom),
+                tip(
+                    toggler(self.full_on_pause).label("Full res").on_toggle(Message::FullOnPause),
+                    text("Full res when paused: a paused frame is decoded from the OSV at full size; off, it stays at the playback source's quality"),
+                    tooltip::Position::Bottom,
+                ),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center)
+        }))
+        .push(row![
             space().width(Length::Fill),
             // Beside what's playing: the transport row is full at the
             // window's default width, and cut it off.
@@ -2888,13 +3044,20 @@ impl App {
                 text("The mix as it plays, left and right: peak (faint) and RMS, red past 0 dBFS; the number is the loudest peak since play started, dBFS. It sums the clip sound and music at their levels, as the export mixes them, whatever the speakers are set to."),
                 tooltip::Position::Bottom,
             ),
+            tip(
+                icon_button(if self.fullscreen { FULLSCREEN_EXIT } else { FULLSCREEN }, Some(Message::Fullscreen)),
+                text(if self.fullscreen { "Leave fullscreen (F)" } else { "Fullscreen (F)" }),
+                tooltip::Position::Bottom,
+            ),
             status
         ]
-            .spacing(12)
-            .padding([6, 10])
-            .align_y(Alignment::Center);
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .width(Length::Fill))
+        .spacing(12)
+        .padding([6, 10])
+        .align_y(Alignment::Center);
 
-        let shown_view = self.shown_view();
         let view: Element<'_, Message> = match self.held.clone().or_else(|| self.sphere()) {
             Some(sphere) => {
                 let (aspect, picking) = (self.aspect, self.picking);
@@ -2919,9 +3082,16 @@ impl App {
             None => center(column![self.logo(), text("Decoding…")].spacing(16).align_x(Alignment::Center)).into(),
         };
         let view = container(view).width(Length::Fill).height(Length::Fill).style(|_| container::background(iced::Color::BLACK));
-        let view: Element<'_, Message> = if self.effects_open { row![view, self.effects_panel()].into() } else { view.into() };
+        let view: Element<'_, Message> = match self.side {
+            Some(Side::Effects) => row![view, self.effects_panel()].into(),
+            Some(Side::Export) => row![view, self.export_panel()].into(),
+            Some(Side::Audio) => row![view, self.audio_panel()].into(),
+            None => view.into(),
+        };
         // A text item's words and look, at the left while it's selected.
-        let view: Element<'_, Message> = match self.text_panel() {
+        // The Info and Settings panels win the left side over the Text panel
+        // while open.
+        let view: Element<'_, Message> = match self.info_panel().or_else(|| self.settings_panel()).or_else(|| self.text_panel()) {
             Some(panel) => row![panel, view].into(),
             None => view,
         };
@@ -3029,9 +3199,11 @@ impl App {
                 text("Track a colour: draw a box over a subject (a jacket, a tent); the keyframe here then follows it"),
                 tooltip::Position::Top,
             ),
+            tip(labelled("FOV", slider(lo..=hi, shown_view.fov, Message::Fov).width(110)), text("Field of view: how wide the view is (scroll on the view)"), tooltip::Position::Top),
+            tip(icon_button(RESET_VIEW, Some(Message::ResetView)), text("Reset the view: straight ahead, level (0)"), tooltip::Position::Top),
             tip(
                 icon_button(EFFECTS, Some(Message::Effect(effects::EffectMsg::Toggle))),
-                text(if self.effects_open { "Close the Effects panel (G)" } else { "Effects: exposure, colour and tone of the cut, keyframed; fades for the edit (G)" }),
+                text(if self.side == Some(Side::Effects) { "Close the Effects panel (G)" } else { "Effects: exposure, colour and tone of the cut, keyframed; fades for the edit (G)" }),
                 tooltip::Position::Top,
             ),
             tip(
@@ -3066,100 +3238,17 @@ impl App {
             tip(icon_button(ZOOM_FIT, Some(Message::TimelineZoomTo(0.0))), text("Show the whole edit (Ctrl+0)"), tooltip::Position::Top),
             space().width(Length::Fill),
             tip(
-                button(svg(svg::Handle::from_memory(if self.muted { SPEAKER_MUTED } else { SPEAKER })).width(20).height(20))
-                    .padding(5)
-                    .on_press(Message::Mute),
-                text(if self.muted { "Unmute (M)" } else { "Mute (M)" }),
+                icon_button(if self.muted { SPEAKER_MUTED } else { SPEAKER }, Some(Message::AudioPanel)),
+                text(if self.side == Some(Side::Audio) { "Close the Audio panel" } else { "Audio: listening volume and the mix levels (M mutes)" }),
                 tooltip::Position::Top,
             ),
-            slider(0.0..=1.0, self.volume(), Message::Volume).step(0.01f32).width(90),
         ]
         .spacing(12)
         .padding([4, 10])
         .align_y(Alignment::Center);
 
-        let mut sources = Vec::new();
-        if media.proxy.is_some() {
-            sources.push(Source::Proxy);
-        }
-        sources.push(Source::Osv(1920.min(media.osv_full)));
-        sources.push(Source::Osv(media.osv_full));
-        sources.dedup();
-        let source = match (media.osv_size, &media.proxy) {
-            (None, Some(_)) => Source::Proxy,
-            (size, _) => Source::Osv(size.unwrap_or(1920)),
-        };
-        let (lo, hi) = shown_view.fov_range();
-        let controls = row![
-            if media.flat.is_some() {
-                tip(labelled("Stabilisation", text("—")), text("An ordinary video or picture has no motion data to steady it with"), tooltip::Position::Top)
-            } else {
-                labelled("Stabilisation", pick_list(&Mode::ALL[..], Some(media.stab.mode()), Message::Stab))
-            },
-            if media.flat.is_some() {
-                tip(labelled("Projection", text("Flat")), text("An ordinary video or picture is framed by panning and zooming within it"), tooltip::Position::Top)
-            } else {
-                labelled("Projection", pick_list(&Projection::ALL[..], Some(shown_view.projection), Message::Projection))
-            },
-            match media.flat {
-                Some(flat) => {
-                    let (w, h) = playback::fit(flat.size(), playback::FLAT_PLAY);
-                    let (fw, fh) = flat.size();
-                    tip(
-                        labelled("Playback source", text(format!("{} {w}×{h}", if flat.picture { "Picture" } else { "Video" }))),
-                        text(if (w, h) == (fw, fh) { "At its own size".to_owned() } else { format!("Scaled down to play smoothly; paused, it shows at its full {fw}×{fh} (Full res when paused)") }),
-                        tooltip::Position::Top,
-                    )
-                }
-                None => labelled("Playback source", pick_list(sources, Some(source), Message::Source)),
-            },
-            labelled("FOV", slider(lo..=hi, shown_view.fov, Message::Fov).width(120)),
-            tip(
-                labelled(
-                    "Clip sound",
-                    row![
-                        slider(crate::project::OFF_DB..=6.0, self.edit.sound.volume, Message::SoundLevel).step(0.5).on_release(Message::LevelDone).width(100),
-                        text(db_label(self.edit.sound.volume)).width(70),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                ),
-                text("The clips' own sound in the mix, and in the export"),
-                tooltip::Position::Top,
-            ),
-            tip(
-                labelled(
-                    "Music",
-                    row![
-                        slider(crate::project::OFF_DB..=6.0, self.edit.music.volume, Message::MusicLevel).step(0.5).on_release(Message::LevelDone).width(100),
-                        text(db_label(self.edit.music.volume)).width(70),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                ),
-                text("The music track in the mix, and in the export"),
-                tooltip::Position::Top,
-            ),
-            toggler(self.rolling_shutter).label("Rolling shutter").on_toggle(Message::RollingShutter),
-            tip(
-                toggler(self.full_on_pause).label("Full res when paused").on_toggle(Message::FullOnPause),
-                text("Off: paused frames stay at the playback source's quality"),
-                tooltip::Position::Top,
-            ),
-            tip(icon_button(RESET_VIEW, Some(Message::ResetView)), text("Reset the view: straight ahead, level (0)"), tooltip::Position::Top),
-            tip(
-                icon_button(if self.fullscreen { FULLSCREEN_EXIT } else { FULLSCREEN }, Some(Message::Fullscreen)),
-                text(if self.fullscreen { "Leave fullscreen (F)" } else { "Fullscreen (F)" }),
-                tooltip::Position::Top,
-            ),
-        ]
-        .spacing(18)
-        .padding([6, 10])
-        .align_y(Alignment::Center)
-        .wrap();
-
         let timeline = container(timeline).padding([2, 10]);
-        column![top, view, transport, timeline, controls].push(error.map(|e| container(e).padding([0, 10]))).push(credit()).into()
+        column![top, view, transport, timeline].push(error.map(|e| container(e).padding([0, 10]))).push(credit()).into()
     }
 }
 
@@ -3224,6 +3313,9 @@ const SAVE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 
 const SAVE_AS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h10.2a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V10"/><path d="M7 3v4a1 1 0 0 0 1 1h7M7 21v-7a1 1 0 0 1 1-1h4"/><path d="M21.4 15.6a1.98 1.98 0 0 0-2.8-2.8L14 17.4V20.2h2.8z"/></svg>"#;
 /// An arrow out of a tray (export) and a crossed circle (cancel a running job).
 const EXPORT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/></svg>"#;
+const SETTINGS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
+const FOLDER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>"#;
+const COPY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>"#;
 const CANCEL: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/></svg>"#;
 /// Transport: play, pause, a camera (save the view) and a globe (save the
 /// whole sphere).
@@ -3287,8 +3379,9 @@ const SPEAKER_MUTED: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox
 /// own reading: in a Flatpak it can't see gsettings, kdeglobals or GTK's
 /// settings, and on desktops it has no reader for (Hyprland) it guesses from
 /// them, so it landed on light there. With no answer from the portal, a
-/// Flatpak goes dark, as the native build does.
-fn system_theme() -> Theme {
+/// Flatpak goes dark, as the native build does. `dark` holds it to dark or
+/// light whatever the desktop says (the Settings panel's System dark/light).
+fn system_theme(dark: Option<bool>) -> Theme {
     let sys = match native_theme::SystemTheme::from_system() {
         Ok(sys) => sys,
         Err(e) => {
@@ -3301,7 +3394,7 @@ fn system_theme() -> Theme {
     // the mode, so ask for the appearance itself (read fresh each time, for
     // live changes).
     let os_dark = if cfg!(target_os = "macos") { native_theme::detect::detect_is_dark() } else { sys.mode.is_dark() };
-    let dark = scheme.unwrap_or_else(|| std::env::var_os("FLATPAK_ID").is_some() || os_dark);
+    let dark = dark.or(scheme).unwrap_or_else(|| std::env::var_os("FLATPAK_ID").is_some() || os_dark);
     let mut resolved = if dark { sys.dark } else { sys.light };
     if let Some([r, g, b]) = accent {
         resolved.defaults.accent_color = native_theme_iced::Rgba::from_f32(r as f32, g as f32, b as f32, 1.0);
@@ -3494,8 +3587,6 @@ fn clock(t: f64) -> String {
     format!("{}:{:05.2}", (t / 60.0) as u32, t % 60.0)
 }
 
-/// Runs `f` on its own thread so blocking work (parsing, ffprobe) stays off
-/// the executor.
 /// A small picture of an overlay for its timeline block: 48 px high,
 /// over a dark checker so transparency shows.
 fn overlay_thumb(picture: &crate::overlay::Picture) -> iced::widget::image::Handle {
@@ -3515,6 +3606,8 @@ fn overlay_thumb(picture: &crate::overlay::Picture) -> iced::widget::image::Hand
     iced::widget::image::Handle::from_rgba(w as u32, h as u32, rgba)
 }
 
+/// Runs `f` on its own thread so blocking work (parsing, ffprobe) stays off
+/// the executor.
 fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl Future<Output = T> {
     let (tx, rx) = iced::futures::channel::oneshot::channel();
     std::thread::spawn(move || {
@@ -3589,7 +3682,7 @@ impl Sphere {
             }
             iced::Event::Mouse(mouse::Event::ButtonReleased(_)) if drag.button.is_some() => {
                 drag.button = None;
-                Some(shader::Action::capture())
+                Some(shader::Action::publish(Message::LookDone).and_capture())
             }
             iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 let (button, last) = (drag.button?, drag.last?);

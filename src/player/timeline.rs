@@ -569,6 +569,12 @@ impl canvas::Program<Message> for OverlayLane {
                 };
                 Some(canvas::Action::publish(message).and_capture())
             }
+            // Right-click an overlay picture: what file it is (text has none).
+            Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) if self.1 == Track::Overlay => {
+                let p = cursor.position_in(bounds)?;
+                let item = self.item_at(p.x, bounds).filter(|_| p.y < OVERLAY)?;
+                Some(canvas::Action::publish(Message::Info(super::info::Of::Overlay((self.1, item)))).and_capture())
+            }
             Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let p = cursor.position_in(bounds)?;
                 if let Some(at) = self.key_at(p, bounds) {
@@ -717,13 +723,20 @@ impl canvas::Program<Message> for Pictures {
             if c.thumbs.is_empty() || r - l <= 2.0 * inset {
                 continue;
             }
-            let clip = Rectangle::new(Point::new(l + inset, inset), Size::new(r - l - 2.0 * inset, th));
+            // Within the widget too: iced clips a canvas's shapes to it but
+            // not its images, and zoomed in the tiles at the ends ran on into
+            // the window's margins.
+            let (cl, cr) = ((l + inset).max(0.0), (r - inset).min(bounds.width));
+            if cr <= cl {
+                continue;
+            }
+            let clip = Rectangle::new(Point::new(cl, inset), Size::new(cr - cl, th));
             let per_px = c.len / (r - l) as f64;
             frame.with_clip(clip, |f| {
                 // From the first tile in sight: zoomed in, a block can be
                 // far wider than the widget.
-                let mut x = clip.x + ((-clip.x) / tw).floor().max(0.0) * tw;
-                while x < (clip.x + clip.width).min(bounds.width) {
+                let mut x = l + inset + ((-(l + inset)) / tw).floor().max(0.0) * tw;
+                while x < clip.x + clip.width {
                     let t = c.start + (x + tw / 2.0 - l) as f64 * per_px;
                     if let Some(h) = c.thumb_at(t) {
                         f.draw_image(Rectangle::new(Point::new(x, inset), Size::new(tw, th)), canvas::Image::new(h.clone()));
@@ -846,6 +859,18 @@ impl canvas::Program<Message> for Marks {
                     return None;
                 };
                 Some(canvas::Action::publish(message).and_capture())
+            }
+            // Right-click a cut or a song: what file it is.
+            Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                let p = cursor.position_in(bounds)?;
+                let of = if p.y < CUTS {
+                    super::info::Of::Cut(self.block_at(p.x, bounds)?)
+                } else if p.y >= MUSIC_TOP && p.y < HEIGHT - SCROLL {
+                    super::info::Of::Music(self.music_at(p.x, bounds)?)
+                } else {
+                    return None;
+                };
+                Some(canvas::Action::publish(Message::Info(of)).and_capture())
             }
             Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let p = cursor.position_in(bounds)?;
