@@ -3459,10 +3459,18 @@ fn theme_changes() -> impl iced::futures::Stream<Item = Message> {
         watch_portal(move || {
             let _ = portal.unbounded_send(());
         });
-        let _watch = native_theme::watch::on_theme_change(move |_| {
-            let _ = tx.unbounded_send(());
-        })
-        .inspect_err(|e| eprintln!("following theme changes through the desktop portal only: {e}"));
+        // Not on macOS: native-theme's watcher there keeps a raw pointer to
+        // its thread's run loop, which can be gone by the time it's used, and
+        // the player sometimes died at start ("trace trap", a freed
+        // CoreFoundation object on a background thread). There the theme is
+        // read at start and when chosen; the Settings panel's System
+        // light/dark cover a change.
+        let _watch = (!cfg!(target_os = "macos")).then(|| {
+            native_theme::watch::on_theme_change(move |_| {
+                let _ = tx.unbounded_send(());
+            })
+            .inspect_err(|e| eprintln!("following theme changes through the desktop portal only: {e}"))
+        });
         while rx.next().await.is_some() {
             if output.send(Message::ThemeChanged).await.is_err() {
                 break;
