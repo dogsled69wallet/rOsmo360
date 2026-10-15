@@ -337,7 +337,7 @@ The level runs in a straight line between points, and stays at the first and las
 
 Click **Effects** (three sliders) in the transport row, or press **G**, to open the Effects panel beside the view. It shows the effects of the cut under the playhead, or of the selected title or overlay while it's showing (see [Titles and overlays](#11-titles-and-overlays)).
 
-![The Effects panel for cut 1: sliders for Exposure (+0.15 EV), Contrast, Highlights (−0.30), Shadows (+0.15), Temperature (+0.08), Tint, Saturation, Vibrance (+0.25), Vignette (0.25) and Opacity (100 %), each with its value and a reset arrow; below them the add-keyframe and delete-keyframe icons, the Ease picker, white balance, to all cuts and reset; the edit's Fade in and Fade out; and Correction, with the Rolling shutter switch](guide/effects-panel.png)
+![The Effects panel for cut 1, a clip filmed in D-Log M, with a ✕ at the top to close it: the LUT picker on DJI Osmo 360 D-Log M to Rec.709 V1 with its Strength at 100 %; sliders for Exposure (+0.25 EV), Contrast, Highlights, Shadows, Temperature, Tint, Saturation, Vibrance (+0.15), Vignette and Opacity (100 %), each with its value and a reset arrow; below them the add-keyframe and delete-keyframe icons, the Ease picker, white balance, to all cuts and reset; the edit's Fade in and Fade out; and Correction, with the Rolling shutter switch](guide/effects-panel.png)
 
 | Effect | What it does |
 |---|---|
@@ -488,7 +488,7 @@ Both are rendered from fresh full-resolution frames, which takes a few seconds.
 
 Click the **cog** at the far left of the top bar, or press **Ctrl+,**, for the **Settings panel** at the left of the view. Everything in it is remembered between runs.
 
-![The Settings panel: Look, with the theme picker on Kanagawa Dragon; Decoding, with the 10-bit switch; Keyframes, with the Auto keyframe switch; each with a short note](guide/settings-panel.png)
+![The Settings panel: Look, with the theme picker on Kanagawa Dragon; Decoding, with the 10-bit switch; LUTs, with DJI Osmo 360 D-Log M to Rec.709 V1 in the library, the Add LUT… button and the LUT for D-Log M clips; Keyframes, with the Auto keyframe switch; each with a short note](guide/settings-panel.png)
 
 - **Look**: the colour theme. rOsmo360 starts in **Kanagawa Dragon**, a dark theme that keeps the picture in front; the list has light and dark themes such as Nord, Dracula, Gruvbox, Catppuccin and Tokyo Night, and the change shows at once.
 - **Decoding → 10-bit**: decodes the Osmo's `.OSV` and other 10-bit video (a phone's HDR) with all its 10 bits instead of 8. Skies and smooth gradients stay smoother, most of all after strong grading, in the player's full-resolution frames and in exports. It moves twice the data, so a full-resolution export takes about a third longer on a PC; playing from the `.LRF` proxy isn't affected. Off by default; it applies from the next seek or clip.
