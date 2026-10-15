@@ -1130,7 +1130,7 @@ fn run() -> Result<()> {
                 // One clip is a project of one cut.
                 let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
                 let (start, end) = span(&input, start, duration, Some(&reframe))?;
-                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new(), lut: None, lut_strength: 1.0, flat: false, lut_applied: None }], ..Default::default() }
+                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new(), lut: None, old_lut_strength: None, flat: false, lut_applied: None }], ..Default::default() }
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
@@ -1356,7 +1356,7 @@ fn encode(p: &Pipeline, start: f64, total: Option<usize>, encoder: &mut dyn ffmp
 /// Grades a rendered frame on the CPU, as the shader does on the GPU.
 /// Its LUT, then its effects, as the shader's `finish` does on the GPU.
 fn grade_frame(frame: &mut stitch::Frame, camera: &view::Camera) {
-    let (grade, lut) = (&camera.grade, camera.lut.map(|l| (lut::get(l.id), l.strength as f64)));
+    let (grade, lut) = (&camera.grade, camera.lut.map(|id| (lut::get(id), camera.grade.lut.clamp(0.0, 1.0))));
     if grade.is_neutral() && lut.is_none() {
         return;
     }

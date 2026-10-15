@@ -8,14 +8,6 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// A LUT as a view uses it: which loaded one (`shared`) and how much of it
-/// (0..1). Small and `Copy`, so `view::Camera` stays so.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Applied {
-    pub id: usize,
-    pub strength: f32,
-}
-
 /// LUTs loaded this run, each file once.
 static LOADED: Mutex<Vec<(PathBuf, Arc<Lut>)>> = Mutex::new(Vec::new());
 

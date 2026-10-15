@@ -140,8 +140,9 @@ pub struct Camera {
     pub planet: Option<f64>,
     /// The colour effects on what it shows.
     pub grade: crate::grade::Grade,
-    /// The LUT applied before them.
-    pub lut: Option<crate::lut::Applied>,
+    /// The LUT applied before them (`lut::shared`'s id), as much of it as
+    /// the grade's `lut` says.
+    pub lut: Option<usize>,
     /// What it shows of an ordinary video instead.
     pub crop: Crop,
 }

@@ -406,7 +406,8 @@ mod tests {
         let lut = crate::lut::get(id);
         let (w, h) = (64, 32);
         let mut camera = crate::view::View::home(crate::view::Projection::Perspective).camera();
-        camera.lut = Some(crate::lut::Applied { id, strength: 0.7 });
+        camera.lut = Some(id);
+        camera.grade.lut = 0.7;
         for [y, cb, cr] in [[502, 512, 512], [600, 640, 440], [420, 420, 470], [800, 540, 560]] {
             let got = draw_flat_as(&mut gpu, p010(w, h, |_| y, cb, cr), crate::hdr::Hdr::None, (w, h), camera);
             // As the shader decodes it: BT.709, video range.

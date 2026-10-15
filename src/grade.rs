@@ -45,6 +45,10 @@ pub struct Grade {
     /// is black, as in a fade; an overlay will show what's beneath.
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub opacity: f64,
+    /// 0..1: how much of the cut's LUT (`Cut::lut`), applied before the
+    /// rest; keyframed with them, so a LUT can fade in or out in a cut.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub lut: f64,
     /// 0..1: how far faded to black, from the edit's fades; not keyframed.
     #[serde(skip)]
     pub black: f64,
@@ -69,7 +73,7 @@ fn is_one(v: &f64) -> bool {
 }
 
 /// `Grade::values` of the picture untouched.
-pub const NEUTRAL: [f64; 10] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+pub const NEUTRAL: [f64; 11] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0];
 
 /// Stops of colour per unit of temperature or tint: at ±1, red and blue
 /// are four times apart, enough to neutralise shade or low sun.
@@ -81,13 +85,13 @@ impl Grade {
     }
 
     /// The fields as a list, for blending and the panel.
-    pub fn values(&self) -> [f64; 10] {
-        [self.exposure, self.contrast, self.highlights, self.shadows, self.temperature, self.tint, self.saturation, self.vibrance, self.vignette, self.opacity]
+    pub fn values(&self) -> [f64; 11] {
+        [self.exposure, self.contrast, self.highlights, self.shadows, self.temperature, self.tint, self.saturation, self.vibrance, self.vignette, self.opacity, self.lut]
     }
 
-    pub fn from_values(v: [f64; 10]) -> Grade {
-        let [exposure, contrast, highlights, shadows, temperature, tint, saturation, vibrance, vignette, opacity] = v;
-        Grade { exposure, contrast, highlights, shadows, temperature, tint, saturation, vibrance, vignette, opacity, black: 0.0 }
+    pub fn from_values(v: [f64; 11]) -> Grade {
+        let [exposure, contrast, highlights, shadows, temperature, tint, saturation, vibrance, vignette, opacity, lut] = v;
+        Grade { exposure, contrast, highlights, shadows, temperature, tint, saturation, vibrance, vignette, opacity, lut, black: 0.0 }
     }
 
     /// Grades display-encoded `rgb` (0..1) at screen point `at` (−1..1 each

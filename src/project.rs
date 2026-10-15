@@ -256,14 +256,6 @@ impl MusicClip {
     }
 }
 
-fn full() -> f64 {
-    1.0
-}
-
-fn is_full(v: &f64) -> bool {
-    *v == 1.0
-}
-
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
 }
@@ -316,16 +308,18 @@ pub struct Cut {
     /// like Rec.709; a missing one leaves the cut as filmed, with a warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lut: Option<String>,
-    /// How much of the LUT, 0..1.
-    #[serde(default = "full", skip_serializing_if = "is_full")]
-    pub lut_strength: f64,
+    /// The LUT's strength as projects saved it for a day (2026-10-15)
+    /// before it became an effect: read, moved into the effect keyframes
+    /// (`Project::load`), never written.
+    #[serde(default, rename = "lut_strength", skip_serializing)]
+    pub old_lut_strength: Option<f64>,
     /// Its clip is an ordinary video (framed by cropping, not a 360 view):
     /// found when the clip is opened, not saved.
     #[serde(skip)]
     pub flat: bool,
     /// Its LUT, loaded (`resolve_lut`): found when the clip is opened.
     #[serde(skip)]
-    pub lut_applied: Option<crate::lut::Applied>,
+    pub lut_applied: Option<usize>,
 }
 
 impl Cut {
@@ -335,8 +329,7 @@ impl Cut {
         self.lut_applied = None;
         let Some(name) = &self.lut else { return Ok(()) };
         let path = crate::lut::find(name).with_context(|| format!("the LUT \"{name}\" isn't in the LUT library (or isn't there as a file)"))?;
-        let id = crate::lut::shared(&path)?;
-        self.lut_applied = Some(crate::lut::Applied { id, strength: self.lut_strength.clamp(0.0, 1.0) as f32 });
+        self.lut_applied = Some(crate::lut::shared(&path)?);
         Ok(())
     }
 
@@ -410,6 +403,14 @@ impl Project {
             }
             if let Some(lut) = cut.lut.as_mut().filter(|l| crate::lut::is_file(l)) {
                 *lut = dir.join(&*lut).to_string_lossy().into_owned();
+            }
+            if let Some(strength) = cut.old_lut_strength.take().filter(|s| *s != 1.0) {
+                if cut.effects.is_empty() {
+                    cut.effects.push(crate::grade::EffectKey { t: cut.start, grade: Default::default(), ease: Default::default() });
+                }
+                for key in &mut cut.effects {
+                    key.grade.lut = strength.clamp(0.0, 1.0);
+                }
             }
         }
         for (n, clip) in project.music.clips.iter_mut().enumerate() {
@@ -561,6 +562,28 @@ mod tests {
         assert_eq!(Project::load(&saved).unwrap(), p);
         std::fs::write(&path, r#"{"cuts": [{"input": "a.OSV", "in": 5, "out": 2}]}"#).unwrap();
         assert!(Project::load(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A project saved while the LUT's strength was the cut's own opens,
+    /// the strength moved into its effects; it isn't written back.
+    #[test]
+    fn old_lut_strength_becomes_an_effect() {
+        let dir = std::env::temp_dir().join(format!("rosmo360-lut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edit.json");
+        std::fs::write(
+            &path,
+            r#"{"cuts": [{"input": "a.OSV", "in": 2, "out": 5, "lut": "x", "lut_strength": 0.84},
+                         {"input": "a.OSV", "in": 6, "out": 9, "lut": "x", "lut_strength": 0.5, "effects": [{"t": 7, "exposure": 1}, {"t": 8}]}]}"#,
+        )
+        .unwrap();
+        let p = Project::load(&path).unwrap();
+        assert_eq!(p.cuts[0].effects.iter().map(|k| (k.t, k.grade.lut)).collect::<Vec<_>>(), [(2.0, 0.84)]);
+        assert_eq!(p.cuts[1].effects.iter().map(|k| (k.grade.exposure, k.grade.lut)).collect::<Vec<_>>(), [(1.0, 0.5), (0.0, 0.5)]);
+        p.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("lut_strength") && text.contains(r#""lut": 0.84"#));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

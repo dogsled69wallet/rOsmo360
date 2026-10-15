@@ -48,9 +48,8 @@ pub enum EffectMsg {
     Jump(usize, f64),
     /// Cut `cut`'s effect keyframe `key` dragged to clip time `t`.
     KeyMove(usize, usize, f64),
-    /// The cut's LUT, and how much of it.
+    /// The cut's LUT (how much of it is effect `LUT`, keyframed).
     Lut(LutChoice),
-    LutStrength(f64),
 }
 
 /// A LUT in a list: none, or a library name (or a file a project names).
@@ -97,6 +96,10 @@ const PARAMS: [(&str, f64, f64, &str); 10] = [
     ("Vignette", 0.0, 1.0, "Darker corners"),
     ("Opacity", 0.0, 1.0, "How much of the picture shows; on the main track it fades towards black"),
 ];
+
+/// The LUT's strength among `Grade::values` (after `PARAMS`), drawn
+/// beside the LUT picker.
+const LUT: usize = 10;
 
 /// The panel's width.
 const WIDTH: f32 = 300.0;
@@ -253,15 +256,6 @@ impl App {
                 cut.lut = choice.name();
                 if let Err(e) = cut.resolve_lut() {
                     self.error = Some(format!("{e:#}"));
-                }
-            }
-            EffectMsg::LutStrength(v) => {
-                let Some((Target::Cut(i), _)) = target else { return };
-                self.begin_drag();
-                let cut = &mut self.edit.cuts[i];
-                cut.lut_strength = v;
-                if let Some(a) = &mut cut.lut_applied {
-                    a.strength = v as f32;
                 }
             }
             EffectMsg::TextEdit(action) => {
@@ -497,9 +491,9 @@ impl App {
         });
     }
 
-    /// Cut `i`'s LUT and its strength: before the effects, which act on
-    /// what it gives.
-    fn lut_controls(&self, i: usize) -> Element<'_, Message> {
+    /// Cut `i`'s LUT, and its strength in `grade` (the effects at the
+    /// playhead): the LUT acts before the effects, which act on what it gives.
+    fn lut_controls(&self, i: usize, grade: &Grade) -> Element<'_, Message> {
         let cut = &self.edit.cuts[i];
         let mut choices = vec![LutChoice::None];
         choices.extend(self.luts.iter().map(|n| LutChoice::Named(n.clone())));
@@ -519,13 +513,16 @@ impl App {
         ]
         .spacing(4);
         if cut.lut.is_some() {
+            // An effect like the others, keyed at the playhead as it moves.
+            let v = grade.lut;
+            let reset = button(text("↺").size(13)).padding([0, 5]).style(button::text).on_press_maybe((v != 1.0).then(|| Message::Effect(EffectMsg::Reset(Some(LUT)))));
             col = col.push(tip(
                 column![
-                    row![text("Strength").width(Length::Fill), text(format!("{:.0} %", cut.lut_strength * 100.0)).size(13)],
-                    slider(0.0..=1.0, cut.lut_strength, |v| Message::Effect(EffectMsg::LutStrength(v))).step(0.01).on_release(Message::Effect(EffectMsg::Done)),
+                    row![text("Strength").width(Length::Fill), text(format!("{:.0} %", v * 100.0)).size(13), reset].spacing(4).align_y(Alignment::Center),
+                    slider(0.0..=1.0, v, |v| Message::Effect(EffectMsg::Set(LUT, v))).step(0.01).on_release(Message::Effect(EffectMsg::Done)),
                 ]
                 .spacing(2),
-                text("How much of the LUT: 100 % is all of it, less mixes in the picture as filmed"),
+                text("How much of the LUT: 100 % is all of it, less mixes in the picture as filmed. Keyframed with the effects, so it can fade in or out"),
                 tooltip::Position::Left,
             ));
         }
@@ -628,7 +625,7 @@ impl App {
         let close = tip(button(text("✕").size(14)).padding([0, 6]).style(button::text).on_press(m(EffectMsg::Toggle)), text("Close (G)"), tooltip::Position::Bottom);
         let mut body = column![row![text("Effects").size(18).width(Length::Fill), close].align_y(Alignment::Center), text(cut_name).size(13)].spacing(10).padding(12);
         if let Some((Target::Cut(i), _)) = target {
-            body = body.push(self.lut_controls(i));
+            body = body.push(self.lut_controls(i, &grade));
         }
         let body = body.extend([column![
             sliders,

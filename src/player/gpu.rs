@@ -477,15 +477,15 @@ impl Pipeline {
         u.misc = [steps as f32, srgb as u8 as f32, origin[0], origin[1]];
         u.lenses = l.lens_u;
         u.grade = camera.grade.uniforms();
-        if let Some(applied) = camera.lut {
-            let lut = crate::lut::get(applied.id);
-            if l.lut_id != Some(applied.id) {
+        if let Some(id) = camera.lut {
+            let lut = crate::lut::get(id);
+            if l.lut_id != Some(id) {
                 l.lut = upload_lut(device, queue, &lut);
-                l.lut_id = Some(applied.id);
+                l.lut_id = Some(id);
                 l.bind_group = bind(device, layout, &l.uniforms, sampler, &l.slots, &l.deep, &l.masks, &l.lut);
             }
             let (lo, hi) = lut.domain;
-            u.lut = [[1.0, applied.strength, lut.size as f32, 0.0], [lo[0], lo[1], lo[2], 0.0], [hi[0], hi[1], hi[2], 0.0]];
+            u.lut = [[1.0, camera.grade.lut.clamp(0.0, 1.0) as f32, lut.size as f32, 0.0], [lo[0], lo[1], lo[2], 0.0], [hi[0], hi[1], hi[2], 0.0]];
         }
         if rig.flat
             && let Some(p) = shown.frame.pictures.first()
