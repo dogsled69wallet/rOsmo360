@@ -218,6 +218,8 @@ pub struct Flat {
     pub hdr: Hdr,
     /// Full-range samples (0-255, `yuvj420p`, as Nikon cameras write).
     pub full_range: bool,
+    /// Tagged with BT.601's matrix (SD video, some cameras).
+    pub bt601: bool,
 }
 
 impl Flat {
@@ -228,7 +230,7 @@ impl Flat {
 
     /// Decoded upright, at `size` (upright) if given.
     pub fn out(&self, size: Option<(u32, u32)>, rate: Option<f64>) -> Out {
-        Out { size, turns: Some(self.turns), rate, picture: self.picture, hdr: self.hdr, full_range: self.full_range }
+        Out { size, turns: Some(self.turns), rate, picture: self.picture, hdr: self.hdr, full_range: self.full_range, bt601: self.bt601 }
     }
 }
 
@@ -259,11 +261,13 @@ pub fn flat(input: &Path) -> Result<Option<Flat>> {
     let rotation = probe(input, &format!("v:{track}"), "stream_side_data=rotation")?.lines().next().and_then(|r| r.trim().parse::<f64>().ok()).unwrap_or(0.0);
     let turns = ((-rotation / 90.0).round() as i64).rem_euclid(4) as u8;
     let picture = is_picture(&probe_format(input)?);
-    let colour = probe(input, &format!("v:{track}"), "stream=pix_fmt,color_range,color_transfer")?;
+    // ffprobe gives them in its own order: format, range, matrix, transfer.
+    let colour = probe(input, &format!("v:{track}"), "stream=pix_fmt,color_range,color_space,color_transfer")?;
     let colour: Vec<&str> = colour.lines().next().unwrap_or("").split(',').collect();
-    let hdr = Hdr::from_transfer(colour.get(2).unwrap_or(&""));
+    let hdr = Hdr::from_transfer(colour.get(3).unwrap_or(&""));
     let full_range = colour.first().is_some_and(|f| f.starts_with("yuvj")) || colour.get(1) == Some(&"pc");
-    Ok(Some(Flat { track, stored, turns, picture, hdr, full_range }))
+    let bt601 = matches!(colour.get(2), Some(&"smpte170m" | &"bt470bg"));
+    Ok(Some(Flat { track, stored, turns, picture, hdr, full_range, bt601 }))
 }
 
 /// How a decode delivers frames, beyond the track as stored.
@@ -290,6 +294,9 @@ pub struct Out {
     /// Nikon's 0-255 came out crushed and dark (the user's DSC_0412,
     /// 2026-10-14). RGB decodes convert by the stream's own tag already.
     pub full_range: bool,
+    /// A BT.601 video: NV12 and P010 are converted to BT.709's matrix
+    /// (`yuv_filters`), the only one the shader reads.
+    pub bt601: bool,
 }
 
 impl Out {
@@ -339,10 +346,26 @@ impl Out {
         }
     }
 
-    /// For an NV12 or P010 decode: full range brought to video range.
+    /// For an NV12 or P010 decode: full range brought to video range, and
+    /// a picture (RGBA by now) or a BT.601 video given BT.709's matrix.
+    /// swscale's default for both is BT.601, which the shader read as 709:
+    /// colour bars' green 210 came out 190 with red's 15 at 0 (in the player
+    /// and GPU export only; the CPU's RGB decode was right). ffmpeg 4.4
+    /// (Ubuntu 22.04's) converts YUV to YUV by these options as 9.0 does.
     fn yuv_filters(&self, filters: &mut Vec<String>) {
+        let mut opts = Vec::new();
         if self.full_range {
-            filters.push("scale=in_range=pc:out_range=tv".to_owned());
+            opts.push("in_range=pc");
+        }
+        if self.bt601 && !self.picture {
+            opts.push("in_color_matrix=bt601");
+        }
+        if self.bt601 || self.picture {
+            opts.push("out_color_matrix=bt709");
+        }
+        if !opts.is_empty() {
+            opts.push("out_range=tv");
+            filters.push(format!("scale={}", opts.join(":")));
         }
     }
 
