@@ -31,6 +31,7 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Smooth playback** from the low-resolution proxy (`.LRF`), switching to the full-resolution frame when paused. On a fast GPU, or an Apple Silicon Mac, it can stream the full-resolution `.OSV` directly.
 - **Hardware decoding** on any GPU vendor: Vulkan Video, VA-API or CUDA on Linux, VideoToolbox on a Mac, with a software fallback.
 - **10-bit decoding** (a setting) keeps the Osmo's full 10 bits, for smoother skies and room to grade.
+- **D-Log M** recognised from the clip itself (DJI tags it as ordinary BT.709) and turned into normal colours with DJI's LUT, added once to a **LUT library**; any `.cube` LUT works, per cut.
 - **Sound**, in sync with the picture, with mute and volume in an Audio panel, and an **audio meter** of the mix (peak and RMS per channel, red past 0 dBFS, the loudest peak held), as the export will mix it.
 - **Save photos** of a paused frame: the view as framed, at 3840 px on the long side, or the whole 360° sphere at 7680 × 3840.
 - **Aspect lock** (16:9, 9:16, 4:3, 1:1, 2:1) for framing shots; saved views and exports take the same shape.
@@ -48,11 +49,11 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - **Crossfades** between cuts, picture and sound: overlap two cuts and the first dissolves into the second. Select a cut in the overlap to frame it on its own.
 - **Music**: songs on a lane of their own under the edit, to move, trim, split and crossfade; it fades out by itself where the video ends. A project can start from a song.
 - **Sound levels**: one slider for the clips' sound and one for the music, plus volume points over time on the music and on each cut's own sound, to dip the music under talk or tame the wind.
-- **Colour effects**, keyframed per cut: exposure, contrast, highlights and shadows, temperature and tint (with a white-balance eyedropper), saturation, vibrance, a vignette and opacity, in a side panel. Plus fades from and to black for the whole edit.
+- **Colour effects**, keyframed per cut: exposure (brightening rolls highlights off instead of burning them out), contrast, highlights and shadows, temperature and tint (with a white-balance eyedropper), saturation, vibrance, a vignette and opacity, in a side panel, after the cut's LUT and its strength (keyframed too, so a LUT can fade in). Plus fades from and to black for the whole edit.
 - **Titles and overlays**: a text track and an overlay track above the picture, for titles, captions and logos (PNGs keep their transparency). Text is typed in a panel of its own, with six built-in fonts that look the same on every computer (and your system's), size, colour, alignment, a shadow and an outline. Drag, size and turn items right on the view; their place, effects and opacity are keyframed, so a title can drift and fade.
 - **Projects**: save the edit and open it again later, framed as you left it. A cut can carry a short note, shown on the timeline.
 - **Export** the edit to MP4 with its sound, from 720p to 4K, in the aspect lock's shape, dithered so skies don't band. It renders on the GPU, about four times faster than the CPU (21 frames a second at 1080p on an RTX 3090).
-- **Export for another editor**: a file per cut (`My hike - 001.mp4`, `- 002` …) with the music beside them as WAVs, graded or as shot, and a DaVinci Resolve format (10-bit DNxHR HQX with PCM sound in `.mov`) that Resolve's free Linux version can read.
+- **Export for another editor**: a file per cut (`My hike - 001.mp4`, `- 002` …) with the music beside them as WAVs, graded or as shot (D-Log M left in log), and a DaVinci Resolve format (10-bit DNxHR HQX with PCM sound in `.mov`) that Resolve's free Linux version can read.
 
 ### Command line
 
@@ -145,13 +146,14 @@ In the player:
 | Move / trim / split / delete a song | Drag it (it snaps edge to edge) / drag its edges / C / Delete, with it selected; Shift-drag onto another song to crossfade them |
 | Mix levels | **Clip sound** and **Music** in the Audio panel (the speaker) |
 | Volume points | Ctrl+click on the music lane or on a cut; drag them up/down and sideways, Delete removes; K adds one at the playhead with a song or point selected |
-| Colour effects and fades | G, or the sliders button: the Effects panel (sliders keyframe the cut's look at the playhead, opacity included; white-balance eyedropper; to all cuts; fades in/out) |
+| Colour effects and fades | G, or the sliders button: the Effects panel (the cut's LUT and its strength; sliders keyframe the cut's look at the playhead, opacity and LUT strength included; white-balance eyedropper; to all cuts; fades in/out) |
+| LUTs | Settings (the cog, Ctrl+,): the LUT library (Add LUT…, ✕ to take one out) and the LUT clips filmed in D-Log M get when added |
 | Add a title / a logo or picture | The T with a plus (the Text panel opens at the left) / the picture with a plus; both go in at the playhead, 5 s long |
 | Place a title or picture | Paused, select it (on the view or its timeline block), then drag it, a corner to size it, the knob to turn it (Shift: 15° steps); or Across, Down, Size and Rotation in the Effects panel. Each change sets a motion keyframe at the playhead |
 | Move / trim / delete a title or picture | Drag its block / its edges on the Text or Overlay lane / Delete |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z |
 | Save / open / new project | Ctrl+S (Ctrl+Shift+S: save as) / Ctrl+Shift+O / Ctrl+N |
-| Export the edit | The export button, an arrow out of a tray, or Ctrl+E: the Export panel, with the resolution (720p–2160p), the format (MP4, or 10-bit DNxHR HQX and PCM in `.mov`, which DaVinci Resolve's free Linux version can read) and **A file per cut** ("project - 001" and on, the music as WAVs, for another editor; **Graded** gives them their effects); the aspect lock sets the shape, 16:9 when free |
+| Export the edit | The export button, an arrow out of a tray, or Ctrl+E: the Export panel, with the resolution (720p–2160p), the format (MP4, or 10-bit DNxHR HQX and PCM in `.mov`, which DaVinci Resolve's free Linux version can read) and **A file per cut** ("project - 001" and on, the music as WAVs, for another editor; **Graded** gives them their LUTs and effects); the aspect lock sets the shape, 16:9 when free |
 
 A project saves the cuts with their keyframes, crossfades, effects and volume points, the music, the levels, the titles and overlays, the fades and the aspect lock, in the same file `rosmo360 export` renders (see below). Clips in the project's folder are stored by relative path, so the folder can be moved as a whole.
 
@@ -205,7 +207,8 @@ A cut may also have:
 
 - `crossfade`: seconds it overlaps the cut before, dissolving in from it (the edit is that much shorter);
 - `volume`: its own sound's level over time, `[{"t": 12, "volume": -10}, …]` in clip time and dB, straight lines between points;
-- `effects`: colour keyframes in clip time, each holding the whole look (fields left out are 0, opacity 1): `exposure` (stops, −3…3), `contrast`, `highlights`, `shadows`, `temperature`, `tint`, `saturation`, `vibrance` (−1…1), `vignette` (0…1), `opacity` (0…1, the rest black), and `ease`.
+- `effects`: colour keyframes in clip time, each holding the whole look (fields left out are 0, opacity and lut 1): `exposure` (stops, −3…3), `contrast`, `highlights`, `shadows`, `temperature`, `tint`, `saturation`, `vibrance` (−1…1), `vignette` (0…1), `opacity` (0…1, the rest black), `lut` (how much of the cut's LUT, 0…1), and `ease`;
+- `lut`: a LUT applied before the effects: the name of one in the player's LUT library (`"DJI Osmo 360 D-Log M to Rec.709 V1"`, kept in rOsmo360's settings folder under `luts/`), or a `.cube` file, relative to the project. A missing one leaves the cut as filmed, with a warning.
 
 On an ordinary video or a picture there's no sphere: a keyframe pans and zooms within the picture. `fov` 90 shows its whole height (and is where a cut without keyframes stays), 45 is a 2× zoom, and 90° of `yaw` or `pitch` moves the view one picture height.
 
@@ -217,7 +220,9 @@ And the edit as a whole: `sound` (the clips' level in dB), `fades` (seconds from
     {"input": "CAM_0037.OSV", "in": 28, "out": 34,
      "effects": [{"t": 28, "exposure": 0.2, "highlights": -0.3, "vibrance": 0.2}]},
     {"input": "CAM_0043.OSV", "in": 5, "out": 12, "crossfade": 1,
-     "volume": [{"t": 8, "volume": 0}, {"t": 9, "volume": -12}]}
+     "volume": [{"t": 8, "volume": 0}, {"t": 9, "volume": -12}]},
+    {"input": "CAM_0046.OSV", "in": 3, "out": 10, "lut": "DJI Osmo 360 D-Log M to Rec.709 V1",
+     "effects": [{"t": 3, "lut": 0}, {"t": 5}]}
   ],
   "sound": {"volume": -6},
   "fades": {"in": 1, "out": 2},
@@ -254,7 +259,7 @@ An item shows from `at` in the edit for `out − in` seconds. Its `motion` keyfr
 ```sh
 rosmo360 export edit.json -o edit.mp4
 rosmo360 export edit.json --clips --handles 1 -o clips/      # a file per cut: "edit - 001.mp4", … with 1 s extra either side, the music as WAVs
-rosmo360 export edit.json --clips --graded -o clips/         # the same, with the cuts' colour effects
+rosmo360 export edit.json --clips --graded -o clips/         # the same, with the cuts' LUTs and colour effects
 rosmo360 export edit.json --format resolve -o edit.mov       # 10-bit DNxHR HQX + PCM, for DaVinci Resolve on Linux
 ```
 
@@ -279,7 +284,7 @@ The CSV has, every 0.1 s, the subject's direction in the camera, its yaw and pit
 Skimming a clip:
 
 ```sh
-rosmo360 info clip.OSV                      # length, frame rate, recording time and kind (osv, video, picture), as JSON
+rosmo360 info clip.OSV                      # length, frame rate, recording time, kind (osv, video, picture) and colour (normal, D-Log M), as JSON
 rosmo360 preview clip.OSV -o sheet.png      # 24 moments on one contact sheet, marked with time and yaw
 rosmo360 preview clip.OSV --reframe moves.json -o check.png   # the framing at each keyframe
 rosmo360 preview edit.json -o check.png      # a project: a row per cut, framed as the export (--every N for more)
@@ -303,7 +308,7 @@ Clips' telemetry and thumbnails, and songs' waveforms, are cached in `~/.cache/r
 - 360° metadata on equirectangular exports, so YouTube and VR players show them as 360° video.
 - Smooth full-resolution playback on modest hardware, and faster 10-bit exports (zero-copy decoding).
 - Windows builds, and a signed macOS download.
-- D-Log M colour support.
+- LUTs chosen by camera for ordinary videos (a DJI Action's or a phone's log).
 
 ## License
 

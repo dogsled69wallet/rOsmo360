@@ -1,6 +1,6 @@
 # rOsmo360 user guide
 
-rOsmo360 plays and edits 360° video from the **DJI Osmo 360**. It reads the camera's `.OSV` files directly, stitches the two lenses, keeps the horizon level, and lets you look around, cut clips together, move the camera's view with keyframes, add crossfades, music, colour effects, titles and logos, and export a finished video. Ordinary videos (from a phone, a drone or an action camera) and photos go in the same edit.
+rOsmo360 plays and edits 360° video from the **DJI Osmo 360**. It reads the camera's `.OSV` files directly, stitches the two lenses, keeps the horizon level, and lets you look around, cut clips together, move the camera's view with keyframes, add crossfades, music, colour effects, titles and logos, and export a finished video. Footage filmed in D-Log M is recognised and turned into normal colours with DJI's LUT. Ordinary videos (from a phone, a drone or an action camera) and photos go in the same edit.
 
 Part 1 walks through the app itself; everything there is done with the mouse and keyboard. Part 2 covers the command line, for batches, scripts and a few extra tools. For building rOsmo360 from source, see the [README](../README.md).
 
@@ -341,7 +341,7 @@ Click **Effects** (three sliders) in the transport row, or press **G**, to open 
 
 | Effect | What it does |
 |---|---|
-| **Exposure** | Brighter or darker, in stops, like the camera's EV |
+| **Exposure** | Brighter or darker, in stops, like the camera's EV. Brightening rolls the highlights off gently instead of burning them out, so a sky keeps its colour |
 | **Contrast** | More or less contrast, around mid-grey |
 | **Highlights** | Pull back (−) or lift the bright parts, such as a bright sky |
 | **Shadows** | Lift (+) or deepen the dark parts |
@@ -370,7 +370,24 @@ More in the panel:
 
 **Opacity** fades a cut out and in within the edit: ease it from 100% to 0% over a second for a fade to black between two cuts, or use it on a title or logo to fade it in and out. For the edit's own start and end, use the fades.
 
-Effects apply to the framed picture after stitching, so what you see in the player is what the export gives, and a crossfade blends two graded cuts. Press **G** again, or click the Effects icon, to close the panel.
+Effects apply to the framed picture after stitching, so what you see in the player is what the export gives, and a crossfade blends two graded cuts. Press **G** again, click the Effects icon, or click the **✕** at the top of the panel to close it.
+
+### LUTs and D-Log M
+
+A LUT (a `.cube` file) turns the picture's colours into others. Its main use here is **D-Log M**, the Osmo 360's flat colour profile, which keeps more of the bright and dark parts but looks grey and washed out until it's converted. DJI's **Osmo 360 D-Log M to Rec.709 LUT** turns it into normal colours; get it from the DJI Download Center (search for "Osmo 360 D-Log M"). Any other `.cube` LUT works too, such as a creative look.
+
+1. Add the LUT once, in **Settings → LUTs → Add LUT…** (see [Settings](#16-settings)). rOsmo360 copies it into its own settings folder, so your projects keep working if the download is moved or deleted.
+2. If its name mentions D-Log M, it becomes the LUT for D-Log M clips, and the D-Log M cuts already in your edit get it too.
+3. From then on, every clip filmed in D-Log M gets it as soon as you add it. rOsmo360 knows from the clip itself whether it was filmed in D-Log M.
+
+At the top of the Effects panel, for the cut under the playhead:
+
+- **LUT** picks the cut's LUT, or **None**. "filmed in D-Log M" shows beside it for such clips.
+- **Strength** sets how much of it applies: 100 % is all of it, less mixes in the picture as filmed. It's keyframed with the other effects, so a LUT can fade in over a cut, from the flat log picture to full colour.
+
+The LUT applies first and the effects after it, so exposure, white balance and the rest work on the converted colours, as on any other clip. If a project names a LUT this computer doesn't have, the project still opens: those cuts show as filmed, and the player says which LUT is missing. Add it in Settings under the same name and they get it back.
+
+You don't need the **10-bit** setting for D-Log M: the camera always records 10 bits, and on test footage the converted picture came out as smooth decoded at 8 bits. Turn it on for a final export if a clean sky shows bands.
 
 ## 11. Titles and overlays
 
@@ -456,7 +473,7 @@ The export renders the whole edit at full resolution, with the sound joined acro
 
 Exports render on the GPU. On an RTX 3090 that's about 21 frames a second at 1080p, so a one-minute edit takes about a minute and a half. You can keep using the player while it runs. An MP4's colours are rounded to 8 bits at the very end with a touch of fine grain (dithering), so smooth skies don't break into bands; the Resolve format keeps 10 bits instead.
 
-**A file per cut** (Clips) is for finishing the edit elsewhere. Export then asks for a folder, and the files are named after the project: `My hike - 001.mp4`, `My hike - 002.mp4` and so on, in timeline order. Each piece of music is written beside them as `My hike - music 001.wav` and on (48 kHz, 24-bit). The clips are left for the other editor to finish: no crossfades, fades, sound levels, titles or overlays, and the music unfaded at its own level. **Graded** appears under it: tick it to give the clips their effects, or leave it off to have them as shot, to grade in the other editor. With the DaVinci Resolve format you get one `.mov` per cut, ready to drop into Resolve.
+**A file per cut** (Clips) is for finishing the edit elsewhere. Export then asks for a folder, and the files are named after the project: `My hike - 001.mp4`, `My hike - 002.mp4` and so on, in timeline order. Each piece of music is written beside them as `My hike - music 001.wav` and on (48 kHz, 24-bit). The clips are left for the other editor to finish: no crossfades, fades, sound levels, titles or overlays, and the music unfaded at its own level. **Graded** appears under it: tick it to give the clips their LUTs and effects, or leave it off to have them as shot, to grade in the other editor (D-Log M stays log, for your own LUT there). With the DaVinci Resolve format you get one `.mov` per cut, ready to drop into Resolve.
 
 ## 15. Saving photos
 
@@ -475,6 +492,7 @@ Click the **cog** at the far left of the top bar, or press **Ctrl+,**, for the *
 
 - **Look**: the colour theme. rOsmo360 starts in **Kanagawa Dragon**, a dark theme that keeps the picture in front; the list has light and dark themes such as Nord, Dracula, Gruvbox, Catppuccin and Tokyo Night, and the change shows at once.
 - **Decoding → 10-bit**: decodes the Osmo's `.OSV` and other 10-bit video (a phone's HDR) with all its 10 bits instead of 8. Skies and smooth gradients stay smoother, most of all after strong grading, in the player's full-resolution frames and in exports. It moves twice the data, so a full-resolution export takes about a third longer on a PC; playing from the `.LRF` proxy isn't affected. Off by default; it applies from the next seek or clip.
+- **LUTs**: the LUT library. **Add LUT…** adds a `.cube` file, the **✕** beside one takes it out, and **For D-Log M clips** chooses the one clips filmed in D-Log M get when they're added. See [LUTs and D-Log M](#luts-and-d-log-m).
 - **Keyframes → Auto keyframe**: looking around while paused sets the view's keyframe at the playhead, or updates the one there, as **K** does, so every framing you settle on is kept. Each look-around (from pressing the mouse to letting go) is one undo step. While playing, looking around stays free, as without it. Off by default.
 
 The ✕ at the top closes the panel.
@@ -530,9 +548,11 @@ Keys only work while you're not typing: in the Text panel's box, the keys type.
 - **Export says it's stitching on the CPU.** No usable GPU was found, so it falls back to the slower CPU stitcher. Update your GPU drivers. The result looks the same.
 - **The meter goes red.** The mix goes over 0 dBFS there and the export's sound would clip. Lower **Clip sound** or **Music**, or add a volume point to dip the loud stretch.
 - **A title shows in another font than you chose.** The project uses a font this computer doesn't have; rOsmo360 says which, and uses Inter. Pick one of the built-in fonts to have it look the same everywhere.
+- **An Osmo clip looks flat and grey.** It was filmed in D-Log M. Add DJI's D-Log M to Rec.709 LUT in Settings; see [LUTs and D-Log M](#luts-and-d-log-m).
+- **A cut shows as filmed and the player says a LUT is missing.** The project names a LUT this computer's library doesn't have, such as one added on another machine. Add the same `.cube` file in Settings; keep its file name, as that's the LUT's name.
 - **A phone video looks washed out.** rOsmo360 converts HDR (HLG and HDR10) by itself; if a video still looks flat, it may lack the HDR tags its colours need. Exposure, contrast and saturation in the Effects panel can lift it.
 - **Full-resolution playback stutters with 10-bit on.** Turn **10-bit** off in Settings, or play from the proxy; exports aren't affected either way.
-- **Your settings** (stabilisation, playback source, rolling shutter, full res when paused, volume and mute, the export's options, aspect, theme, 10-bit and Auto keyframe) are remembered between runs.
+- **Your settings** (stabilisation, playback source, rolling shutter, full res when paused, volume and mute, the export's options, aspect, theme, 10-bit, Auto keyframe and the LUT for D-Log M clips) are remembered between runs, and your LUTs stay in the library.
 
 ---
 
@@ -559,7 +579,7 @@ rosmo360 export clip.OSV -s 30 -d 8 --view 40,-10 -a 9:16 -o reel.mp4
 rosmo360 export clip.OSV --reframe moves.json -r 2160p -o reel.mp4
 rosmo360 export edit.json --draft -o draft.mp4                # quick and soft, from the proxies
 rosmo360 export edit.json --clips --handles 1 -o clips/        # a file per cut, with 1 s extra either side
-rosmo360 export edit.json --clips --graded -o clips/           # the same, with the cuts' colour effects
+rosmo360 export edit.json --clips --graded -o clips/           # the same, with the cuts' LUTs and colour effects
 rosmo360 export edit.json --format resolve -o edit.mov         # 10-bit DNxHR HQX, for DaVinci Resolve on Linux
 ```
 
@@ -593,7 +613,7 @@ rosmo360 track clip.OSV --colour "#c8302a" -s 40 -d 20 > friend.csv
 
 Then give a keyframe `"follow": "friend.csv"` in the project file. Read the colour off a preview or a saved photo. If something else nearby has the same colour, add `--near YAW,PITCH` with where the subject is at the start, as shown on a `--stabilize level` preview.
 
-**Find good moments**: `rosmo360 scan clip.OSV > scan.csv` gives, per second, where the camera points, how fast it turns or shakes, and how loud it is. Give it a folder (or several clips) and an output folder, `rosmo360 scan ~/Videos/Hike -o scans/`, for a CSV per clip, four at a time. Add `--image` for three columns from the picture: how much of the sky is open (`sky`), how high the skyline is around you (`skyline`, in degrees: near 0 on a summit, higher in a valley) and in how many directions you can see out to the horizon (`open`). Sort by `open` to find the panoramas. It needs the `.LRF` proxy and takes a little longer: about 20 s for a 13-minute clip. `rosmo360 info clip.OSV` prints the clip's length, frame rate and recording time, and whether it's an Osmo clip, an ordinary video or a picture. `scan`, `track` and the other commands that need the camera's motion data work only on Osmo clips.
+**Find good moments**: `rosmo360 scan clip.OSV > scan.csv` gives, per second, where the camera points, how fast it turns or shakes, and how loud it is. Give it a folder (or several clips) and an output folder, `rosmo360 scan ~/Videos/Hike -o scans/`, for a CSV per clip, four at a time. Add `--image` for three columns from the picture: how much of the sky is open (`sky`), how high the skyline is around you (`skyline`, in degrees: near 0 on a summit, higher in a valley) and in how many directions you can see out to the horizon (`open`). Sort by `open` to find the panoramas. It needs the `.LRF` proxy and takes a little longer: about 20 s for a 13-minute clip. `rosmo360 info clip.OSV` prints the clip's length, frame rate and recording time, whether it's an Osmo clip, an ordinary video or a picture, and for an Osmo clip its colour profile (`"colour": "D-Log M"` or `"normal"`). `scan`, `track` and the other commands that need the camera's motion data work only on Osmo clips.
 
 **Stitch** whole clips or frames to equirectangular video or images, for other 360° tools:
 
@@ -602,7 +622,7 @@ rosmo360 render clip.OSV -s 48 -d 12 -w 3840 --stabilize horizon -o out.mp4
 rosmo360 stitch clip.OSV -t 10 -w 4096 --stabilize horizon -o frame.png
 ```
 
-Projects are small JSON files you can also write or change by hand; the [README](../README.md#usage) describes the project and reframe formats, including cut notes (`"note": "summit arrival"`), per-cut stabilisation, following keyframes, crossfades, effects, volume points, music, titles, overlays and fades.
+Projects are small JSON files you can also write or change by hand; the [README](../README.md#usage) describes the project and reframe formats, including cut notes (`"note": "summit arrival"`), per-cut stabilisation, following keyframes, crossfades, effects, LUTs, volume points, music, titles, overlays and fades.
 
 ## 20. The clip cache
 
