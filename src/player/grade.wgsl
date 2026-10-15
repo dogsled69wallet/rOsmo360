@@ -1,12 +1,23 @@
 // Shared by the stitch (shader.wgsl) and the overlays (overlay.wgsl), each
 // source having this appended: `Grade::uniforms`' three rows in g0..g2.
 
+// Mirrors `grade::shoulder`: brightened light rolled off above the knee
+// so the source's white lands on white instead of clipping early.
+fn shoulder(x: vec3f, gain: vec3f) -> vec3f {
+    let k = 0.4;
+    let a = 1.0 / (1.0 - k) - 1.0 / max(gain - vec3f(k), vec3f(1e-6));
+    let t = x - vec3f(k);
+    let rolled = vec3f(k) + t / (vec3f(1.0) + a * t);
+    return select(x, rolled, gain > vec3f(1.0) & x > vec3f(k));
+}
+
 // Mirrors `Grade::apply` in grade.rs: exposure and white balance on light,
 // tone and colour on display values, then the vignette, opacity and fade.
 fn grade_by(g0: vec4f, g1: vec4f, g2: vec4f, rgb: vec3f, at: vec2f, aspect: f32) -> vec3f {
     let luma = vec3f(0.2126, 0.7152, 0.0722);
     let wb = vec3f(exp2(g0.y), exp2(-g0.z), exp2(-g0.y));
-    var c = pow(pow(max(rgb, vec3f(0.0)), vec3f(2.2)) * g0.x * wb, vec3f(1.0 / 2.2));
+    let gain = g0.x * wb;
+    var c = pow(shoulder(pow(max(rgb, vec3f(0.0)), vec3f(2.2)) * gain, gain), vec3f(1.0 / 2.2));
     var l = dot(c, luma);
     let x = clamp(l / 0.6, 0.0, 1.0);
     let lift = 0.25 * (g1.y * 6.75 * x * (1.0 - x) * (1.0 - x) + g1.x * smoothstep(0.4, 1.0, l));

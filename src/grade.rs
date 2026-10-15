@@ -99,7 +99,7 @@ impl Grade {
         let wb = [2f64.powf(WB_STOPS * self.temperature), 2f64.powf(-WB_STOPS * self.tint), 2f64.powf(-WB_STOPS * self.temperature)];
         let mut c = [0.0; 3];
         for i in 0..3 {
-            c[i] = (rgb[i].max(0.0).powf(2.2) * gain * wb[i]).powf(1.0 / 2.2);
+            c[i] = shoulder(rgb[i].max(0.0).powf(2.2) * gain * wb[i], gain * wb[i]).powf(1.0 / 2.2);
         }
         // Tone: highlights and shadows move the brightness, keeping the hue.
         // Shadows works on a bump that is 0 at black (black stays black)
@@ -148,6 +148,25 @@ impl Grade {
             [f(self.vignette), f(self.black), if self.is_neutral() { 0.0 } else { 1.0 }, f(self.opacity)],
         ]
     }
+}
+
+/// Where brightening light starts to roll off, in linear light (about
+/// 0.66 displayed).
+const KNEE: f64 = 0.4;
+
+/// Linear light `x` brightened by `gain`, rolled off above `KNEE` so the
+/// source's white (now `gain`) lands on white instead of everything above
+/// 1/gain clipping: at +0.5 EV 23% of 0037's summit view had a channel
+/// burnt out (user, 2026-10-15: "it burns out highlights very quick").
+/// Below the knee, and for gains up to 1, it's the plain gain. The curve
+/// k + t/(1 + a·t) leaves the knee at slope 1 and meets white at `gain`.
+pub fn shoulder(x: f64, gain: f64) -> f64 {
+    if gain <= 1.0 || x <= KNEE {
+        return x;
+    }
+    let a = 1.0 / (1.0 - KNEE) - 1.0 / (gain - KNEE);
+    let t = x - KNEE;
+    KNEE + t / (1.0 + a * t)
 }
 
 /// The temperature and tint that make `rgb` (display-encoded, of something
@@ -200,6 +219,30 @@ pub fn grade_at(keys: &[EffectKey], t: f64) -> Grade {
 
 #[cfg(test)]
 mod tests {
+    /// Exposure up rolls the highlights off instead of clipping them, and
+    /// leaves everything else as the plain gain did.
+    #[test]
+    fn exposure_rolls_highlights_off() {
+        for gain in [0.5, 1.0] {
+            for x in [0.0, 0.3, 0.7, 1.0] {
+                assert_eq!(shoulder(x * gain, gain), x * gain);
+            }
+        }
+        for gain in [1.2, 2.0, 4.0] {
+            assert_eq!(shoulder(0.3, gain), 0.3);
+            assert!((shoulder(gain, gain) - 1.0).abs() < 1e-12, "white lands on white");
+            let mut last = 0.0;
+            for i in 0..=1000 {
+                let x = i as f64 / 1000.0 * gain;
+                let y = shoulder(x, gain);
+                assert!(y >= last && y <= 1.0 + 1e-12);
+                last = y;
+            }
+            // Smooth at the knee: no step in slope.
+            let (d, k) = (1e-6, KNEE);
+            assert!(((shoulder(k + d, gain) - shoulder(k, gain)) / d - 1.0).abs() < 1e-4);
+        }
+    }
 
     /// A dragged effect keyframe stops a frame short of its neighbours, so
     /// each keeps what it holds.
