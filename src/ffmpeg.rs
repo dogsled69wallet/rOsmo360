@@ -469,11 +469,15 @@ impl Hwaccel {
     /// GPU really decoded; ffmpeg's own fallback would hide a failure.
     ///
     /// Each probe takes 0.5-1 s, and every Osmo 360 clip's tracks are the
-    /// same (HEVC Main10, 3840²), so each decoder is probed once a run: an
-    /// export of several clips otherwise spent seconds probing.
+    /// same (HEVC Main10, 3840²), so each decoder is probed once a run per
+    /// kind of track (codec, profile, sampling, size): an export of several
+    /// clips otherwise spent seconds probing. Probed once for all, a 10-bit
+    /// 4:2:2 H.264 video (as Sony and Panasonic record) after an OSV was
+    /// given the OSV's decoder, which can't decode it: "no frames decoded".
     pub fn works(self, input: &Path, track: u32) -> Result<bool> {
-        static PROBED: std::sync::Mutex<Vec<(Hwaccel, bool)>> = std::sync::Mutex::new(Vec::new());
-        if let Some(&(_, ok)) = PROBED.lock().unwrap().iter().find(|(hw, _)| *hw == self) {
+        static PROBED: std::sync::Mutex<Vec<(Hwaccel, String, bool)>> = std::sync::Mutex::new(Vec::new());
+        let kind = probe(input, &format!("v:{track}"), "stream=codec_name,profile,pix_fmt,width,height")?;
+        if let Some(&(_, _, ok)) = PROBED.lock().unwrap().iter().find(|(hw, k, _)| *hw == self && *k == kind) {
             return Ok(ok);
         }
         let ok = nv12(input, track, 0.0, Out::default(), self)?
@@ -483,7 +487,7 @@ impl Hwaccel {
             .status()
             .context("running ffmpeg")?
             .success();
-        PROBED.lock().unwrap().push((self, ok));
+        PROBED.lock().unwrap().push((self, kind, ok));
         Ok(ok)
     }
 }
