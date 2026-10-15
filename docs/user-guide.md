@@ -374,11 +374,21 @@ Effects apply to the framed picture after stitching, so what you see in the play
 
 ### LUTs and D-Log M
 
-A LUT (a `.cube` file) turns the picture's colours into others. Its main use here is **D-Log M**, the Osmo 360's flat colour profile, which keeps more of the bright and dark parts but looks grey and washed out until it's converted. DJI's **Osmo 360 D-Log M to Rec.709 LUT** turns it into normal colours; get it from the DJI Download Center (search for "Osmo 360 D-Log M"). Any other `.cube` LUT works too, such as a creative look.
+A LUT (a `.cube` file) turns the picture's colours into others. Its main use here is **D-Log M**, the Osmo 360's flat colour profile, which keeps more of the bright and dark parts but looks grey and washed out until it's converted. DJI's **Osmo 360 D-Log M to Rec.709 LUT** turns it into normal colours. Any other `.cube` LUT works too, such as a creative look.
 
-1. Add the LUT once, in **Settings → LUTs → Add LUT…** (see [Settings](#16-settings)). rOsmo360 copies it into its own settings folder, so your projects keep working if the download is moved or deleted.
-2. If its name mentions D-Log M, it becomes the LUT for D-Log M clips, and the D-Log M cuts already in your edit get it too.
-3. From then on, every clip filmed in D-Log M gets it as soon as you add it. rOsmo360 knows from the clip itself whether it was filmed in D-Log M.
+#### Downloading and adding DJI's LUT
+
+You do this once on each computer. rOsmo360 doesn't come with the LUT, as it's DJI's file to hand out, but it's a free download.
+
+1. **Download it.** Open DJI's download page, [Osmo 360 D-Log M to Rec.709 LUT](https://www.dji.com/downloads/softwares/osmo-360-dlog-m-to-rec709-lut) (in the DJI Download Center, search for "Osmo 360 D-Log M" if the link has moved), and click **Download**. You get `DJI Osmo 360 D-Log M to Rec.709 V1.cube`, about 1 MB, usually in your Downloads folder. Make sure it's the **Osmo 360** one: DJI has D-Log M LUTs for its drones and other cameras too.
+2. **Add it.** In rOsmo360, open **Settings** (the cog at the far left of the top bar, or **Ctrl+,**), find **LUTs** and click **Add LUT…**. Pick the `.cube` file you downloaded and click **Open**.
+3. **Check it.** The LUT is now listed under LUTs, and **For D-Log M clips** shows it: since its name says D-Log M, rOsmo360 chose it for those clips by itself. Any D-Log M clips in your edit change from grey and flat to normal colours at once.
+
+rOsmo360 copies the file into its own settings folder, so you can delete the download afterwards, and your projects keep working wherever the download went. The LUT is known by its file name (without `.cube`); a project made on another computer finds it by that name, so add the same file there without renaming it. To take a LUT out of the library, click the **✕** beside it.
+
+From then on, every clip filmed in D-Log M gets the LUT as soon as you add it to the edit. rOsmo360 knows from the clip itself whether it was filmed in D-Log M; the camera's file says so even though it's otherwise tagged like any video.
+
+#### Using it
 
 At the top of the Effects panel, for the cut under the playhead:
 
@@ -548,7 +558,7 @@ Keys only work while you're not typing: in the Text panel's box, the keys type.
 - **Export says it's stitching on the CPU.** No usable GPU was found, so it falls back to the slower CPU stitcher. Update your GPU drivers. The result looks the same.
 - **The meter goes red.** The mix goes over 0 dBFS there and the export's sound would clip. Lower **Clip sound** or **Music**, or add a volume point to dip the loud stretch.
 - **A title shows in another font than you chose.** The project uses a font this computer doesn't have; rOsmo360 says which, and uses Inter. Pick one of the built-in fonts to have it look the same everywhere.
-- **An Osmo clip looks flat and grey.** It was filmed in D-Log M. Add DJI's D-Log M to Rec.709 LUT in Settings; see [LUTs and D-Log M](#luts-and-d-log-m).
+- **An Osmo clip looks flat and grey.** It was filmed in D-Log M. Download DJI's D-Log M to Rec.709 LUT and add it in Settings; see [Downloading and adding DJI's LUT](#downloading-and-adding-djis-lut).
 - **A cut shows as filmed and the player says a LUT is missing.** The project names a LUT this computer's library doesn't have, such as one added on another machine. Add the same `.cube` file in Settings; keep its file name, as that's the LUT's name.
 - **A phone video looks washed out.** rOsmo360 converts HDR (HLG and HDR10) by itself; if a video still looks flat, it may lack the HDR tags its colours need. Exposure, contrast and saturation in the Effects panel can lift it.
 - **Full-resolution playback stutters with 10-bit on.** Turn **10-bit** off in Settings, or play from the proxy; exports aren't affected either way.
