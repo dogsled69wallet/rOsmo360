@@ -143,10 +143,16 @@ pub struct Stream {
     /// only stopped after its next frame, a second or more for an OSV
     /// starting up, and scrubbing piled them up until memory ran out.
     procs: Arc<Mutex<Vec<Child>>>,
+    /// Why a decoder failed, set before `frames` closes: the frames simply
+    /// stopping looked like the clip's end, and an export held the last one.
+    pub error: Arc<Mutex<Option<String>>>,
+    /// Dropped: its decoders were killed, which is no failure.
+    dropped: Arc<AtomicBool>,
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Relaxed);
         kill(&self.procs);
     }
 }
@@ -175,7 +181,7 @@ pub fn spawn(kind: Kind, hw: Hwaccel, start: f64, fps: f64) -> Result<Stream> {
         Kind::Flat { path, flat, size, rate } => {
             let (w, h) = size.unwrap_or_else(|| flat.size());
             let (mut cmd, deep) = ffmpeg::yuv(path, flat.track, start, flat.out(*size, *rate), hw, deep())?;
-            cmd.args(["-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null());
+            cmd.args(["-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::piped());
             vec![(cmd.spawn().context("running ffmpeg")?, w, h, deep)]
         }
     };
@@ -185,31 +191,48 @@ pub fn spawn(kind: Kind, hw: Hwaccel, start: f64, fps: f64) -> Result<Stream> {
     };
     let (mut children, sizes): (Vec<Child>, Vec<(u32, u32, bool)>) = procs.into_iter().map(|(c, w, h, deep)| (c, (w, h, deep))).unzip();
     let outs: Vec<_> = children.iter_mut().map(|c| c.stdout.take().unwrap()).collect();
+    let mut tails: Vec<_> = children.iter_mut().map(ffmpeg::Tail::of).collect();
     let procs = Arc::new(Mutex::new(children));
-    let decoders = procs.clone();
+    let (error, dropped) = (Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)));
+    let (decoders, failed, gone) = (procs.clone(), error.clone(), dropped.clone());
     thread::spawn(move || {
-        pump(outs, sizes, layout, start, fps, tx);
+        if let Some(i) = pump(outs, sizes, layout, start, fps, &tx)
+            && !gone.load(Ordering::Relaxed)
+        {
+            // The one that ended is exiting; the others are killed below.
+            let status = decoders.lock().unwrap()[i].wait();
+            if let Ok(status) = status
+                && !status.success()
+                && !gone.load(Ordering::Relaxed)
+            {
+                let why = tails[i].failure(status);
+                eprintln!("{why}");
+                *failed.lock().unwrap() = Some(why);
+            }
+        }
         kill(&decoders);
+        drop(tx);
     });
-    Ok(Stream { frames: rx, procs })
+    Ok(Stream { frames: rx, procs, error, dropped })
 }
 
-/// Reads whole frames from the decoders until they end or nobody wants
-/// more.
-fn pump(mut outs: Vec<std::process::ChildStdout>, sizes: Vec<(u32, u32, bool)>, layout: Layout, start: f64, fps: f64, tx: SyncSender<Frame>) {
+/// Reads whole frames from the decoders until one ends, giving its index,
+/// or nobody wants more.
+fn pump(mut outs: Vec<std::process::ChildStdout>, sizes: Vec<(u32, u32, bool)>, layout: Layout, start: f64, fps: f64, tx: &SyncSender<Frame>) -> Option<usize> {
     for n in 0.. {
         let mut pictures = Vec::with_capacity(sizes.len());
-        for (&(w, h, deep), out) in sizes.iter().zip(outs.iter_mut()) {
+        for (i, (&(w, h, deep), out)) in sizes.iter().zip(outs.iter_mut()).enumerate() {
             let mut data = buffer(Picture::bytes(w, h, deep));
             if out.read_exact(&mut data).is_err() {
-                return;
+                return Some(i);
             }
             pictures.push(Picture { width: w, height: h, deep, data });
         }
         if tx.send(Frame { pts: start + n as f64 / fps, layout, pictures }).is_err() {
-            return;
+            return None;
         }
     }
+    None
 }
 
 fn kill(procs: &Mutex<Vec<Child>>) {
@@ -261,7 +284,7 @@ pub fn still_flat(path: &Path, flat: ffmpeg::Flat, t: f64, hw: Hwaccel) -> Resul
 /// A lens track's decoder, and whether it delivers P010.
 fn decode(path: &Path, track: u32, start: f64, size: Option<u32>, hw: Hwaccel) -> Result<(Child, bool)> {
     let (mut cmd, deep) = ffmpeg::yuv(path, track, start, ffmpeg::Out { size: size.map(|s| (s, s)), ..Default::default() }, hw, deep())?;
-    cmd.args(["-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.args(["-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::piped());
     Ok((cmd.spawn().context("running ffmpeg")?, deep))
 }
 

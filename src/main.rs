@@ -753,6 +753,19 @@ impl Pipeline {
         }
     }
 
+    /// Says so when an export holds this clip's last frame for more than a
+    /// frame or two: the cut runs past what decoded (a duration rounded up
+    /// costs a frame), so its picture freezes.
+    pub fn warn_held(&self, frames: usize) {
+        if frames > 2 {
+            eprintln!(
+                "\nwarning: {} ran out {frames} frames ({:.2} s) before the cut's end; its last frame is held",
+                self.input.display(),
+                frames as f64 / self.fps
+            );
+        }
+    }
+
     fn stream(&self, start: f64) -> Result<Stream> {
         if let Some(flat) = &self.flat {
             let (w, h) = flat.size();
@@ -1322,9 +1335,13 @@ fn encode(p: &Pipeline, start: f64, total: Option<usize>, encoder: &mut dyn ffmp
         n += 1;
         tick(n)?;
     }
-    if let (Some(total), Some(last)) = (total, &last) {
+    if let Some(total) = total {
+        // A cut with no frames would write none while its sound still
+        // counted, and every later cut would run behind its sound.
+        let last = last.context("no frames decoded")?;
+        p.warn_held(total - n);
         for k in n..total {
-            encoder.write(last)?;
+            encoder.write(&last)?;
             tick(k + 1)?;
         }
     }

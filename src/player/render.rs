@@ -232,6 +232,7 @@ pub fn encode(
         (None, None) => Kind::Osv { path: p.input.clone(), tracks: p.tracks.clone(), size: None },
     };
     let stream = source::spawn(kind, clip.hw, start, p.fps)?;
+    let failed = stream.error.clone();
     let rig = &clip.rig;
     // Seam and attitude for the next frames while this one renders. The
     // threads end with the stream, or when this returns and drops `measured`.
@@ -283,8 +284,13 @@ pub fn encode(
         written = write(&frame)?;
         last = Some(frame);
     }
-    // The clip ran out before the cut did.
+    // The clip ran out before the cut did: a decoder that failed says so,
+    // else the last frame is held.
+    if let Some(why) = failed.lock().unwrap().take() {
+        bail!("{}: {why}", p.input.display());
+    }
     let last = last.context("no frames decoded")?;
+    p.warn_held(total - written);
     for _ in written..total {
         write(&last)?;
     }

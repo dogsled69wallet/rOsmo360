@@ -605,12 +605,48 @@ pub fn still_out(input: &Path, track: u32, t: f64, hw: Hwaccel, (width, height):
     Ok(Frame { width, height, rgb: out.rgb24(decoded.stdout), deep: false })
 }
 
+/// The last lines a child wrote to stderr, read on a thread of its own (a
+/// full pipe would stall it), for saying why it failed.
+pub struct Tail(Option<std::thread::JoinHandle<Vec<String>>>);
+
+impl Tail {
+    const LINES: usize = 6;
+
+    /// Takes over `child`'s stderr, which must be piped.
+    pub fn of(child: &mut Child) -> Self {
+        let stderr = child.stderr.take().expect("stderr piped");
+        Tail(Some(std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut lines = std::collections::VecDeque::new();
+            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                if lines.len() == Self::LINES {
+                    lines.pop_front();
+                }
+                lines.push_back(line);
+            }
+            lines.into()
+        })))
+    }
+
+    /// Why a decode that exited with `status` failed, with what it wrote.
+    pub fn failure(&mut self, status: std::process::ExitStatus) -> String {
+        let lines = self.0.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        let mut why = format!("ffmpeg failed decoding ({status})");
+        if !lines.is_empty() {
+            why = format!("{why}: {}", lines.join("; "));
+        }
+        why
+    }
+}
+
 /// Streams RGB24 frames of one video track, starting at the first frame at or
 /// after `start` seconds. Decodes on `hw` when it can (3.5× faster for a
 /// 3840² HEVC still on Vulkan) and quietly in software when it can't.
 pub struct Decoder {
     child: Child,
     stdout: ChildStdout,
+    stderr: Tail,
+    input: PathBuf,
     width: usize,
     height: usize,
     /// How it was asked to deliver, for `Out::rgb24`.
@@ -643,18 +679,28 @@ impl Decoder {
         let mut child = cmd
             .args(["-f", "rawvideo", "-pix_fmt", out.rgb_format(), "-"])
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .context("running ffmpeg")?;
         let stdout = child.stdout.take().unwrap();
-        Ok(Decoder { child, stdout, width, height, out })
+        let stderr = Tail::of(&mut child);
+        Ok(Decoder { child, stdout, stderr, input: input.to_owned(), width, height, out })
     }
 
-    /// The next frame, or `None` at the end of the stream.
+    /// The next frame, or `None` at the end of the stream. Fails if ffmpeg
+    /// did: a read error or a dying decoder mid-clip otherwise looked like
+    /// the clip's end, and the export held its last frame without a word.
     pub fn next(&mut self) -> Result<Option<Frame>> {
         let mut data = vec![0; self.width * self.height * self.out.rgb_bytes()];
         match self.stdout.read_exact(&mut data) {
             Ok(()) => Ok(Some(Frame { width: self.width, height: self.height, rgb: self.out.rgb24(data), deep: false })),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                let status = self.child.wait()?;
+                if !status.success() {
+                    bail!("{}: {}", self.input.display(), self.stderr.failure(status));
+                }
+                Ok(None)
+            }
             Err(e) => Err(e.into()),
         }
     }
