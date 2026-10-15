@@ -285,6 +285,8 @@ enum Message {
     ProjectPicked(Option<PathBuf>),
     /// The window's close button was pressed.
     CloseRequested,
+    /// The answer to "stop the export (or tracking) and quit?".
+    StopAndClose(bool),
     /// The answer to "save changes first?" before doing `.0`.
     Confirmed(Then, Choice),
     /// Save the project; to a new file if true or never saved.
@@ -511,6 +513,8 @@ struct App {
     saved_aspect: Aspect,
     /// What to do once the project has been saved.
     after_save: Option<Then>,
+    /// Quitting once the export or tracking stopped for it has cleaned up.
+    closing: bool,
     /// Exports are this many pixels on the short side.
     resolution: crate::Resolution,
     /// Export each cut to its own file, and in which format.
@@ -626,6 +630,7 @@ impl App {
             saved_version: 0,
             saved_aspect: Aspect::Free,
             after_save: None,
+            closing: false,
             resolution: saved.resolution,
             export_clips: saved.export_clips,
             export_graded: saved.export_graded,
@@ -1167,6 +1172,42 @@ impl App {
         })
     }
 
+    /// An export or colour track is running on its thread.
+    fn busy(&self) -> bool {
+        self.exporting.is_some() || self.tracking.is_some()
+    }
+
+    /// Asks whether to stop the running export or tracking and quit:
+    /// quitting under it left a half-written video, and the crossfade's
+    /// temporary frames (GBs at 2160p) in the temp folder.
+    fn confirm_stop(&self) -> Task<Message> {
+        let what = if self.exporting.is_some() { "An export" } else { "Colour tracking" };
+        let ask = rfd::AsyncMessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Still working")
+            .set_description(format!("{what} is still running. Stop it and quit?"))
+            .set_buttons(rfd::MessageButtons::OkCancelCustom("Stop and quit".into(), "Keep working".into()));
+        Task::perform(ask.show(), |answer| {
+            Message::StopAndClose(matches!(answer, rfd::MessageDialogResult::Ok) || matches!(&answer, rfd::MessageDialogResult::Custom(l) if l == "Stop and quit"))
+        })
+    }
+
+    fn cancel_work(&self) {
+        for (cancel, _) in self.exporting.iter().chain(&self.tracking) {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Goes on quitting once the work stopped for it has finished
+    /// (cleaning up after itself), asking about unsaved changes as usual.
+    fn close_when_stopped(&mut self) -> Task<Message> {
+        if self.closing && !self.busy() {
+            self.closing = false;
+            return self.update(Message::CloseRequested);
+        }
+        Task::none()
+    }
+
     /// Does what waited on the edit being saved or let go.
     fn proceed(&mut self, then: Then) -> Task<Message> {
         match then {
@@ -1311,6 +1352,17 @@ impl App {
                 self.save_status = None;
                 self.timeline_zoom = 1.0;
                 self.timeline_start = 0.0;
+            }
+            Message::CloseRequested if self.busy() => return self.confirm_stop(),
+            Message::StopAndClose(stop) => {
+                if stop {
+                    self.cancel_work();
+                    self.closing = self.busy();
+                    if !self.closing {
+                        return self.update(Message::CloseRequested);
+                    }
+                    self.save_status = Some("Stopping, then quitting…".to_owned());
+                }
             }
             Message::CloseRequested if self.unsaved() => return self.confirm(Then::Close),
             Message::CloseRequested => return iced::exit(),
@@ -1567,6 +1619,7 @@ impl App {
                     Err(_) if cancelled => self.save_status = Some("Tracking cancelled".to_owned()),
                     Err(e) => self.error = Some(format!("Tracking failed: {e}")),
                 }
+                return self.close_when_stopped();
             }
             Message::ExportDone(result) => {
                 let cancelled = self.exporting.take().is_some_and(|(c, _)| c.load(std::sync::atomic::Ordering::Relaxed));
@@ -1582,6 +1635,7 @@ impl App {
                     Err(_) if cancelled => self.save_status = Some("Export cancelled".to_owned()),
                     Err(e) => self.error = Some(format!("Export failed: {e}")),
                 }
+                return self.close_when_stopped();
             }
             Message::SaveProjectTo(Some(path)) => match self.to_project().save(&path) {
                 Ok(()) => {
