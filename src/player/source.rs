@@ -253,9 +253,11 @@ pub fn still(path: &Path, tracks: &[u32], t: f64, size: Option<u32>, hw: Hwaccel
             let read = |hw| -> Result<(Vec<u8>, bool)> {
                 let (mut child, deep) = decode(path, track, t, size, hw)?;
                 let mut data = vec![0; Picture::bytes(w, h, deep)];
-                child.stdout.take().unwrap().read_exact(&mut data)?;
+                let read = child.stdout.take().unwrap().read_exact(&mut data);
+                // Reaped even when the read failed, or it lingers a zombie.
                 let _ = child.kill();
                 let _ = child.wait();
+                read?;
                 Ok((data, deep))
             };
             let (data, deep) = read(hw).or_else(|_| read(Hwaccel::Software))?;
@@ -273,8 +275,11 @@ pub fn still_flat(path: &Path, flat: ffmpeg::Flat, t: f64, hw: Hwaccel) -> Resul
         let (mut cmd, deep) = ffmpeg::yuv(path, flat.track, t, flat.out(None, None), hw, deep())?;
         let mut child = cmd.args(["-frames:v", "1", "-f", "rawvideo", "-"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().context("running ffmpeg")?;
         let mut data = vec![0; Picture::bytes(w, h, deep)];
-        child.stdout.take().unwrap().read_exact(&mut data)?;
+        let read = child.stdout.take().unwrap().read_exact(&mut data);
+        // Reaped even when the read failed, or it lingers a zombie.
+        let _ = child.kill();
         let _ = child.wait();
+        read?;
         Ok((data, deep))
     };
     let (data, deep) = read(hw).or_else(|_| read(Hwaccel::Software))?;

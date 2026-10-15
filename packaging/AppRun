@@ -1,8 +1,11 @@
 #!/bin/sh
-# Without a command (double-clicked, or given clips or a project) open the player;
-# otherwise run the command line as usual: `rOsmo360-x86_64.AppImage export ...`.
+# Without a command (double-clicked, or given clips, videos, pictures or a project) open
+# the player; otherwise run the command line as usual: `rOsmo360-x86_64.AppImage export ...`.
 here="$(dirname "$(readlink -f "$0")")"
-case "${1:-}" in
-    ""|*.OSV|*.osv|*.json|*/*) exec "$here/usr/bin/rosmo360" play "$@" ;;
+# The types the player's Add clips dialog lists, in any case.
+ext="$(printf '%s' "${1:-}" | sed -n 's/.*\.\([^./]*\)$/\1/p' | tr '[:upper:]' '[:lower:]')"
+case "${1:-}:$ext" in
+    :*|*/*:*|*:osv|*:json|*:mp4|*:mov|*:mkv|*:m4v|*:avi|*:webm|*:mts|*:jpg|*:jpeg|*:png|*:webp|*:bmp|*:tif|*:tiff)
+        exec "$here/usr/bin/rosmo360" play "$@" ;;
     *) exec "$here/usr/bin/rosmo360" "$@" ;;
 esac

@@ -4,6 +4,7 @@ Name=rOsmo360
 GenericName=360° Video Editor
 Comment=Play and edit DJI Osmo 360 footage
 Exec=rosmo360 play %F
+MimeType=video/mp4;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;video/mp2t;image/jpeg;image/png;image/webp;image/bmp;image/tiff;application/json;
 Icon=rosmo360
 Terminal=false
 Categories=AudioVideo;Video;AudioVideoEditing;

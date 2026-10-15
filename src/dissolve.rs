@@ -31,8 +31,14 @@ pub struct Dissolve<'a> {
 }
 
 impl<'a> Dissolve<'a> {
+    /// Its files are named unguessably in the temp folder (by the pid
+    /// alone, another user could plant a link there for it to write through).
     pub fn new(out: &'a mut dyn FrameSink) -> Self {
-        let file = |k| std::env::temp_dir().join(format!("rosmo360-dissolve-{}-{k}.rgb", std::process::id()));
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        let key = hasher.finish();
+        let file = |k| std::env::temp_dir().join(format!("rosmo360-dissolve-{}-{key:016x}-{k}.rgb", std::process::id()));
         Dissolve { out, n: 0, frames: 0, head: 0, tail: 0, held: None, holding: None, files: [file(0), file(1)] }
     }
 
@@ -47,7 +53,11 @@ impl<'a> Dissolve<'a> {
             self.held = Some(BufReader::new(File::open(&self.files[0])?));
         }
         if tail > 0 {
-            self.holding = Some(BufWriter::new(File::create(&self.files[1]).with_context(|| format!("creating {}", self.files[1].display()))?));
+            // Made new, never opened through whatever is at the name: the
+            // last cut's file is removed first.
+            let _ = std::fs::remove_file(&self.files[1]);
+            let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&self.files[1]);
+            self.holding = Some(BufWriter::new(file.with_context(|| format!("creating {}", self.files[1].display()))?));
         }
         (self.n, self.frames, self.head, self.tail) = (0, frames, head.min(frames), tail.min(frames));
         Ok(())

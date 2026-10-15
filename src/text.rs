@@ -203,26 +203,40 @@ pub fn render(text: &Text, frame_height: usize) -> (Picture, Option<String>) {
     let (system, cache) = &mut *guard;
     let missing = (!has_family(system, &text.font)).then(|| text.font.clone());
     let family = if missing.is_some() { DEFAULT_FONT } else { &text.font };
-    let px = (text.size * frame_height as f64).max(2.0) as f32;
+    // A project file can ask for anything: at 20 frames high, or with a
+    // long text, the picture took gigabytes. Bounded as the panel bounds
+    // them (and then some), and the picture to `MOST` px a side, drawn
+    // smaller and shown at its size if need be.
+    const MOST: f32 = 8192.0;
+    let asked = (text.size.clamp(0.005, 1.0) * frame_height as f64).max(2.0) as f32;
+    let mut px = asked;
     let attrs = Attrs::new().family(Family::Name(family)).weight(weight(system, family, text.bold));
-    let mut buffer = Buffer::new(system, Metrics::new(px, px * 1.2));
     let content = if text.content.is_empty() { " " } else { &text.content };
     let align = match text.align {
         TextAlign::Left => Align::Left,
         TextAlign::Centre => Align::Center,
         TextAlign::Right => Align::Right,
     };
-    buffer.set_size(system, None, None);
-    buffer.set_text(system, content, &attrs, Shaping::Advanced, Some(align));
-    buffer.shape_until_scroll(system, false);
-    // Laid out unbounded, then again as wide as the widest line, so the
-    // lines align within it.
-    let width = buffer.layout_runs().map(|r| r.line_w).fold(1.0f32, f32::max).ceil();
-    buffer.set_size(system, Some(width), None);
-    buffer.shape_until_scroll(system, false);
-    let height = buffer.layout_runs().map(|r| r.line_top + r.line_height).fold(px, f32::max).ceil();
+    let (buffer, width, height) = loop {
+        let mut buffer = Buffer::new(system, Metrics::new(px, px * 1.2));
+        buffer.set_size(system, None, None);
+        buffer.set_text(system, content, &attrs, Shaping::Advanced, Some(align));
+        buffer.shape_until_scroll(system, false);
+        // Laid out unbounded, then again as wide as the widest line, so the
+        // lines align within it.
+        let width = buffer.layout_runs().map(|r| r.line_w).fold(1.0f32, f32::max).ceil();
+        buffer.set_size(system, Some(width), None);
+        buffer.shape_until_scroll(system, false);
+        let height = buffer.layout_runs().map(|r| r.line_top + r.line_height).fold(px, f32::max).ceil();
+        // Outline and shadow add up to about 1.2 em around it.
+        let most = width.max(height) + 1.2 * px;
+        if most <= MOST || px <= 2.0 {
+            break (buffer, width, height);
+        }
+        px = (px * MOST / most * 0.98).max(2.0);
+    };
     // Room around the letters for the outline and the shadow.
-    let outline = text.outline.map(|o| (o.width * px as f64).max(0.0));
+    let outline = text.outline.map(|o| (o.width.clamp(0.0, 0.5) * px as f64).max(0.0));
     let ring = outline.unwrap_or(0.0);
     let (shadow_off, shadow_blur) = if text.shadow { (0.05 * px as f64, 0.06 * px as f64) } else { (0.0, 0.0) };
     let pad = (ring + shadow_off + 2.0 * shadow_blur).ceil() as usize + 2;
@@ -268,7 +282,7 @@ pub fn render(text: &Text, frame_height: usize) -> (Picture, Option<String>) {
         }
         px[3] = (a * 255.0).round() as u8;
     });
-    let picture = Picture { width: w, height: h, rgba, natural: Some(h as f64 / frame_height as f64) };
+    let picture = Picture { width: w, height: h, rgba, natural: Some(h as f64 * (asked / px) as f64 / frame_height as f64) };
     (picture, missing)
 }
 

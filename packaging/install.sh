@@ -51,12 +51,26 @@ src="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo .)"
 if [ ! -f "$src/rosmo360" ] || [ ! -f "$src/rOsmo360.desktop" ]; then
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
-    url="https://github.com/$REPO/releases/latest/download/$ARCHIVE"
-    echo "Downloading $url"
+    base="https://github.com/$REPO/releases/latest/download"
+    echo "Downloading $base/$ARCHIVE"
     if command -v curl >/dev/null 2>&1; then
-        curl -fL --progress-bar "$url" -o "$tmp/$ARCHIVE"
+        curl -fL --progress-bar "$base/$ARCHIVE" -o "$tmp/$ARCHIVE"
+        curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
     else
-        wget -q --show-progress "$url" -O "$tmp/$ARCHIVE"
+        wget -q --show-progress "$base/$ARCHIVE" -O "$tmp/$ARCHIVE"
+        wget -q "$base/SHA256SUMS" -O "$tmp/SHA256SUMS"
+    fi
+    # Checked against the release's checksums, so a broken or tampered
+    # download is never installed.
+    want="$(awk -v f="$ARCHIVE" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")"
+    if command -v sha256sum >/dev/null 2>&1; then
+        got="$(sha256sum "$tmp/$ARCHIVE" | cut -d' ' -f1)"
+    else
+        got="$(shasum -a 256 "$tmp/$ARCHIVE" | cut -d' ' -f1)"
+    fi
+    if [ -z "$want" ] || [ "$got" != "$want" ]; then
+        echo "The download doesn't match the release's SHA256SUMS; not installing." >&2
+        exit 1
     fi
     tar -xzf "$tmp/$ARCHIVE" -C "$tmp"
     src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
