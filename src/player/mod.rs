@@ -187,6 +187,10 @@ pub fn run(inputs: Vec<PathBuf>, launch: Launch) -> Result<()> {
             application_id: std::env::var("FLATPAK_ID").unwrap_or_else(|_| NAME.to_owned()),
             ..Default::default()
         },
+        // Windows takes the title bar's and taskbar's icon from the window,
+        // not the .exe's resource (which Explorer shows).
+        #[cfg(windows)]
+        icon: window::icon::from_file_data(include_bytes!("../../packaging/rosmo360.png"), None).ok(),
         ..Default::default()
     })
     .run()
@@ -3134,6 +3138,7 @@ impl App {
                 Hwaccel::Vulkan => "Vulkan Video",
                 Hwaccel::Vaapi => "VA-API",
                 Hwaccel::VideoToolbox => "VideoToolbox",
+                Hwaccel::D3d11va => "Direct3D 11",
                 _ => "CUDA",
             })),
         };

@@ -29,10 +29,15 @@ pub fn tool(tool: &str) -> Command {
             })
             .collect()
     });
-    match found.iter().find(|(name, _)| name == tool) {
+    let mut cmd = match found.iter().find(|(name, _)| name == tool) {
         Some((_, path)) => Command::new(path),
         None => Command::new(tool),
-    }
+    };
+    // CREATE_NO_WINDOW: on Windows each ffmpeg would otherwise flash a
+    // console window of its own over the player.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    cmd
 }
 
 /// Everything ffprobe says about `input`'s container and streams, as JSON.
@@ -430,6 +435,7 @@ pub enum Hwaccel {
     Cuda,
     #[value(name = "videotoolbox")]
     VideoToolbox,
+    D3d11va,
     Software,
 }
 
@@ -440,6 +446,7 @@ impl Hwaccel {
             Hwaccel::Vaapi => Some("vaapi"),
             Hwaccel::Cuda => Some("cuda"),
             Hwaccel::VideoToolbox => Some("videotoolbox"),
+            Hwaccel::D3d11va => Some("d3d11va"),
             Hwaccel::Software => None,
         }
     }
@@ -448,14 +455,22 @@ impl Hwaccel {
     fn output_format(self) -> Option<&'static str> {
         match self {
             Hwaccel::VideoToolbox => Some("videotoolbox_vld"),
+            Hwaccel::D3d11va => Some("d3d11"),
             hw => hw.name(),
         }
     }
 
     /// The first decoder that gets a frame of `track` out of `input`.
     pub fn pick(input: &Path, track: u32) -> Result<Hwaccel> {
-        let tried: &[Hwaccel] =
-            if cfg!(target_os = "macos") { &[Hwaccel::VideoToolbox] } else { &[Hwaccel::Vulkan, Hwaccel::Vaapi, Hwaccel::Cuda] };
+        // Windows: Direct3D 11 decodes on any GPU vendor's driver; CUDA and
+        // Vulkan stay as fallbacks.
+        let tried: &[Hwaccel] = if cfg!(target_os = "macos") {
+            &[Hwaccel::VideoToolbox]
+        } else if cfg!(windows) {
+            &[Hwaccel::D3d11va, Hwaccel::Cuda, Hwaccel::Vulkan]
+        } else {
+            &[Hwaccel::Vulkan, Hwaccel::Vaapi, Hwaccel::Cuda]
+        };
         for &hw in tried {
             if hw.works(input, track)? {
                 return Ok(hw);

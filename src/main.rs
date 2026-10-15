@@ -1046,13 +1046,44 @@ impl Stream {
 /// Finder starts it with nothing (or, on some versions, only a `-psn_`
 /// process serial number), which opens the player, as the AppImage's AppRun
 /// does on Linux. From a terminal nothing still prints the help.
+/// On Windows, double-clicked in Explorer (or a clip or project opened with
+/// it) the same: the player, with the file if there is one.
 fn app_args() -> Vec<std::ffi::OsString> {
     let mut args: Vec<_> = std::env::args_os().filter(|a| !a.to_string_lossy().starts_with("-psn_")).collect();
     let in_app = std::env::current_exe().is_ok_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"));
-    if cfg!(target_os = "macos") && in_app && args.len() == 1 {
+    let explorer = from_explorer();
+    if (cfg!(target_os = "macos") && in_app || explorer) && args.len() == 1 {
         args.push("play".into());
+    } else if explorer && args.len() == 2 {
+        args.insert(1, "play".into());
     }
     args
+}
+
+/// Whether Windows started us from Explorer rather than a terminal: then the
+/// console it made is ours alone (a terminal shares its own), and it's
+/// closed, so the player doesn't sit beside a black window. Errors then go
+/// to a message box (`main`), there being nowhere to print them.
+#[cfg(windows)]
+fn from_explorer() -> bool {
+    unsafe extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
+        fn FreeConsole() -> i32;
+    }
+    static ALONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALONE.get_or_init(|| {
+        let mut ids = [0u32; 2];
+        let alone = unsafe { GetConsoleProcessList(ids.as_mut_ptr(), 2) } == 1;
+        if alone {
+            unsafe { FreeConsole() };
+        }
+        alone
+    })
+}
+
+#[cfg(not(windows))]
+fn from_explorer() -> bool {
+    false
 }
 
 fn main() -> Result<()> {
@@ -1060,6 +1091,10 @@ fn main() -> Result<()> {
     // failure to report: the reader has what it wanted.
     match run() {
         Err(e) if e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)) => Ok(()),
+        Err(e) if from_explorer() => {
+            rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("rOsmo360").set_description(format!("{e:#}")).show();
+            Err(e)
+        }
         r => r,
     }
 }
