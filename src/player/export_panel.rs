@@ -46,7 +46,7 @@ impl App {
                 space().width(INDENT),
                 tip(
                     checkbox(self.export_graded).label("Graded").on_toggle(Message::ExportGraded),
-                    text("Apply the cuts' colour effects to the clips too; left off, they're as shot, to grade in the other editor"),
+                    text("Apply the cuts' LUTs and colour effects to the clips too; left off, they're as shot (D-Log M stays log), to grade in the other editor"),
                     tooltip::Position::Left,
                 ),
             ]

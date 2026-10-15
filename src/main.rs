@@ -969,7 +969,10 @@ fn export(project: &project::Project, opts: &StitchOpts, out: &ExportOpts, progr
             let camera = |t: f64| {
                 let mut c = project::camera_at(&project.cuts, n, t, &|f, t| pipelines[i].aim(f, t));
                 if !graded {
+                    // Ungraded clips are for grading elsewhere: as filmed,
+                    // so D-Log M stays log for the editor's own LUT.
                     c.grade = Default::default();
+                    c.lut = None;
                 } else if whole {
                     c.grade.black = project.black_at(n, t);
                 }
