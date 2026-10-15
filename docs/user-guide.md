@@ -380,7 +380,7 @@ A LUT (a `.cube` file) turns the picture's colours into others. Its main use her
 
 You do this once on each computer. rOsmo360 doesn't come with the LUT, as it's DJI's file to hand out, but it's a free download.
 
-1. **Download it.** Open DJI's download page, [Osmo 360 D-Log M to Rec.709 LUT](https://www.dji.com/downloads/softwares/osmo-360-dlog-m-to-rec709-lut) (in the DJI Download Center, search for "Osmo 360 D-Log M" if the link has moved), and click **Download**. You get `DJI Osmo 360 D-Log M to Rec.709 V1.cube`, about 1 MB, usually in your Downloads folder. Make sure it's the **Osmo 360** one: DJI has D-Log M LUTs for its drones and other cameras too.
+1. **Download it.** Open DJI's download page, [Osmo 360 D-Log M to Rec.709 LUT](https://www.dji.com/downloads/softwares/osmo-360-dlog-m-to-rec709-lut) (in the DJI Download Center, search for "Osmo 360 D-Log M" if the link has moved), and click the **.cube** button. The page has a **Mac** and a **Windows** tab; it doesn't matter which you pick, as both give the same file, and on Linux either will do. You get `DJI Osmo 360 D-Log M to Rec.709 V1.cube`, about 1 MB, usually in your Downloads folder. Make sure it's the **Osmo 360** one (it's for the Osmo 360 II too): DJI has D-Log M LUTs for its drones and other cameras as well.
 2. **Add it.** In rOsmo360, open **Settings** (the cog at the far left of the top bar, or **Ctrl+,**), find **LUTs** and click **Add LUT…**. Pick the `.cube` file you downloaded and click **Open**.
 
    ![The LUTs part of the Settings panel before any LUT is added: "None yet.", the Add LUT… button, and For D-Log M clips set to None](guide/lut-add.png)
