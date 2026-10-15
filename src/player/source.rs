@@ -116,14 +116,36 @@ impl Frame {
         if x < 0 || y < 0 || x >= pic.width as i64 || y >= pic.height as i64 {
             return None;
         }
-        let (x, y, w) = (x as usize, y as usize, pic.width as usize);
-        let c = (y / 2) * w + (x / 2) * 2;
-        let yy = (pic.sample(pic.y(), y * w + x) - 16.0 / 255.0) * (255.0 / 219.0);
-        let cu = (pic.sample(pic.uv(), c) - 128.0 / 255.0) * (255.0 / 224.0);
-        let cv = (pic.sample(pic.uv(), c + 1) - 128.0 / 255.0) * (255.0 / 224.0);
+        let [yy, cu, cv] = ycc(pic, x as usize, y as usize);
         // BT.709, limited range, as in the shader.
         Some([yy + 1.5748 * cv, yy - 0.1873 * cu - 0.4681 * cv, yy + 1.8556 * cu].map(|v| v.clamp(0.0, 1.0)))
     }
+
+    /// An ordinary video's colour at `(u, v)` across its picture (0..1), as
+    /// the shader shows it: an HDR one brought down to SDR.
+    pub fn flat_rgb_at(&self, u: f64, v: f64, hdr: crate::hdr::Hdr) -> Option<[f64; 3]> {
+        let pic = self.pictures.first()?;
+        let x = ((u * pic.width as f64) as usize).min(pic.width as usize - 1);
+        let y = ((v * pic.height as f64) as usize).min(pic.height as usize - 1);
+        let [yy, cu, cv] = ycc(pic, x, y);
+        if hdr == crate::hdr::Hdr::None {
+            return Some([yy + 1.5748 * cv, yy - 0.1873 * cu - 0.4681 * cv, yy + 1.8556 * cu].map(|v| v.clamp(0.0, 1.0)));
+        }
+        // BT.2020's matrix, as the shader's `hdr_to_sdr`.
+        let signal = [yy + 1.4746 * cv, yy - 0.16455 * cu - 0.57135 * cv, yy + 1.8814 * cu].map(|v| v as f32);
+        Some(crate::hdr::to_sdr(signal, hdr).map(|v| v as f64))
+    }
+}
+
+/// Y′, Cb and Cr at a pixel, Y′ 0..1 and Cb/Cr about 0, from video range.
+fn ycc(pic: &Picture, x: usize, y: usize) -> [f64; 3] {
+    let w = pic.width as usize;
+    let c = (y / 2) * w + (x / 2) * 2;
+    [
+        (pic.sample(pic.y(), y * w + x) - 16.0 / 255.0) * (255.0 / 219.0),
+        (pic.sample(pic.uv(), c) - 128.0 / 255.0) * (255.0 / 224.0),
+        (pic.sample(pic.uv(), c + 1) - 128.0 / 255.0) * (255.0 / 224.0),
+    ]
 }
 
 #[derive(Clone)]

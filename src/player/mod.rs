@@ -1086,10 +1086,25 @@ impl App {
         let rig_from_view = views[views.len() / 2];
         let dir = |fx: f64, fy: f64| crate::stitch::apply(rig_from_view, crate::stitch::apply(camera.user, camera.ray(aspect, [2.0 * fx - 1.0, 2.0 * fy - 1.0])));
         let mut channels: [Vec<f64>; 3] = Default::default();
+        // An ordinary video or picture has no lenses: its frame's one
+        // picture, cropped as the shader crops it. The eyedropper used to
+        // find nothing there and silently do nothing (the user's Nikon clip).
+        let flat = c.playback.media.flat;
+        let picture = frame.pictures.first().map_or(1.0, |p| p.width as f64 / p.height as f64);
         for gy in 0..N {
             for gx in 0..N {
                 let fx = area.x as f64 + (gx as f64 + 0.5) / N as f64 * area.width as f64;
                 let fy = area.y as f64 + (gy as f64 + 0.5) / N as f64 * area.height as f64;
+                if let Some(flat) = flat {
+                    if let Some([u, v]) = camera.flat_uv(aspect, picture, [2.0 * fx - 1.0, 2.0 * fy - 1.0])
+                        && let Some(rgb) = frame.flat_rgb_at(u, v, flat.hdr)
+                    {
+                        for k in 0..3 {
+                            channels[k].push(rgb[k]);
+                        }
+                    }
+                    continue;
+                }
                 let d = dir(fx, fy);
                 // The lens that weighs most there, as the blend would.
                 let best = rig.lenses.iter().filter_map(|l| l.project(d).map(|h| (l, h))).max_by(|a, b| (a.0.blend.weight(a.1.2) * a.1.3).total_cmp(&(b.0.blend.weight(b.1.2) * b.1.3)));
