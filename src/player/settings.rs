@@ -31,6 +31,8 @@ pub struct Settings {
     pub theme: String,
     /// Decode 10-bit tracks at 10 bits (`source::set_deep`).
     pub ten_bit: bool,
+    /// The library LUT D-Log M clips get when they're added.
+    pub dlog_m_lut: Option<String>,
 }
 
 impl Default for Settings {
@@ -50,6 +52,7 @@ impl Default for Settings {
             auto_key: false,
             theme: iced::Theme::KanagawaDragon.to_string(),
             ten_bit: false,
+            dlog_m_lut: None,
         }
     }
 }

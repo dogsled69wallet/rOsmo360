@@ -53,6 +53,9 @@ struct Uniforms {
     crop: vec4f,
     // .x 1 to dither the last rounding to 8 bits, .y the frame's number.
     dither: vec4f,
+    // The LUT (lut.rs): .x 1 if on, .y strength, .z size; its domain's low
+    // and high ends.
+    lut: array<vec4f, 3>,
 }
 
 const BINS: u32 = 32u;
@@ -79,6 +82,7 @@ const TAPER_WIDTH: f32 = 12.0;
 @group(0) @binding(9) var uv0d: texture_2d<u32>;
 @group(0) @binding(10) var y1d: texture_2d<u32>;
 @group(0) @binding(11) var uv1d: texture_2d<u32>;
+@group(0) @binding(12) var lut3d: texture_3d<f32>;
 
 const PI: f32 = 3.14159265358979;
 
@@ -405,8 +409,20 @@ fn noise(p: vec3u) -> vec2f {
     return vec2f(v.xy) / 4294967296.0;
 }
 
+// The LUT, mirroring `Lut::blend`: the hardware's trilinear filtering
+// between texel centres is `Lut::apply`'s interpolation.
+fn apply_lut(c: vec3f) -> vec3f {
+    if u.lut[0].x < 0.5 {
+        return c;
+    }
+    let n = u.lut[0].z;
+    let x = clamp((c - u.lut[1].xyz) / (u.lut[2].xyz - u.lut[1].xyz), vec3f(0.0), vec3f(1.0));
+    let to = textureSampleLevel(lut3d, samp, (x * (n - 1.0) + 0.5) / n, 0.0).rgb;
+    return c + (to - c) * u.lut[0].y;
+}
+
 fn finish(picture: vec3f, pos: vec4f) -> vec4f {
-    var rgb = picture;
+    var rgb = apply_lut(picture);
     if u.grade[2].z > 0.5 {
         let p = pos.xy - u.misc.zw;
         rgb = grade(rgb, vec2f(p.x / u.screen.x * 2.0 - 1.0, p.y / u.screen.y * 2.0 - 1.0), u.screen.x / u.screen.y);

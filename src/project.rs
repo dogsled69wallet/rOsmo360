@@ -256,6 +256,14 @@ impl MusicClip {
     }
 }
 
+fn full() -> f64 {
+    1.0
+}
+
+fn is_full(v: &f64) -> bool {
+    *v == 1.0
+}
+
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
 }
@@ -303,13 +311,35 @@ pub struct Cut {
     /// Its colour effects' keyframes, clip time, apart from the camera's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<crate::grade::EffectKey>,
+    /// A LUT applied before the effects: a name in the LUT library, or a
+    /// `.cube` file (relative to the project). D-Log M needs DJI's to look
+    /// like Rec.709; a missing one leaves the cut as filmed, with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lut: Option<String>,
+    /// How much of the LUT, 0..1.
+    #[serde(default = "full", skip_serializing_if = "is_full")]
+    pub lut_strength: f64,
     /// Its clip is an ordinary video (framed by cropping, not a 360 view):
     /// found when the clip is opened, not saved.
     #[serde(skip)]
     pub flat: bool,
+    /// Its LUT, loaded (`resolve_lut`): found when the clip is opened.
+    #[serde(skip)]
+    pub lut_applied: Option<crate::lut::Applied>,
 }
 
 impl Cut {
+    /// Loads the LUT it names (a library name, or a file) for `camera_at`.
+    /// Says why when it can't: the cut then shows as filmed.
+    pub fn resolve_lut(&mut self) -> Result<()> {
+        self.lut_applied = None;
+        let Some(name) = &self.lut else { return Ok(()) };
+        let path = crate::lut::find(name).with_context(|| format!("the LUT \"{name}\" isn't in the LUT library (or isn't there as a file)"))?;
+        let id = crate::lut::shared(&path)?;
+        self.lut_applied = Some(crate::lut::Applied { id, strength: self.lut_strength.clamp(0.0, 1.0) as f32 });
+        Ok(())
+    }
+
     pub fn len(&self) -> f64 {
         self.end - self.start
     }
@@ -378,6 +408,9 @@ impl Project {
             for track in cut.keyframes.tracks_mut() {
                 *track = dir.join(&*track);
             }
+            if let Some(lut) = cut.lut.as_mut().filter(|l| crate::lut::is_file(l)) {
+                *lut = dir.join(&*lut).to_string_lossy().into_owned();
+            }
         }
         for (n, clip) in project.music.clips.iter_mut().enumerate() {
             if clip.end <= clip.start || clip.at < 0.0 {
@@ -438,6 +471,11 @@ impl Project {
                     *track = rel.to_owned();
                 }
             }
+            if let Some(lut) = cut.lut.as_mut().filter(|l| crate::lut::is_file(l))
+                && let Ok(rel) = Path::new(lut.as_str()).strip_prefix(dir)
+            {
+                *lut = rel.to_string_lossy().into_owned();
+            }
         }
         for clip in &mut project.music.clips {
             if let Ok(rel) = clip.input.strip_prefix(dir) {
@@ -480,7 +518,7 @@ pub fn keyframed(cuts: &[Cut], n: usize, t: f64) -> Option<(&Keyframes, f64)> {
 /// goes on following in its own footage.
 pub fn camera_at(cuts: &[Cut], n: usize, t: f64, aim: Aim) -> Camera {
     let camera = keyframed(cuts, n, t).and_then(|(k, at)| k.camera_at(at, &held(aim, at == t, t))).unwrap_or_else(|| View::home(Projection::Perspective).camera());
-    Camera { grade: crate::grade::grade_at(&cuts[n].effects, t), ..camera }
+    Camera { grade: crate::grade::grade_at(&cuts[n].effects, t), lut: cuts[n].lut_applied, ..camera }
 }
 
 /// `aim` for reading keyframes from `keyframed`: as asked in the cut's own

@@ -28,7 +28,9 @@ use telemetry_parser::rig::CameraRig;
 /// layout, a telemetry-parser update that reads the rig or attitude differently,
 /// thumbnails worth redoing. Entries of another format are rebuilt; otherwise
 /// they outlive updates, so a new version doesn't re-read every clip.
-const FORMAT: u32 = 1;
+///
+/// 2 (0.7.0): telemetry entries hold the colour mode (D-Log M).
+const FORMAT: u32 = 2;
 const MAGIC: &[u8; 8] = b"rOsmo360";
 /// What entries are named, after the fingerprint.
 const KINDS: [&str; 3] = ["telemetry", "thumbs", "wave"];
@@ -79,6 +81,8 @@ pub struct Telemetry {
     pub rig: Option<CameraRig>,
     /// Fused attitude, (ms, [w, x, y, z]), as `imu::Imu::quats`.
     pub quats: Vec<(f64, [f64; 4])>,
+    /// The colour profile it was filmed in.
+    pub color_mode: crate::dji::ColorMode,
 }
 
 /// `input`'s telemetry, from the cache when it holds it, else parsed (telling
@@ -89,7 +93,7 @@ pub fn telemetry(input: &Path, progress: &dyn Fn(f64)) -> Result<Telemetry> {
         return Ok(t);
     }
     let parsed = crate::load_input(input, progress)?;
-    let t = Telemetry { rig: telemetry_parser::util::camera_rig(&parsed), quats: imu::read(&parsed).quats };
+    let t = Telemetry { rig: telemetry_parser::util::camera_rig(&parsed), quats: imu::read(&parsed).quats, color_mode: crate::dji::color_mode(input)? };
     if let Some(e) = entry {
         store(&e, |w| write_telemetry(w, &t));
     }
@@ -222,6 +226,7 @@ fn write_telemetry(w: &mut Vec<u8>, t: &Telemetry) -> Result<()> {
             w.extend((*c as f32).to_le_bytes());
         }
     }
+    w.extend(t.color_mode.number().to_le_bytes());
     Ok(())
 }
 
@@ -238,7 +243,8 @@ fn read_telemetry(r: &mut &[u8]) -> Option<Telemetry> {
         }
         quats.push((ms, q));
     }
-    Some(Telemetry { rig, quats })
+    let color_mode = crate::dji::ColorMode::from_number(u32_from(r)?);
+    Some(Telemetry { rig, quats, color_mode })
 }
 
 /// PNG each: 128 × 72 RGBA raw would be 37 kB a thumbnail.
@@ -401,11 +407,12 @@ mod tests {
 
     #[test]
     fn telemetry_round_trips() {
-        let t = Telemetry { rig: None, quats: vec![(0.0, [1.0, 0.0, 0.0, 0.0]), (1.25, [0.5, -0.5, 0.5, -0.5])] };
+        let color_mode = crate::dji::ColorMode::DLogM;
+        let t = Telemetry { rig: None, quats: vec![(0.0, [1.0, 0.0, 0.0, 0.0]), (1.25, [0.5, -0.5, 0.5, -0.5])], color_mode };
         let mut w = Vec::new();
         write_telemetry(&mut w, &t).unwrap();
         let back = read_telemetry(&mut w.as_slice()).unwrap();
-        assert_eq!((back.rig, back.quats), (None, t.quats));
+        assert_eq!((back.rig, back.quats, back.color_mode), (None, t.quats, color_mode));
         // Cut short, it is a miss rather than a wrong answer.
         assert!(read_telemetry(&mut &w[..w.len() - 1]).is_none());
     }

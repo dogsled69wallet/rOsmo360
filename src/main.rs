@@ -2,11 +2,13 @@ mod align;
 mod cache;
 mod check;
 mod dissolve;
+mod dji;
 mod exposure;
 mod grade;
 mod ffmpeg;
 mod hdr;
 mod imu;
+mod lut;
 mod overlay;
 mod player;
 mod project;
@@ -566,6 +568,8 @@ struct Pipeline {
     /// Decode at this rate instead of the clip's own (an ordinary video in
     /// an edit at another rate); `fps` is then this.
     rate: Option<f64>,
+    /// The colour profile it was filmed in (D-Log M wants a LUT).
+    color_mode: dji::ColorMode,
     /// Tracks that keyframes follow, read once each (`None`: unreadable).
     followed: std::sync::Mutex<std::collections::HashMap<PathBuf, Option<std::sync::Arc<track::Track>>>>,
 }
@@ -632,6 +636,7 @@ impl Pipeline {
             proxy: None,
             flat: None,
             rate: None,
+            color_mode: telemetry.color_mode,
             followed: Default::default(),
         })
     }
@@ -654,6 +659,7 @@ impl Pipeline {
             proxy: None,
             flat: Some(flat),
             rate: None,
+            color_mode: dji::ColorMode::Normal,
             followed: Default::default(),
         })
     }
@@ -706,9 +712,7 @@ impl Pipeline {
                 }
                 Shot::View { ref camera, size } => {
                     let mut frame = stitch::flat(picture, size, camera);
-                    if !camera.grade.is_neutral() {
-                        grade_frame(&mut frame, &camera.grade);
-                    }
+                    grade_frame(&mut frame, camera);
                     frame
                 }
             };
@@ -733,9 +737,7 @@ impl Pipeline {
             Shot::View { ref camera, size: (w, h) } => {
                 let ray = |x: f64, y: f64| stitch::apply(camera.user, camera.ray(w as f64 / h as f64, [x / w as f64 * 2.0 - 1.0, y / h as f64 * 2.0 - 1.0]));
                 let mut frame = stitch::render(&self.lenses, frames, (w, h), ray, self.only, &views, &seam);
-                if !camera.grade.is_neutral() {
-                    grade_frame(&mut frame, &camera.grade);
-                }
+                grade_frame(&mut frame, camera);
                 frame
             }
         }
@@ -825,6 +827,9 @@ fn cut_pipelines(project: &mut project::Project, opts: &StitchOpts, proxy: bool)
             }
         };
         cut.flat = pipelines[i].flat.is_some();
+        if let Err(e) = cut.resolve_lut() {
+            eprintln!("warning: {e:#}; {} is left as filmed", cut.input.display());
+        }
         of_cut.push(i);
     }
     // The edit runs at its first 360 clip's rate (its first video's if it
@@ -1125,7 +1130,7 @@ fn run() -> Result<()> {
                 // One clip is a project of one cut.
                 let reframe = framing.reframe()?.unwrap_or_else(|| Reframe::fixed(View::home(Projection::Perspective)));
                 let (start, end) = span(&input, start, duration, Some(&reframe))?;
-                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new(), flat: false }], ..Default::default() }
+                project::Project { aspect: reframe.aspect, cuts: vec![project::Cut { input, start, end, keyframes: reframe.keyframes, stabilize: None, note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new(), lut: None, lut_strength: 1.0, flat: false, lut_applied: None }], ..Default::default() }
             };
             let aspect = aspect.or(project.aspect).unwrap_or(view::Aspect(16, 9));
             let [w, h] = size.unwrap_or_else(|| aspect.size(resolution.short_side())).map(|v| v as usize);
@@ -1349,14 +1354,23 @@ fn encode(p: &Pipeline, start: f64, total: Option<usize>, encoder: &mut dyn ffmp
 }
 
 /// Grades a rendered frame on the CPU, as the shader does on the GPU.
-fn grade_frame(frame: &mut stitch::Frame, grade: &grade::Grade) {
+/// Its LUT, then its effects, as the shader's `finish` does on the GPU.
+fn grade_frame(frame: &mut stitch::Frame, camera: &view::Camera) {
+    let (grade, lut) = (&camera.grade, camera.lut.map(|l| (lut::get(l.id), l.strength as f64)));
+    if grade.is_neutral() && lut.is_none() {
+        return;
+    }
     let (w, h) = (frame.width, frame.height);
     let aspect = w as f64 / h as f64;
     frame.rgb.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
         for (x, px) in row.chunks_exact_mut(3).enumerate() {
             // Pixel centres, as the shader's fragment positions.
             let at = [(x as f64 + 0.5) / w as f64 * 2.0 - 1.0, (y as f64 + 0.5) / h as f64 * 2.0 - 1.0];
-            let out = grade.apply([px[0], px[1], px[2]].map(|v| v as f64 / 255.0), at, aspect);
+            let mut rgb = [px[0], px[1], px[2]].map(|v| v as f64 / 255.0);
+            if let Some((lut, strength)) = &lut {
+                rgb = lut.blend(rgb, *strength);
+            }
+            let out = if grade.is_neutral() { rgb } else { grade.apply(rgb, at, aspect) };
             for (p, v) in px.iter_mut().zip(out) {
                 *p = (v * 255.0).round() as u8;
             }
@@ -1424,10 +1438,12 @@ fn info(input: &Path) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&info)?);
         return Ok(());
     }
-    let quats = cache::telemetry(input, &|_| {})?.quats;
+    let telemetry = cache::telemetry(input, &|_| {})?;
+    let quats = telemetry.quats;
     let info = serde_json::json!({
         "input": input,
         "kind": "osv",
+        "colour": telemetry.color_mode.name(),
         "proxy": ffmpeg::proxy(input),
         "duration": ffmpeg::duration(input)?,
         "fps": ffmpeg::frame_rate(input)?,

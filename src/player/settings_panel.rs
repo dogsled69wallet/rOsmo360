@@ -1,6 +1,7 @@
 //! The Settings panel: how the player behaves, kept between runs
 //! (`settings.rs`), docked at the left of the view like the Info panel.
 
+use super::effects::LutChoice;
 use super::{App, Message, tip};
 use iced::widget::{button, column, container, pick_list, row, rule, scrollable, text, toggler, tooltip};
 use iced::{Alignment, Element, Length, Theme};
@@ -16,6 +17,32 @@ pub fn theme_named(name: &str) -> Theme {
 }
 
 impl App {
+    /// The LUT library: each LUT with a button to take it out, Add, and
+    /// which one D-Log M clips get.
+    fn lut_library(&self) -> Element<'_, Message> {
+        let note = |s: &'static str| text(s).size(13).style(text::secondary);
+        let mut list = column![].spacing(4);
+        for name in &self.luts {
+            let remove = tip(button(text("✕").size(13)).padding([0, 6]).style(button::text).on_press(Message::RemoveLut(name.clone())), text("Take it out of the library"), tooltip::Position::Left);
+            list = list.push(row![text(name.clone()).size(14).width(Length::Fill), remove].align_y(Alignment::Center));
+        }
+        if self.luts.is_empty() {
+            list = list.push(note("None yet."));
+        }
+        let mut choices = vec![LutChoice::None];
+        choices.extend(self.luts.iter().map(|n| LutChoice::Named(n.clone())));
+        column![
+            list,
+            button(text("Add LUT…").size(14)).on_press(Message::AddLut),
+            note("Copied into rOsmo360's settings folder, so projects keep working when the download moves."),
+            text("For D-Log M clips").size(14),
+            pick_list(choices, Some(LutChoice::of(self.dlog_m_lut.as_ref())), Message::DlogMLut).text_size(13).width(Length::Fill),
+            note("Clips filmed in D-Log M get it when they're added; the Effects panel changes it per cut. DJI's is \"Osmo 360 D-Log M to Rec.709 LUT\" in the DJI Download Center."),
+        ]
+        .spacing(6)
+        .into()
+    }
+
     /// The Settings panel, while it's open.
     pub(super) fn settings_panel(&self) -> Option<Element<'_, Message>> {
         if !self.settings_open {
@@ -38,6 +65,9 @@ impl App {
                 note("Decodes the OSV and 10-bit videos (a phone's HDR) at all their 10 bits instead of 8: smoother skies and gradients, twice the data to move. Applies from the next seek or clip."),
             ]
             .spacing(6),
+            rule::horizontal(1),
+            text("LUTs").size(15),
+            self.lut_library(),
             rule::horizontal(1),
             text("Keyframes").size(15),
             column![

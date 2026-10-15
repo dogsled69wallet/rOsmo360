@@ -48,6 +48,39 @@ pub enum EffectMsg {
     Jump(usize, f64),
     /// Cut `cut`'s effect keyframe `key` dragged to clip time `t`.
     KeyMove(usize, usize, f64),
+    /// The cut's LUT, and how much of it.
+    Lut(LutChoice),
+    LutStrength(f64),
+}
+
+/// A LUT in a list: none, or a library name (or a file a project names).
+#[derive(Clone, Debug, PartialEq)]
+pub enum LutChoice {
+    None,
+    Named(String),
+}
+
+impl LutChoice {
+    pub fn of(name: Option<&String>) -> Self {
+        name.map_or(LutChoice::None, |n| LutChoice::Named(n.clone()))
+    }
+
+    pub fn name(&self) -> Option<String> {
+        match self {
+            LutChoice::None => None,
+            LutChoice::Named(n) => Some(n.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for LutChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LutChoice::None => f.write_str("None"),
+            // A file a project names: its file name.
+            LutChoice::Named(n) => f.write_str(std::path::Path::new(n).file_name().map_or(n.as_str(), |s| s.to_str().unwrap_or(n))),
+        }
+    }
 }
 
 /// Each effect: its name, range, and what it does. Untouched, each is
@@ -213,6 +246,24 @@ impl App {
                 self.change_place(|place| *place = to);
             }
             EffectMsg::Done => self.dragging = false,
+            EffectMsg::Lut(choice) => {
+                let Some((Target::Cut(i), _)) = target else { return };
+                self.edit.checkpoint();
+                let cut = &mut self.edit.cuts[i];
+                cut.lut = choice.name();
+                if let Err(e) = cut.resolve_lut() {
+                    self.error = Some(format!("{e:#}"));
+                }
+            }
+            EffectMsg::LutStrength(v) => {
+                let Some((Target::Cut(i), _)) = target else { return };
+                self.begin_drag();
+                let cut = &mut self.edit.cuts[i];
+                cut.lut_strength = v;
+                if let Some(a) = &mut cut.lut_applied {
+                    a.strength = v as f32;
+                }
+            }
             EffectMsg::TextEdit(action) => {
                 let edits = action.is_edit();
                 self.text_content.perform(action);
@@ -446,6 +497,41 @@ impl App {
         });
     }
 
+    /// Cut `i`'s LUT and its strength: before the effects, which act on
+    /// what it gives.
+    fn lut_controls(&self, i: usize) -> Element<'_, Message> {
+        let cut = &self.edit.cuts[i];
+        let mut choices = vec![LutChoice::None];
+        choices.extend(self.luts.iter().map(|n| LutChoice::Named(n.clone())));
+        let current = LutChoice::of(cut.lut.as_ref());
+        if !choices.contains(&current) {
+            choices.push(current.clone());
+        }
+        let d_log_m = self.library.iter().find(|m| m.input == cut.input).is_some_and(|m| m.color_mode == crate::dji::ColorMode::DLogM);
+        let hint = if self.luts.is_empty() {
+            "Add LUTs (.cube) in Settings: DJI's D-Log M to Rec.709 for D-Log M footage, or any look"
+        } else {
+            "A LUT turns the picture's colours into others before the effects: DJI's D-Log M to Rec.709 makes D-Log M footage look normal"
+        };
+        let mut col = column![
+            row![text("LUT").width(Length::Fill), text(if d_log_m { "filmed in D-Log M" } else { "" }).size(13).style(text::secondary)].align_y(Alignment::Center),
+            tip(pick_list(choices, Some(current), |c| Message::Effect(EffectMsg::Lut(c))).text_size(13).width(Length::Fill), text(hint), tooltip::Position::Left),
+        ]
+        .spacing(4);
+        if cut.lut.is_some() {
+            col = col.push(tip(
+                column![
+                    row![text("Strength").width(Length::Fill), text(format!("{:.0} %", cut.lut_strength * 100.0)).size(13)],
+                    slider(0.0..=1.0, cut.lut_strength, |v| Message::Effect(EffectMsg::LutStrength(v))).step(0.01).on_release(Message::Effect(EffectMsg::Done)),
+                ]
+                .spacing(2),
+                text("How much of the LUT: 100 % is all of it, less mixes in the picture as filmed"),
+                tooltip::Position::Left,
+            ));
+        }
+        col.push(rule::horizontal(1)).into()
+    }
+
     pub(super) fn effects_panel(&self) -> Element<'_, Message> {
         let m = |e: EffectMsg| Message::Effect(e);
         let target = self.effect_target();
@@ -539,7 +625,11 @@ impl App {
                 tooltip::Position::Left,
             )
         };
-        let body = column![text("Effects").size(18), text(cut_name).size(13)].spacing(10).padding(12);
+        let close = tip(button(text("✕").size(14)).padding([0, 6]).style(button::text).on_press(m(EffectMsg::Toggle)), text("Close (G)"), tooltip::Position::Bottom);
+        let mut body = column![row![text("Effects").size(18).width(Length::Fill), close].align_y(Alignment::Center), text(cut_name).size(13)].spacing(10).padding(12);
+        if let Some((Target::Cut(i), _)) = target {
+            body = body.push(self.lut_controls(i));
+        }
         let body = body.extend([column![
             sliders,
             keys,

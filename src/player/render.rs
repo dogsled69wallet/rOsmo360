@@ -335,10 +335,14 @@ mod tests {
 
     /// An ordinary video's `frame` drawn whole into a `w` × `h` target, as
     /// an export draws it.
-    fn draw_flat(gpu: &mut Gpu, frame: Frame, hdr: crate::hdr::Hdr, (w, h): (usize, usize)) -> stitch::Frame {
+    fn draw_flat(gpu: &mut Gpu, frame: Frame, hdr: crate::hdr::Hdr, size: (usize, usize)) -> stitch::Frame {
+        draw_flat_as(gpu, frame, hdr, size, crate::view::View::home(crate::view::Projection::Perspective).camera())
+    }
+
+    /// `draw_flat` through `camera` (its grade and LUT).
+    fn draw_flat_as(gpu: &mut Gpu, frame: Frame, hdr: crate::hdr::Hdr, (w, h): (usize, usize), camera: Camera) -> stitch::Frame {
         let shown = Shown::new(frame, SeamFix::default());
         let rig = Rig::flat(0, hdr);
-        let camera = crate::view::View::home(crate::view::Projection::Perspective).camera();
         gpu.size = (0, 0);
         gpu.targets = vec![gpu.make_target(w, h)];
         gpu.stitcher.prepare_frame(&gpu.device, &gpu.queue, &rig, &shown, &camera, &[stitch::IDENTITY], [w as f32, h as f32], [0.0, 0.0]);
@@ -376,6 +380,42 @@ mod tests {
             let mid = ((h / 2) * w + w / 2) * 3;
             let px = [0, 1, 2].map(|c| got.rgb[mid + c] as i32);
             eprintln!("{ycc:?}: GPU {px:?}, CPU {want:?}");
+            assert!(px.iter().zip(want).all(|(a, b)| (a - b).abs() <= 2), "GPU {px:?} against CPU {want:?}");
+        }
+    }
+
+    /// The shader's LUT (a 3D texture, filtered by the hardware) gives what
+    /// `Lut::blend` gives, at part strength too.
+    #[test]
+    fn gpu_lut_matches_the_cpu() {
+        let Ok(mut gpu) = Gpu::new(false) else { return };
+        // Bent, and mixing the channels, so the interpolation is tested.
+        let mut cube = String::from("LUT_3D_SIZE 17\n");
+        for b in 0..17 {
+            for g in 0..17 {
+                for r in 0..17 {
+                    let [r, g, b] = [r, g, b].map(|v| v as f64 / 16.0);
+                    cube += &format!("{} {} {}\n", r.powf(0.6), 0.2 * r + 0.8 * g * g, (1.0 - b).sqrt());
+                }
+            }
+        }
+        let path = std::env::temp_dir().join(format!("rosmo360-test-{}.cube", std::process::id()));
+        std::fs::write(&path, cube).unwrap();
+        let id = crate::lut::shared(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lut = crate::lut::get(id);
+        let (w, h) = (64, 32);
+        let mut camera = crate::view::View::home(crate::view::Projection::Perspective).camera();
+        camera.lut = Some(crate::lut::Applied { id, strength: 0.7 });
+        for [y, cb, cr] in [[502, 512, 512], [600, 640, 440], [420, 420, 470], [800, 540, 560]] {
+            let got = draw_flat_as(&mut gpu, p010(w, h, |_| y, cb, cr), crate::hdr::Hdr::None, (w, h), camera);
+            // As the shader decodes it: BT.709, video range.
+            let [yy, u, v] = [(y as f64 - 64.0) / 876.0, (cb as f64 - 512.0) / 896.0, (cr as f64 - 512.0) / 896.0];
+            let rgb = [yy + 1.5748 * v, yy - 0.1873 * u - 0.4681 * v, yy + 1.8556 * u].map(|c| c.clamp(0.0, 1.0));
+            let want = lut.blend(rgb, 0.7).map(|v| (v * 255.0).round() as i32);
+            let mid = ((h / 2) * w + w / 2) * 3;
+            let px = [0, 1, 2].map(|c| got.rgb[mid + c] as i32);
+            eprintln!("{rgb:?}: GPU {px:?}, CPU {want:?}");
             assert!(px.iter().zip(want).all(|(a, b)| (a - b).abs() <= 2), "GPU {px:?} against CPU {want:?}");
         }
     }

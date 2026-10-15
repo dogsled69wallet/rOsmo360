@@ -96,7 +96,7 @@ impl View {
             half: (self.fov / FLAT_DEGREES / 2.0) as f32,
             roll: self.roll.to_radians() as f32,
         };
-        Camera { user: self.matrix(), zoom: (self.fov.to_radians() / 2.0).tan(), planet: self.projection.planet(), grade: Default::default(), crop }
+        Camera { user: self.matrix(), zoom: (self.fov.to_radians() / 2.0).tan(), planet: self.projection.planet(), grade: Default::default(), lut: None, crop }
     }
 
     /// view_from_screen-ray: yaw about +y, then pitch about +x, then roll.
@@ -140,6 +140,8 @@ pub struct Camera {
     pub planet: Option<f64>,
     /// The colour effects on what it shows.
     pub grade: crate::grade::Grade,
+    /// The LUT applied before them.
+    pub lut: Option<crate::lut::Applied>,
     /// What it shows of an ordinary video instead.
     pub crop: Crop,
 }
@@ -681,7 +683,7 @@ mod tests {
 
     #[test]
     fn azimuthal_matches_perspective_and_planet() {
-        let cam = |planet| Camera { user: crate::stitch::IDENTITY, zoom: 0.7, planet: Some(planet), grade: Default::default(), crop: Default::default() };
+        let cam = |planet| Camera { user: crate::stitch::IDENTITY, zoom: 0.7, planet: Some(planet), grade: Default::default(), lut: None, crop: Default::default() };
         let ndc = [0.3, -0.8];
         let (q, z) = ([0.3 * 1.5 * 0.7, -0.8 * 0.7], 0.7);
         let n = (q[0] * q[0] + q[1] * q[1] + 1.0f64).sqrt();

@@ -56,6 +56,8 @@ pub struct Media {
     pub duration: f64,
     /// An ordinary video (`ffmpeg::flat`), not a 360 clip.
     pub flat: Option<ffmpeg::Flat>,
+    /// The colour profile it was filmed in: D-Log M gets its LUT.
+    pub color_mode: crate::dji::ColorMode,
 }
 
 impl fmt::Debug for Media {
@@ -134,6 +136,7 @@ impl Media {
             readout_ms: p.readout_ms,
             fps: p.fps,
             flat: p.flat,
+            color_mode: p.color_mode,
             input,
         })
     }
@@ -307,6 +310,12 @@ enum Message {
     AutoKey(bool),
     Theme(Theme),
     TenBit(bool),
+    /// Add a `.cube` to the LUT library (a file dialog), the file picked,
+    /// take one out, and choose the one D-Log M clips get.
+    AddLut,
+    LutPicked(Option<PathBuf>),
+    RemoveLut(String),
+    DlogMLut(effects::LutChoice),
     /// A drag on the view let go.
     LookDone,
     /// Open the Info panel on a file on the timeline (right-click).
@@ -567,6 +576,9 @@ struct App {
     settings_open: bool,
     /// 10-bit tracks decode at 10 bits (`source::deep`).
     ten_bit: bool,
+    /// The library LUT new D-Log M cuts get, and the library's LUTs.
+    dlog_m_lut: Option<String>,
+    luts: Vec<String>,
     fullscreen: bool,
     volume: f32,
     muted: bool,
@@ -599,6 +611,8 @@ impl App {
             followed: Default::default(),
             theme: settings_panel::theme_named(&saved.theme),
             ten_bit: saved.ten_bit,
+            dlog_m_lut: saved.dlog_m_lut.clone(),
+            luts: crate::lut::library_names(),
             logo: image::Handle::from_bytes(LOGO),
             library: Vec::new(),
             thumbs: Default::default(),
@@ -685,6 +699,7 @@ impl App {
             auto_key: self.auto_key,
             theme: self.theme.to_string(),
             ten_bit: self.ten_bit,
+            dlog_m_lut: self.dlog_m_lut.clone(),
         }
     }
 
@@ -1547,6 +1562,39 @@ impl App {
                 self.ten_bit = on;
                 source::set_deep(on);
             }
+            Message::AddLut => {
+                return Task::perform(
+                    async { rfd::AsyncFileDialog::new().set_title("Add a LUT").add_filter("3D LUT", &["cube", "CUBE"]).pick_file().await.map(|f| f.path().to_owned()) },
+                    Message::LutPicked,
+                );
+            }
+            Message::LutPicked(None) => {}
+            Message::LutPicked(Some(path)) => match crate::lut::add_to_library(&path) {
+                Ok(name) => {
+                    self.luts = crate::lut::library_names();
+                    self.save_status = Some("LUT added".to_owned());
+                    // DJI's LUT added with no choice made yet: D-Log M
+                    // clips get it, those in the edit too.
+                    let squashed = name.to_lowercase().replace([' ', '-', '_'], "");
+                    if self.dlog_m_lut.is_none() && squashed.contains("dlogm") {
+                        self.dlog_m_lut = Some(name);
+                        self.lut_dlog_m_cuts();
+                    }
+                    self.mark_flat();
+                }
+                Err(e) => self.error = Some(format!("Couldn't add the LUT: {e:#}")),
+            },
+            Message::RemoveLut(name) => {
+                if let Err(e) = crate::lut::remove_from_library(&name) {
+                    self.error = Some(format!("{e:#}"));
+                }
+                if self.dlog_m_lut.as_ref() == Some(&name) {
+                    self.dlog_m_lut = None;
+                }
+                self.luts = crate::lut::library_names();
+                self.mark_flat();
+            }
+            Message::DlogMLut(choice) => self.dlog_m_lut = choice.name(),
             Message::LookDone => {}
             Message::Export => {
                 if self.edit.cuts.is_empty() || self.exporting.is_some() {
@@ -2348,7 +2396,7 @@ impl App {
             _ => self.look.camera(),
         };
         let grade = self.playing_cut().map(|(_, t)| self.grade(self.current, t)).unwrap_or_default();
-        Camera { grade, ..camera }
+        Camera { grade, lut: self.edit.cuts.get(self.current).and_then(|c| c.lut_applied), ..camera }
     }
 
     /// Cut `i`'s colour effects at clip time `t`, faded to black where the
@@ -2482,7 +2530,7 @@ impl App {
         // ordinary video's picture off screen, and the other way round.
         let look = if self.edit.cuts.get(*i).is_some_and(|c| c.flat) == self.look_flat { self.look } else { self.other_look };
         let camera = if self.follow { keyed().unwrap_or_else(|| look.camera()) } else { look.camera() };
-        let camera = Camera { grade: self.grade(*i, t), ..camera };
+        let camera = Camera { grade: self.grade(*i, t), lut: self.edit.cuts.get(*i).and_then(|c| c.lut_applied), ..camera };
         Some((p.media.rig.clone(), shown, camera, p.rig_from_view(self.rolling_shutter), self.crossfade_shares()?.1 as f32))
     }
 
@@ -2529,7 +2577,8 @@ impl App {
         // A picture has no length of its own: a few seconds, trimmed at will.
         let picture = self.library.iter().find(|m| m.input == input).and_then(|m| m.flat).is_some_and(|f| f.picture);
         let end = if picture { ffmpeg::PICTURE_SECONDS } else { duration };
-        self.edit.cuts.push(Cut { input, start: 0.0, end, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new(), flat: false });
+        let lut = self.auto_lut(&input);
+        self.edit.cuts.push(Cut { input, start: 0.0, end, keyframes: Default::default(), stabilize: Some(self.opts.stabilize), note: None, volume: Vec::new(), crossfade: 0.0, effects: Vec::new(), lut, lut_strength: 1.0, flat: false, lut_applied: None });
         self.mark_flat();
         let i = self.edit.cuts.len() - 1;
         self.selected = Some(i);
@@ -2587,10 +2636,36 @@ impl App {
     /// Marks each cut whose clip has loaded as an ordinary video or not;
     /// the views of the two kinds are kept apart (`project::keyframed`).
     fn mark_flat(&mut self) {
+        let mut missing = Vec::new();
         for cut in &mut self.edit.cuts {
             if let Some(m) = self.library.iter().find(|m| m.input == cut.input) {
                 cut.flat = m.flat.is_some();
             }
+            // Its LUT loaded too; a missing one leaves the cut as filmed.
+            if cut.resolve_lut().is_err() {
+                missing.extend(cut.lut.clone().filter(|n| !missing.contains(n)));
+            }
+        }
+        if !missing.is_empty() {
+            self.error = Some(format!("Missing LUT, shown as filmed (add it in Settings): {}", missing.join(", ")));
+        }
+    }
+
+    /// The LUT a newly added clip gets: the D-Log M one for D-Log M.
+    fn auto_lut(&self, input: &Path) -> Option<String> {
+        let media = self.library.iter().find(|m| m.input == input)?;
+        (media.color_mode == crate::dji::ColorMode::DLogM).then(|| self.dlog_m_lut.clone()).flatten()
+    }
+
+    /// Gives every D-Log M cut without a LUT the D-Log M one, one undo step.
+    fn lut_dlog_m_cuts(&mut self) {
+        let todo: Vec<usize> = (0..self.edit.cuts.len()).filter(|&i| self.edit.cuts[i].lut.is_none() && self.auto_lut(&self.edit.cuts[i].input).is_some()).collect();
+        if todo.is_empty() {
+            return;
+        }
+        self.edit.checkpoint();
+        for i in todo {
+            self.edit.cuts[i].lut = self.auto_lut(&self.edit.cuts[i].input.clone());
         }
     }
 
@@ -3060,7 +3135,8 @@ impl App {
                 _ => "CUDA",
             })),
         };
-        let message = self.save_status.as_ref().map(|s| text(s.clone()).style(text::secondary));
+        // One line: wrapped, a long one stood the whole top bar on end.
+        let message = self.save_status.as_ref().map(|s| text(s.clone()).style(text::secondary).wrapping(text::Wrapping::None));
         let status: Element<'_, Message> = match &self.loading {
             Some(_) => self.loading_bar(140.0),
             None => row![].push(message).push(showing).push(decode).spacing(10).align_y(Alignment::Center).into(),

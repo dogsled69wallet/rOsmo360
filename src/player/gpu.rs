@@ -95,6 +95,9 @@ struct Uniforms {
     /// 1 to dither the picture's last rounding to 8 bits, then the frame's
     /// number for the noise (`Pipeline::dither`).
     dither: [f32; 4],
+    /// The LUT before the effects (`lut.rs`): (1 if on, strength, size, 0),
+    /// its domain's low and high ends.
+    lut: [[f32; 4]; 3],
 }
 
 /// Numbers rigs and frames so each is uploaded once however often it is drawn.
@@ -271,6 +274,9 @@ struct Layer {
     /// device feature iced doesn't ask for.
     deep: [(Plane, Plane); 2],
     masks: [Plane; 2],
+    /// The LUT as a 3D texture, and which loaded one (`lut::shared`) it is.
+    lut: Plane,
+    lut_id: Option<usize>,
     bind_group: wgpu::BindGroup,
     lens_u: [LensU; 2],
     rig_id: u64,
@@ -334,6 +340,12 @@ impl Pipeline {
                 deep_entry(9),
                 deep_entry(10),
                 deep_entry(11),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -385,8 +397,9 @@ impl Pipeline {
             let slots = [0, 1].map(|_| (plane(device, 2, 2, wgpu::TextureFormat::R8Unorm), plane(device, 1, 1, wgpu::TextureFormat::Rg8Unorm)));
             let deep = [0, 1].map(|_| deep_planes(device, 2, 2));
             let masks = [0, 1].map(|_| plane(device, 1, 1, wgpu::TextureFormat::R8Unorm));
-            let bind_group = bind(device, &layout, &uniforms, &sampler, &slots, &deep, &masks);
-            Layer { uniforms, slots, deep, masks, bind_group, lens_u: [LensU::zeroed(); 2], rig_id: 0, shown_id: 0 }
+            let lut = lut_texture(device, 2);
+            let bind_group = bind(device, &layout, &uniforms, &sampler, &slots, &deep, &masks, &lut);
+            Layer { uniforms, slots, deep, masks, lut, lut_id: None, bind_group, lens_u: [LensU::zeroed(); 2], rig_id: 0, shown_id: 0 }
         });
         let (overlay, overlay_layout) = overlay_pipeline(device, format);
         Pipeline { pipeline, blend, layout, sampler, srgb: format.is_srgb(), layers, mix: None, overlay, overlay_layout, overlay_slots: Vec::new(), overlays: 0, dither: None }
@@ -464,6 +477,16 @@ impl Pipeline {
         u.misc = [steps as f32, srgb as u8 as f32, origin[0], origin[1]];
         u.lenses = l.lens_u;
         u.grade = camera.grade.uniforms();
+        if let Some(applied) = camera.lut {
+            let lut = crate::lut::get(applied.id);
+            if l.lut_id != Some(applied.id) {
+                l.lut = upload_lut(device, queue, &lut);
+                l.lut_id = Some(applied.id);
+                l.bind_group = bind(device, layout, &l.uniforms, sampler, &l.slots, &l.deep, &l.masks, &l.lut);
+            }
+            let (lo, hi) = lut.domain;
+            u.lut = [[1.0, applied.strength, lut.size as f32, 0.0], [lo[0], lo[1], lo[2], 0.0], [hi[0], hi[1], hi[2], 0.0]];
+        }
         if rig.flat
             && let Some(p) = shown.frame.pictures.first()
         {
@@ -536,7 +559,7 @@ impl Layer {
         if rig.flat {
             self.masks = [0, 1].map(|_| plane(device, 1, 1, wgpu::TextureFormat::R8Unorm));
             self.lens_u = [LensU::zeroed(); 2];
-            self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.deep, &self.masks);
+            self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.deep, &self.masks, &self.lut);
             self.rig_id = rig.id;
             self.shown_id = 0;
             return;
@@ -549,7 +572,7 @@ impl Layer {
             p
         });
         self.lens_u = [0, 1].map(|i| lens_uniform(&rig.lenses[i]));
-        self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.deep, &self.masks);
+        self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.deep, &self.masks, &self.lut);
         self.rig_id = rig.id;
         self.shown_id = 0;
     }
@@ -572,7 +595,7 @@ impl Layer {
             write(queue, &uv.texture, pic.uv(), pic.width / 2, pic.height / 2, 2 * bytes);
         }
         if rebind {
-            self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.deep, &self.masks);
+            self.bind_group = bind(device, layout, &self.uniforms, sampler, &self.slots, &self.deep, &self.masks, &self.lut);
         }
         for (i, lens) in rig.lenses.iter().enumerate().take(2) {
             let track = rig.tracks[lens.input];
@@ -718,6 +741,7 @@ fn bind_overlay(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, uniforms:
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -726,6 +750,7 @@ fn bind(
     slots: &[(Plane, Plane); 2],
     deep: &[(Plane, Plane); 2],
     masks: &[Plane; 2],
+    lut: &Plane,
 ) -> wgpu::BindGroup {
     fn tex(binding: u32, p: &Plane) -> wgpu::BindGroupEntry<'_> {
         wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(&p.view) }
@@ -746,6 +771,61 @@ fn bind(
             tex(9, &deep[0].1),
             tex(10, &deep[1].0),
             tex(11, &deep[1].1),
+            tex(12, lut),
         ],
     })
+}
+
+/// An `n`³ RGBA half-float 3D texture for a LUT: filterable without any
+/// device feature, so the hardware interpolates it trilinearly, as
+/// `Lut::apply` does; f16's 11 bits are finer than a 10-bit step.
+fn lut_texture(device: &wgpu::Device, n: u32) -> Plane {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("lut"),
+        size: wgpu::Extent3d { width: n, height: n, depth_or_array_layers: n },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    Plane { texture, view }
+}
+
+/// `lut` uploaded: the .cube order (red fastest) is the texture's x, y, z.
+fn upload_lut(device: &wgpu::Device, queue: &wgpu::Queue, lut: &crate::lut::Lut) -> Plane {
+    let n = lut.size as u32;
+    let plane = lut_texture(device, n);
+    let data: Vec<u8> = lut.table.iter().flat_map(|c| [c[0], c[1], c[2], 1.0]).flat_map(|v| to_half(v).to_le_bytes()).collect();
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &plane.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        &data,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * 8), rows_per_image: Some(n) },
+        wgpu::Extent3d { width: n, height: n, depth_or_array_layers: n },
+    );
+    plane
+}
+
+/// An IEEE half-precision float's bits, rounded to nearest.
+fn to_half(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let man = bits & 0x7f_ffff;
+    if v.is_nan() {
+        return 0x7e00;
+    }
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        let m = (man | 0x80_0000) >> (1 - exp);
+        return sign | ((m + 0x1000) >> 13) as u16;
+    }
+    sign | ((((exp as u32) << 10) | (man >> 13)) + ((man >> 12) & 1)) as u16
 }

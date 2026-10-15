@@ -44,7 +44,7 @@ pub fn probe_all(input: &Path) -> Result<serde_json::Value> {
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 
-fn probe(input: &Path, stream: &str, entries: &str) -> Result<String> {
+pub fn probe(input: &Path, stream: &str, entries: &str) -> Result<String> {
     let out = tool("ffprobe")
         .args(["-v", "error", "-select_streams", stream, "-show_entries", entries, "-of", "csv=p=0"])
         .arg(input)
