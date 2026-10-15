@@ -1704,7 +1704,9 @@ impl App {
                 Ok(()) => {
                     self.saved_version = self.edit.version;
                     self.saved_aspect = self.aspect;
-                    self.save_status = Some(format!("Saved {}", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())));
+                    // No "Saved …" (user: just annoying): the title's unsaved
+                    // mark going is enough.
+                    self.save_status = None;
                     self.project = Some(path);
                     if let Some(then) = self.after_save.take() {
                         return self.proceed(then);
@@ -2278,7 +2280,7 @@ impl App {
                 return Task::perform(blocking(move || export::save(request).map_err(|e| format!("{e:#}"))), Message::Saved);
             }
             Message::Saved(result) => match result {
-                Ok(path) => self.save_status = Some(format!("Saved {}", path.display())),
+                Ok(_) => self.save_status = None,
                 Err(e) => {
                     self.save_status = None;
                     self.error = Some(format!("Saving failed: {e}"));
