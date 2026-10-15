@@ -10,9 +10,11 @@ Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your optio
 
 Ready-made Linux builds, with an install script, an AppImage and a Flatpak, are on the [releases page](https://github.com/ravelund/rOsmo360/releases/latest); see [Installing](#installing). On an Apple Silicon Mac it builds from source; see [Building](#building).
 
+**Windows support is coming soon**: a download with everything included (ffmpeg too), to unzip and double-click, is being tested now.
+
 ## Why
 
-I vibed this tool primarily for Linux, since I couldn't find anything close to DJI Studio there. The goal of rOsmo360 is to bring most of DJI Studio's playback and editing to Linux users. It isn't Linux-exclusive, though: it runs on Apple Silicon Macs too (built from source for now), and Windows is in the pipeline.
+I vibed this tool primarily for Linux, since I couldn't find anything close to DJI Studio there. The goal of rOsmo360 is to bring most of DJI Studio's playback and editing to Linux users. It isn't Linux-exclusive, though: it runs on Apple Silicon Macs too (built from source for now), and Windows support is coming soon.
 
 ## Features
 
@@ -70,7 +72,7 @@ I vibed this tool primarily for Linux, since I couldn't find anything close to D
 - On Linux, ALSA for sound (`alsa-lib`, or `libasound2-dev` on Debian/Ubuntu). PipeWire and PulseAudio work through it.
 - To build: Rust 1.88 or newer.
 
-Developed and tested on Linux (KDE Plasma, NVIDIA RTX 3090) and on an Apple Silicon Mac (M4 Pro, macOS 27). Windows builds are planned.
+Developed and tested on Linux (KDE Plasma, NVIDIA RTX 3090) and on an Apple Silicon Mac (M4 Pro, macOS 27). Windows support is coming soon (in testing).
 
 ## Installing
 
@@ -307,7 +309,7 @@ Clips' telemetry and thumbnails, and songs' waveforms, are cached in `~/.cache/r
 - Picture-in-picture video on the overlay track.
 - 360° metadata on equirectangular exports, so YouTube and VR players show them as 360° video.
 - Smooth full-resolution playback on modest hardware, and faster 10-bit exports (zero-copy decoding).
-- Windows builds, and a signed macOS download.
+- Windows support, coming soon: a zip with ffmpeg included, in testing now. And a signed macOS download.
 - LUTs chosen by camera for ordinary videos (a DJI Action's or a phone's log).
 
 ## License
