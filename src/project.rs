@@ -449,7 +449,7 @@ impl Project {
                 item.input = rel.to_owned();
             }
         }
-        std::fs::write(path, serde_json::to_string_pretty(&project)? + "\n").with_context(|| format!("writing {}", path.display()))
+        crate::replace_file(path, (serde_json::to_string_pretty(&project)? + "\n").as_bytes())
     }
 
     /// Length of the edit in seconds.

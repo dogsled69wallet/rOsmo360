@@ -90,7 +90,7 @@ impl Settings {
         let Some(path) = path() else { return };
         let write = || -> anyhow::Result<()> {
             std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
-            std::fs::write(&path, serde_json::to_string_pretty(self)? + "\n")?;
+            crate::replace_file(&path, (serde_json::to_string_pretty(self)? + "\n").as_bytes())?;
             Ok(())
         };
         if let Err(e) = write() {

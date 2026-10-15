@@ -19,7 +19,7 @@
 use crate::imu;
 use anyhow::{Context, Result};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use telemetry_parser::rig::CameraRig;
@@ -204,12 +204,8 @@ fn store(path: &Path, write: impl FnOnce(&mut Vec<u8>) -> Result<()>) {
         bytes.extend(FORMAT.to_le_bytes());
         put_string(&mut bytes, env!("CARGO_PKG_VERSION"));
         write(&mut bytes)?;
-        let dir = path.parent().context("no cache folder")?;
-        fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!(".{}.{}", path.file_name().unwrap().to_string_lossy(), std::process::id()));
-        File::create(&tmp)?.write_all(&bytes)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
+        fs::create_dir_all(path.parent().context("no cache folder")?)?;
+        crate::replace_file(path, &bytes)
     })();
     if let Err(e) = result {
         eprintln!("could not cache {}: {e:#}", path.display());
@@ -363,7 +359,7 @@ pub fn move_to(to: Option<PathBuf>) -> Result<()> {
         let _ = fs::remove_file(&choice);
     } else {
         fs::create_dir_all(choice.parent().unwrap())?;
-        fs::write(&choice, format!("{}\n", to.display()))?;
+        crate::replace_file(&choice, format!("{}\n", to.display()).as_bytes())?;
     }
     println!("moved {n} files from {} to {}; the cache is kept there from now on", from.display(), to.display());
     if std::env::var_os(ENV).is_some_and(|v| !v.is_empty()) {
