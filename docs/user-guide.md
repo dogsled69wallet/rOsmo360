@@ -382,7 +382,12 @@ You do this once on each computer. rOsmo360 doesn't come with the LUT, as it's D
 
 1. **Download it.** Open DJI's download page, [Osmo 360 D-Log M to Rec.709 LUT](https://www.dji.com/downloads/softwares/osmo-360-dlog-m-to-rec709-lut) (in the DJI Download Center, search for "Osmo 360 D-Log M" if the link has moved), and click **Download**. You get `DJI Osmo 360 D-Log M to Rec.709 V1.cube`, about 1 MB, usually in your Downloads folder. Make sure it's the **Osmo 360** one: DJI has D-Log M LUTs for its drones and other cameras too.
 2. **Add it.** In rOsmo360, open **Settings** (the cog at the far left of the top bar, or **Ctrl+,**), find **LUTs** and click **Add LUT…**. Pick the `.cube` file you downloaded and click **Open**.
+
+   ![The LUTs part of the Settings panel before any LUT is added: "None yet.", the Add LUT… button, and For D-Log M clips set to None](guide/lut-add.png)
+
 3. **Check it.** The LUT is now listed under LUTs, and **For D-Log M clips** shows it: since its name says D-Log M, rOsmo360 chose it for those clips by itself. Any D-Log M clips in your edit change from grey and flat to normal colours at once.
+
+   ![The LUTs part of the Settings panel after adding it: DJI Osmo 360 D-Log M to Rec.709 V1 listed with a ✕ to remove it, and chosen under For D-Log M clips](guide/lut-added.png)
 
 rOsmo360 copies the file into its own settings folder, so you can delete the download afterwards, and your projects keep working wherever the download went. The LUT is known by its file name (without `.cube`); a project made on another computer finds it by that name, so add the same file there without renaming it. To take a LUT out of the library, click the **✕** beside it.
 
